@@ -1,0 +1,53 @@
+# --- build output ---
+/bin/
+/dist/
+/build/
+chomosyncer-go
+chomosyncer-go.exe
+loadgen
+loadgen.exe
+*.exe
+*.test
+*.out
+
+# --- Go tooling ---
+/vendor/
+go.work
+go.work.sum
+
+# --- profiling / coverage ---
+*.prof
+*.pprof
+*.cpu
+*.mem
+coverage.txt
+coverage.html
+cover.out
+*.cover
+
+# --- local runtime / secrets ---
+.env
+.env.*
+!.env.example
+!deploy/*.env.example
+*.local.yml
+*.local.yaml
+
+# --- docker / data volumes (if bind-mounted) ---
+/deploy/data/
+**/data/
+**/_data/
+
+# --- editor / OS ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- scratch ---
+/tmp/
+/scratch/
+/scratchpad/

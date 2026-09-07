@@ -1,0 +1,81 @@
+# ChomoSyncer-go local / staging stack.
+#
+#   docker compose -f deploy/docker-compose.yml up -d            # ClickHouse + Redis only
+#   docker compose -f deploy/docker-compose.yml --profile app up # + the collector
+#
+# ClickHouse auto-creates market.fapi_kline_1m / _1h on first start from the
+# mounted DDL. Ports: ClickHouse native 9000 / http 8123, Redis 6379,
+# chomosyncer-go metrics 9090.
+
+name: chomosyncer
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: chomo-clickhouse
+    ports:
+      - "9000:9000"   # native TCP (used by clickhouse-go)
+      - "8123:8123"   # HTTP (curl / debugging)
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    environment:
+      CLICKHOUSE_DB: market
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - ch-data:/var/lib/clickhouse
+      - ./clickhouse/001_fapi_kline.sql:/docker-entrypoint-initdb.d/001_fapi_kline.sql:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: chomo-redis
+    ports:
+      - "6379:6379"
+    # Cache role: persistence off. livebar:* keys carry TTLs; kline:* windows are
+    # LTRIM-bounded. noeviction => writes fail loudly instead of silently dropping
+    # window data when memory is exhausted.
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - "1gb"
+      - --maxmemory-policy
+      - noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  chomosyncer-go:
+    profiles: ["app"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: chomo-app
+    ports:
+      - "9090:9090"   # /metrics + /healthz
+    env_file:
+      - ./chomosyncer-go.env.example
+    environment:
+      CHOMOSYNCER_REDIS_ADDR: redis:6379
+      CHOMOSYNCER_CH_ADDR: clickhouse:9000
+      CHOMOSYNCER_METRICS_ADDR: ":9090"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  ch-data:
