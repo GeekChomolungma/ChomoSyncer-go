@@ -6,6 +6,7 @@ Binance U 本位永续合约 K 线行情实时采集器。低延迟流式接入 
 设计说明书：[`chomoSyncer-go_design_doc.md`](./chomoSyncer-go_design_doc.md)
 任务拆解：[`chomosyncer-go-agent-tasks.md`](./chomosyncer-go-agent-tasks.md)
 **部署 / 集成 / 压测手册：[`docs/OPERATIONS.md`](./docs/OPERATIONS.md)**（如何拉起 ClickHouse + Redis、配置并启动、正向集成测试、压力测试）
+历史 K 线回补设计（待实现）：[`docs/GAPFILL_DESIGN.md`](./docs/GAPFILL_DESIGN.md)
 
 ## 功能模组拆解
 
