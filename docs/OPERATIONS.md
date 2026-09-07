@@ -102,6 +102,12 @@ CGO_ENABLED=0 go build -trimpath \
 | `-ws-url` / `..._WS_URL` | `wss://fstream.binance.com` | testnet：`wss://fstream.binancefuture.com` |
 | `-rest-url` / `..._REST_URL` | `https://fapi.binance.com` | testnet：`https://testnet.binancefuture.com` |
 | `-section-timeout` / `..._SECTION_TIMEOUT` | `5s` | 截面未集齐时 `kline_ready` 的兜底 |
+| `-backfill` / `..._BACKFILL` | `true` | 历史回补总开关：冷启动 + shard 重连回补 + CH→Redis 窗口重建（见 [`GAPFILL_DESIGN.md`](GAPFILL_DESIGN.md)）。`false` = forward-only |
+| `-backfill-rest-rps` / `..._BACKFILL_REST_RPS` | `20` | `/fapi/v1/klines` 令牌桶速率 |
+| `-backfill-workers` / `..._BACKFILL_WORKERS` | `4` | 单请求并行 REST 拉取数 |
+| `-backfill-gap-debounce` / `..._BACKFILL_GAP_DEBOUNCE` | `30s` | 合并同一 shard 的重连 gap 事件 |
+| `-backfill-gate-timeout` / `..._BACKFILL_GATE_TIMEOUT` | `5m` | 被门控的 key 超时强制放行（forward-only 降级） |
+| `-backfill-flush-wait` / `..._BACKFILL_FLUSH_WAIT` | `2s` | 归档后、读 CH 前的等待（覆盖 chwriter flush 间隔） |
 | `-log-level` / `-log-format` | `info` / `text` | `debug\|info\|warn\|error` / `text\|json` |
 
 样例：`cp deploy/chomosyncer-go.env.example deploy/chomosyncer-go.env` 后按需改。
@@ -127,8 +133,13 @@ curl -s localhost:9090/metrics | grep -E \
 - 约 1 分钟后 `kline_ingested_total` / `redis_bars_pushed_total` / `clickhouse_rows_flushed_total`
   开始增长，整分钟出现 `dispatcher_section_published_total{interval="1m",reason="complete"}`
 
+启用 `-backfill`（默认）时：启动会先做**冷启动回补**——对全 universe 拉历史进 CH 并从 CH 重建 Redis
+收盘窗口，期间 `/readyz` 返回 **503**（`/healthz` 仍 200）。完成后 `/readyz` 转 200，日志出现
+`cold-start backfill complete`。此时 `redis-cli LLEN kline:BTCUSDT:1h` 应**立即接近 200**（而非从 0 攒）。
+
 **优雅退出**：`SIGTERM`（`kill` / `docker stop` / Ctrl-C）。日志出现 `shutdown signal received; draining`
-→ `clickhouse batch writer stopped` → `shutdown complete`。退出前会把 CH 缓冲全量 flush、drain 各 channel。
+→ `clickhouse batch writer stopped` → `shutdown complete`。退出前会把 CH 缓冲全量 flush、drain 各 channel、
+取消在途回补并释放门控。
 
 ---
 
@@ -258,7 +269,16 @@ go test -bench=. -benchmem ./internal/chwriter/ ./internal/rediswin/
 
 ### 5.5 可调旋钮
 
-**已可通过 flag/env 调**：`-shards-per-interval`、`-section-timeout`、`-intervals`。
+**已可通过 flag/env 调**：`-shards-per-interval`、`-section-timeout`、`-intervals`、`-backfill*`。
+
+**gapfill 相关指标**（`-backfill` 开启时）：`backfill_ready`（1=冷启动完成）、`backfill_requests_total{reason}`、
+`backfill_bars_fetched_total{interval}` / `backfill_bars_written_total{interval}`、
+`backfill_windows_rebuilt_total{interval}`、`backfill_errors_total{stage}`、`backfill_duration_seconds{reason}`、
+`backfill_rest_weight_used`、`backfill_rest_http_errors_total{code}`、`windowgate_held_keys`、
+`redis_window_gated_pushes_total{interval}`、`redis_bars_skipped_total`、
+`dispatcher_kline_ready_suppressed_total{interval}`。告警：`backfill_ready == 0` 持续 > 10min、
+`rate(backfill_errors_total[10m]) > 0`、`windowgate_held_keys` 长期 > 0。
+
 
 **目前写死在 `internal/app/app.go` 的 `*.Config{}` 里，压测要调得改代码重编**（后续应提升为 `app.Config` + flag）：
 

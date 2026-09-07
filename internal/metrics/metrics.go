@@ -47,6 +47,9 @@ type Config struct {
 	// Version is stamped into chomosyncer_build_info; falls back to the module
 	// build version when empty.
 	Version string
+	// Readiness backs GET /readyz: 200 when it returns true, 503 otherwise. Nil
+	// means always ready.
+	Readiness func() bool
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -162,6 +165,15 @@ func (m *Metrics) Start() error {
 		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok\n"))
+		})
+		mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+			if m.cfg.Readiness == nil || m.cfg.Readiness() {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("ready\n"))
+				return
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("not ready\n"))
 		})
 
 		m.ln = ln

@@ -19,9 +19,10 @@ Binance U 本位永续合约 K 线行情实时采集器。低延迟流式接入 
 | 3 | Binance 行情流监听 + 断线重连 | `internal/collector` | 逐 symbol `<sym>@kline_<iv>` 订阅（futures 无 kline 聚合流）；crc32 分片；无限退避重连 + staleness 看门狗；回调直连 dispatcher | §2, §5 | ✅ 已实现 + 单测 |
 | 5 | 可观测性 | `internal/metrics` | 唯一 `prometheus.Registry`（+ Go/process/build collector）；`/metrics` + `/healthz` HTTP server；优雅关闭；`Registerer()` 交给各模组 | §6 | ✅ 已实现 + 单测 |
 | 6 | 主程序装配 | `internal/app` + `cmd/chomosyncer-go` | 配置加载（flag/env）、全链路装配、信号驱动优雅退出、ClickHouse 按 interval 分表路由 | §5 | ✅ 已实现 + 单测 |
+| 8 | 历史 K 线 gapfill | `internal/backfill` + `internal/windowgate` | 冷启动 / shard 重连回补 REST→CH，CH→Redis 窗口重建；门控挂起在补 key 的收盘写 + `kline_ready`；`rediswin` 单调 LPUSH + `RebuildWindow`；`collector.OnGap`；`/readyz` | [`docs/GAPFILL_DESIGN.md`](./docs/GAPFILL_DESIGN.md) | ✅ P1–P5 实现 + 单测（P6 周期对账 TODO） |
 | 7 | Python 无状态特征读取骨架 | `python/` *(待做)* | 订阅 `kline_ready`；pipeline 批量读 200 根 Bar；Polars 全量重算 | §4.2 | ⬜ 待做 |
 
-依赖顺序（本轮调整）：`1 → 2 → 4 → 3b → 3 → 5 → 6 → 7 → Integration`。当前进度到 6；剩 7（Python reader）+ 端到端联调。
+依赖顺序：`1 → 2 → 4 → 3b → 3 → 5 → 6 → 8 → 7 → Integration`。当前进度到 8；剩 7（Python reader）+ 端到端联调。
 
 ## 模块 1：`internal/chwriter`（已完成）
 

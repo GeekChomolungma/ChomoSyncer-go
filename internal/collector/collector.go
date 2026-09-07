@@ -30,6 +30,17 @@ type EventSink interface {
 
 var _ EventSink = (*dispatcher.Dispatcher)(nil)
 
+// GapEvent reports that a shard missed data between LastMsgAt (its last frame
+// before the drop) and ReconnectAt (when it came back), across the given
+// streams. The app forwards it to the backfiller; collector does not import
+// backfill.
+type GapEvent struct {
+	ShardID     string
+	Streams     []string
+	LastMsgAt   time.Time
+	ReconnectAt time.Time
+}
+
 // streamClient is the minimal WebSocket-streams surface a shard needs. The
 // production implementation wraps binance-connector-go; tests inject a fake.
 // onEvent (passed to the factory) is called for every decoded kline frame.
@@ -74,6 +85,9 @@ type Config struct {
 	WatchdogInterval time.Duration
 	// ConnectTimeout bounds a single dial+subscribe. Default 20s.
 	ConnectTimeout time.Duration
+	// OnGap, if set, is called (from a shard goroutine) after a shard reconnects
+	// following a drop. Must be non-blocking / fast.
+	OnGap func(GapEvent)
 
 	Registerer prometheus.Registerer
 	Logger     *slog.Logger
@@ -149,6 +163,7 @@ type Collector struct {
 	cfg     resolvedConfig
 	sink    EventSink
 	factory clientFactory
+	onGap   func(GapEvent)
 	log     *slog.Logger
 	metrics *metrics
 	rootCtx context.Context
@@ -174,6 +189,7 @@ func New(ctx context.Context, cfg Config, sink EventSink, opts ...Option) (*Coll
 	c := &Collector{
 		cfg:     cfg.resolve(),
 		sink:    sink,
+		onGap:   cfg.OnGap,
 		log:     log.With("component", "collector"),
 		metrics: newMetrics(cfg.Registerer),
 		rootCtx: ctx,

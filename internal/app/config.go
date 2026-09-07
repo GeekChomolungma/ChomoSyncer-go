@@ -46,6 +46,14 @@ type Config struct {
 	// --- dispatcher ---
 	SectionTimeout time.Duration
 
+	// --- historical gapfill (see docs/GAPFILL_DESIGN.md) ---
+	Backfill            bool          // master switch; false => forward-only
+	BackfillRestRPS     float64       // token-bucket rate for /fapi/v1/klines, default 20
+	BackfillWorkers     int           // per-request parallel fetch, default 4
+	BackfillGapDebounce time.Duration // coalesce repeated shard-reconnect gaps, default 30s
+	BackfillGateTimeout time.Duration // force-release a stuck key after this, default 5m
+	BackfillFlushWait   time.Duration // wait after archiving before CH read-back, default 2s
+
 	// --- observability ---
 	MetricsAddr string // ":9090" (default); "off" disables the HTTP server
 	Version     string
@@ -94,6 +102,21 @@ func (c Config) withDefaults() Config {
 	}
 	if c.SectionTimeout <= 0 {
 		c.SectionTimeout = 5 * time.Second
+	}
+	if c.BackfillRestRPS <= 0 {
+		c.BackfillRestRPS = 20
+	}
+	if c.BackfillWorkers <= 0 {
+		c.BackfillWorkers = 4
+	}
+	if c.BackfillGapDebounce <= 0 {
+		c.BackfillGapDebounce = 30 * time.Second
+	}
+	if c.BackfillGateTimeout <= 0 {
+		c.BackfillGateTimeout = 5 * time.Minute
+	}
+	if c.BackfillFlushWait <= 0 {
+		c.BackfillFlushWait = 2 * time.Second
 	}
 	if c.MetricsAddr == "" {
 		c.MetricsAddr = ":9090"

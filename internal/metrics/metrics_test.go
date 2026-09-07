@@ -191,3 +191,32 @@ func httpGetCode(t *testing.T, url string) (int, string) {
 	b, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, string(b)
 }
+
+func TestReadyz(t *testing.T) {
+	ready := false
+	m, err := New(Config{Addr: "127.0.0.1:0", Readiness: func() bool { return ready }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close(context.Background())
+
+	if code, _ := httpGetCode(t, "http://"+m.Addr()+"/readyz"); code != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz while not ready = %d, want 503", code)
+	}
+	ready = true
+	if code, _ := httpGetCode(t, "http://"+m.Addr()+"/readyz"); code != http.StatusOK {
+		t.Fatalf("/readyz while ready = %d, want 200", code)
+	}
+}
+
+func TestReadyzNilAlwaysReady(t *testing.T) {
+	m, _ := New(Config{Addr: "127.0.0.1:0"})
+	_ = m.Start()
+	defer m.Close(context.Background())
+	if code, _ := httpGetCode(t, "http://"+m.Addr()+"/readyz"); code != http.StatusOK {
+		t.Fatalf("/readyz with nil Readiness = %d, want 200", code)
+	}
+}

@@ -99,6 +99,7 @@ func (s *shard) run(ctx context.Context) {
 	}
 
 	backoff := s.c.cfg.reconnectBase
+	var downAt time.Time // last-frame time of a drop, reported to OnGap on the next successful connect
 	for {
 		select {
 		case <-ctx.Done():
@@ -108,11 +109,12 @@ func (s *shard) run(ctx context.Context) {
 		default:
 		}
 
-		r := s.connectAndPump(ctx)
+		r, d := s.connectAndPump(ctx, downAt)
 		s.c.metrics.wsStatus.WithLabelValues(s.id).Set(0)
 		if r == reasonStopped {
 			return
 		}
+		downAt = d
 		s.c.metrics.wsReconnects.WithLabelValues(s.id).Inc()
 		s.c.log.Warn("shard down; reconnecting", "shard", s.id, "reason", r.String(), "retry_in", backoff)
 		if !s.sleep(ctx, jitter(backoff)) {
@@ -126,8 +128,11 @@ func (s *shard) run(ctx context.Context) {
 }
 
 // connectAndPump establishes one connection and services it until it drops or
-// the shard is told to stop. It returns why it ended.
-func (s *shard) connectAndPump(ctx context.Context) reason {
+// the shard is told to stop. prevDownAt, if non-zero, is the last-frame time of
+// the earlier drop that led here; once this connection is up, the gap
+// [prevDownAt, now] is reported to OnGap. Returns why it ended plus the
+// last-frame time to carry forward as the next prevDownAt (zero on a clean stop).
+func (s *shard) connectAndPump(ctx context.Context, prevDownAt time.Time) (reason, time.Time) {
 	cl := s.c.factory(s.id, s.onEvent)
 
 	want, ver := s.snapshotDesired()
@@ -139,15 +144,18 @@ func (s *shard) connectAndPump(ctx context.Context) reason {
 	if err != nil {
 		_ = cl.Close()
 		if ctx.Err() != nil {
-			return reasonStopped
+			return reasonStopped, time.Time{}
 		}
 		s.c.log.Warn("shard connect failed", "shard", s.id, "err", err)
-		return reasonConnectFailed
+		return reasonConnectFailed, prevDownAt // carry the drop forward
 	}
 	defer func() { _ = cl.Close() }()
 
 	s.c.metrics.wsStatus.WithLabelValues(s.id).Set(1)
 	s.c.log.Info("shard connected", "shard", s.id, "streams", len(streams))
+	if !prevDownAt.IsZero() {
+		s.reportGap(prevDownAt, time.Now(), streams)
+	}
 
 	subscribed := want
 	localVer := ver
@@ -158,16 +166,16 @@ func (s *shard) connectAndPump(ctx context.Context) reason {
 	for {
 		select {
 		case <-ctx.Done():
-			return reasonStopped
+			return reasonStopped, time.Time{}
 		case <-s.stopCh:
-			return reasonStopped
+			return reasonStopped, time.Time{}
 
 		case e, ok := <-cl.Errors():
 			if !ok {
-				return reasonClosed
+				return reasonClosed, cl.LastMessageAt()
 			}
 			s.c.log.Warn("shard stream error", "shard", s.id, "err", e)
-			return reasonError
+			return reasonError, cl.LastMessageAt()
 
 		case <-wd.C:
 			// Apply a subscription delta if the desired set changed.
@@ -176,7 +184,7 @@ func (s *shard) connectAndPump(ctx context.Context) reason {
 				if len(add) > 0 {
 					if err := cl.Subscribe(ctx, add); err != nil {
 						s.c.log.Warn("shard subscribe delta failed", "shard", s.id, "err", err)
-						return reasonError
+						return reasonError, cl.LastMessageAt()
 					}
 				}
 				if len(remove) > 0 {
@@ -196,10 +204,26 @@ func (s *shard) connectAndPump(ctx context.Context) reason {
 			s.c.metrics.lastMsgAge.WithLabelValues(s.id).Set(age.Seconds())
 			if age > s.c.cfg.staleTimeout {
 				s.c.log.Warn("shard stale; forcing reconnect", "shard", s.id, "age", age.Round(time.Second))
-				return reasonStale
+				return reasonStale, cl.LastMessageAt()
 			}
 		}
 	}
+}
+
+// reportGap notifies the collector's OnGap callback (if set) that this shard
+// missed data in [downAt, upAt] for the given streams.
+func (s *shard) reportGap(downAt, upAt time.Time, streams []string) {
+	if s.c.onGap == nil || downAt.IsZero() || !upAt.After(downAt) {
+		return
+	}
+	cp := make([]string, len(streams))
+	copy(cp, streams)
+	s.c.onGap(GapEvent{
+		ShardID:     s.id,
+		Streams:     cp,
+		LastMsgAt:   downAt,
+		ReconnectAt: upAt,
+	})
 }
 
 func (s *shard) sleep(ctx context.Context, d time.Duration) bool {

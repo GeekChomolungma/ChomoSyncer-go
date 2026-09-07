@@ -1,7 +1,12 @@
 # 历史 K 线 Gapfill / 回补设计
 
-> 状态：Design — 待实现。本文只定设计，不含最终代码。
+> 状态：**P1–P5 已实现**（`internal/rediswin` 单调 LPUSH + `RebuildWindow`、`internal/windowgate`、
+> `internal/backfill`、`internal/app` 装配、`collector.OnGap`）。**P6（周期对账）仍为 TODO**。
 > 关联：[`../chomoSyncer-go_design_doc.md`](../chomoSyncer-go_design_doc.md)、[`OPERATIONS.md`](OPERATIONS.md)
+>
+> 实现与本设计的偏差：`backfill_rest_errors_total{code}` 实际名为 `backfill_rest_http_errors_total`；
+> gate 的持有计数指标名为 `windowgate_held_keys`（非 `backfill_keys_gated`）；`backfill_requests_dropped_total`
+> 替代设计里的队列满计数；`backfill_errors_total{stage}` 覆盖 rest/archive/ch_max/ch_read/rebuild。
 
 ---
 

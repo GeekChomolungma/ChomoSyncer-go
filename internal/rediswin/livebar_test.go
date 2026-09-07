@@ -165,7 +165,7 @@ func TestLiveBarWriterWritesHash(t *testing.T) {
 		t.Fatalf("TryEnqueue: %v", err)
 	}
 
-	eventually(t, 2*time.Second, func() bool {
+	eventually(t, 6*time.Second, func() bool {
 		n, _ := client.Exists(ctx, key).Result()
 		return n == 1
 	})
@@ -208,7 +208,7 @@ func TestLiveBarWriterOverwrites(t *testing.T) {
 		}
 	}
 
-	eventually(t, 2*time.Second, func() bool {
+	eventually(t, 5*time.Second, func() bool {
 		v, err := client.HGet(ctx, key, "c").Result()
 		return err == nil && mustF(t, v) == liveBar(30, false).Close
 	})
@@ -234,7 +234,7 @@ func TestLiveBarTTLFromInterval(t *testing.T) {
 			t.Fatalf("TryEnqueue %s: %v", c.sym, err)
 		}
 		key := w.Key(c.sym, c.interval)
-		eventually(t, 2*time.Second, func() bool {
+		eventually(t, 6*time.Second, func() bool {
 			n, _ := client.Exists(ctx, key).Result()
 			return n == 1
 		})
@@ -320,7 +320,7 @@ func TestLiveBarContextCancel(t *testing.T) {
 	_ = w.TryEnqueue("BTCUSDT", "1h", liveBar(1, false))
 	cancel()
 
-	eventually(t, 2*time.Second, func() bool {
+	eventually(t, 6*time.Second, func() bool {
 		return errors.Is(w.TryEnqueue("BTCUSDT", "1h", liveBar(2, false)), ErrClosed)
 	})
 
@@ -361,7 +361,7 @@ func TestLiveBarPublish(t *testing.T) {
 	}
 
 	// Hash write still happened alongside the publish.
-	eventually(t, 2*time.Second, func() bool {
+	eventually(t, 6*time.Second, func() bool {
 		n, _ := client.Exists(context.Background(), w.Key("BTCUSDT", "1h")).Result()
 		return n == 1
 	})

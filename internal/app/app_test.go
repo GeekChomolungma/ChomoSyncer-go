@@ -139,3 +139,51 @@ func (f *fakeArchive) TryPush(row chwriter.Row) error {
 	f.rows = append(f.rows, row)
 	return nil
 }
+
+func TestBackfillWiring(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := smokeConfig()
+	cfg.Backfill = true
+	cfg.BackfillFlushWait = time.Millisecond
+
+	a, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if a.backfiller == nil || a.gate == nil || a.chStore == nil {
+		t.Fatalf("backfill components not wired: bf=%v gate=%v store=%v", a.backfiller != nil, a.gate != nil, a.chStore != nil)
+	}
+	// readiness closure reflects the backfiller
+	if !a.backfiller.Ready() {
+		t.Fatal("Ready() should be true before any cold-start submission")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- a.Shutdown(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown hung with backfill enabled")
+	}
+}
+
+func TestBackfillDisabledByDefault(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a, err := New(ctx, smokeConfig()) // Backfill: false
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if a.backfiller != nil || a.chStore != nil {
+		t.Fatal("backfiller/chStore should be nil when Backfill is off")
+	}
+	if a.gate == nil {
+		t.Fatal("gate is always wired (adapters are cheap)")
+	}
+	_ = a.Shutdown(context.Background())
+}

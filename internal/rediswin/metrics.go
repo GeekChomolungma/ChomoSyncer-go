@@ -11,6 +11,8 @@ import (
 type metrics struct {
 	pipelineLatency *prometheus.HistogramVec // {op,status}
 	barsPushed      prometheus.Counter
+	barsSkipped     prometheus.Counter
+	windowsRebuilt  prometheus.Counter
 	klineReady      prometheus.Counter
 	errors          *prometheus.CounterVec // {op}
 }
@@ -29,6 +31,14 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		barsPushed: f.NewCounter(prometheus.CounterOpts{
 			Name: "redis_bars_pushed_total",
 			Help: "Closed bars LPUSH-ed into a rolling window.",
+		}),
+		barsSkipped: f.NewCounter(prometheus.CounterOpts{
+			Name: "redis_bars_skipped_total",
+			Help: "Closed-bar pushes skipped by the monotonic guard (bar not newer than the window head).",
+		}),
+		windowsRebuilt: f.NewCounter(prometheus.CounterOpts{
+			Name: "redis_windows_rebuilt_total",
+			Help: "Rolling windows rebuilt wholesale from ClickHouse (gapfill).",
 		}),
 		klineReady: f.NewCounter(prometheus.CounterOpts{
 			Name: "redis_kline_ready_published_total",

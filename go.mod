@@ -5,17 +5,18 @@ go 1.25.0
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.48.0
 	github.com/alicebob/miniredis/v2 v2.39.0
+	github.com/binance/binance-connector-go/clients/derivativestradingusdsfutures v1.20.0
+	github.com/binance/binance-connector-go/common/v2 v2.8.0
 	github.com/bytedance/sonic v1.15.3
 	github.com/prometheus/client_golang v1.24.1
 	github.com/redis/go-redis/v9 v9.22.0
+	golang.org/x/time v0.15.0
 )
 
 require (
 	github.com/ClickHouse/ch-go v0.74.0 // indirect
 	github.com/andybalholm/brotli v1.2.3 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/binance/binance-connector-go/clients/derivativestradingusdsfutures v1.20.0 // indirect
-	github.com/binance/binance-connector-go/common/v2 v2.8.0 // indirect
 	github.com/bytedance/gopkg v0.1.3 // indirect
 	github.com/bytedance/sonic/loader v0.5.2 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

@@ -396,3 +396,80 @@ func TestNilSinkRejected(t *testing.T) {
 		t.Fatal("expected error for nil sink")
 	}
 }
+
+func TestOnGapReportedAfterReconnect(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		gaps []GapEvent
+	)
+	f := newFakeFactory()
+	sink := &fakeSink{}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c, err := New(ctx, Config{
+		Intervals: []string{"1m"}, ShardsPerInterval: 1,
+		ReconnectBase: 5 * time.Millisecond, WatchdogInterval: 5 * time.Millisecond, ConnectStagger: time.Millisecond,
+		Registerer: prometheus.NewRegistry(),
+		OnGap: func(g GapEvent) {
+			mu.Lock()
+			gaps = append(gaps, g)
+			mu.Unlock()
+		},
+	}, sink, withClientFactory(f.make))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	c.SetSymbols([]string{"BTCUSDT"})
+	eventually(t, time.Second, func() bool { return f.latest("kline_1m_0") != nil && f.latest("kline_1m_0").connectN == 1 })
+
+	fc1 := f.latest("kline_1m_0")
+	fc1.push(closedEvent("BTCUSDT", "1m", 1000)) // set LastMessageAt to ~now
+	downApprox := time.Now()
+	fc1.errCh <- errors.New("stream blew up")
+
+	eventually(t, 2*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(gaps) == 1
+	})
+
+	mu.Lock()
+	g := gaps[0]
+	mu.Unlock()
+	if g.ShardID != "kline_1m_0" {
+		t.Fatalf("gap ShardID = %q", g.ShardID)
+	}
+	if len(g.Streams) != 1 || g.Streams[0] != "btcusdt@kline_1m" {
+		t.Fatalf("gap Streams = %v", g.Streams)
+	}
+	if g.LastMsgAt.Sub(downApprox).Abs() > time.Second {
+		t.Fatalf("gap LastMsgAt = %v, want ~%v", g.LastMsgAt, downApprox)
+	}
+	if !g.ReconnectAt.After(g.LastMsgAt) {
+		t.Fatalf("ReconnectAt %v not after LastMsgAt %v", g.ReconnectAt, g.LastMsgAt)
+	}
+}
+
+func TestOnGapNotFiredOnFirstConnect(t *testing.T) {
+	var n atomic.Int32
+	f := newFakeFactory()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c, err := New(ctx, Config{
+		Intervals: []string{"1m"}, ShardsPerInterval: 1, ConnectStagger: time.Millisecond,
+		Registerer: prometheus.NewRegistry(),
+		OnGap:      func(GapEvent) { n.Add(1) },
+	}, &fakeSink{}, withClientFactory(f.make))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	c.SetSymbols([]string{"BTCUSDT"})
+	eventually(t, time.Second, func() bool { return f.latest("kline_1m_0") != nil })
+	time.Sleep(30 * time.Millisecond)
+	if n.Load() != 0 {
+		t.Fatalf("OnGap fired %d times on first connect, want 0", n.Load())
+	}
+}
