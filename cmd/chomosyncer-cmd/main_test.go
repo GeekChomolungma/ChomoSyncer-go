@@ -3,13 +3,18 @@ package main
 import (
 	"errors"
 	"flag"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 )
 
 func TestParseFlagsDefaults(t *testing.T) {
-	c, _ := parseFlags(nil)
+	c, err := parseFlags(nil)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
 	if c.metricsAddr != ":9090" || c.redisAddr != "localhost:6379" || c.chAddr != "localhost:9000" {
 		t.Fatalf("defaults wrong: %+v", c)
 	}
@@ -19,10 +24,13 @@ func TestParseFlagsDefaults(t *testing.T) {
 	if c.sectionTimeout != 5*time.Second {
 		t.Fatalf("section timeout default = %v", c.sectionTimeout)
 	}
+	if c.windowSize != 200 {
+		t.Fatalf("window size default = %d, want 200", c.windowSize)
+	}
 }
 
 func TestParseFlagsOverride(t *testing.T) {
-	c, _ := parseFlags([]string{
+	c, err := parseFlags([]string{
 		"-metrics-addr", "off",
 		"-redis-addr", "redis:6380",
 		"-ch-addr", "ch-a:9000,ch-b:9000",
@@ -31,23 +39,34 @@ func TestParseFlagsOverride(t *testing.T) {
 		"-live-publish",
 		"-section-timeout", "3s",
 		"-log-format", "json",
+		"-window-size", "500",
+		"-dispatcher-closed-workers", "12",
 	})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
 	if c.metricsAddr != "off" || c.redisAddr != "redis:6380" || !c.livePublish {
 		t.Fatalf("overrides not applied: %+v", c)
 	}
 	if c.shards != 8 || c.sectionTimeout != 3*time.Second || c.logFormat != "json" {
 		t.Fatalf("overrides wrong: %+v", c)
 	}
+	if c.windowSize != 500 || c.dispatcherClosedWorkers != 12 {
+		t.Fatalf("new high-priority overrides wrong: %+v", c)
+	}
 
 	ac := c.toAppConfig(newLogger("info", "text"))
-	if !reflect.DeepEqual(ac.CHAddrs, []string{"ch-a:9000", "ch-b:9000"}) {
-		t.Fatalf("CHAddrs = %v", ac.CHAddrs)
+	if !reflect.DeepEqual(ac.ClickHouse.Addrs, []string{"ch-a:9000", "ch-b:9000"}) {
+		t.Fatalf("ClickHouse.Addrs = %v", ac.ClickHouse.Addrs)
 	}
-	if !reflect.DeepEqual(ac.Intervals, []string{"1m", "5m", "1h"}) {
-		t.Fatalf("Intervals = %v (CSV must trim spaces)", ac.Intervals)
+	if !reflect.DeepEqual(ac.Collector.Intervals, []string{"1m", "5m", "1h"}) {
+		t.Fatalf("Intervals = %v (CSV must trim spaces)", ac.Collector.Intervals)
 	}
-	if ac.MetricsAddr != "off" || ac.Version != version {
+	if ac.App.MetricsAddr != "off" || ac.Version != version {
 		t.Fatalf("toAppConfig mismatch: %+v", ac)
+	}
+	if ac.Redis.Window.WindowSize != 500 || ac.Dispatcher.ClosedWorkers != 12 {
+		t.Fatalf("ac overrides mismatch: %+v", ac)
 	}
 }
 
@@ -55,16 +74,91 @@ func TestEnvOverridesDefault(t *testing.T) {
 	t.Setenv("CHOMOSYNCER_REDIS_ADDR", "envredis:6379")
 	t.Setenv("CHOMOSYNCER_SHARDS_PER_INTERVAL", "6")
 	t.Setenv("CHOMOSYNCER_LIVE_PUBLISH", "true")
+	t.Setenv("CHOMOSYNCER_WINDOW_SIZE", "350")
 
-	c, _ := parseFlags(nil)
-	if c.redisAddr != "envredis:6379" || c.shards != 6 || !c.livePublish {
+	c, err := parseFlags(nil)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if c.redisAddr != "envredis:6379" || c.shards != 6 || !c.livePublish || c.windowSize != 350 {
 		t.Fatalf("env not honored: %+v", c)
 	}
 
 	// explicit flag still beats env
-	c, _ = parseFlags([]string{"-redis-addr", "flagredis:6379"})
+	c, err = parseFlags([]string{"-redis-addr", "flagredis:6379", "-window-size", "400"})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
 	if c.redisAddr != "flagredis:6379" {
 		t.Fatalf("flag should override env, got %q", c.redisAddr)
+	}
+	if c.windowSize != 400 {
+		t.Fatalf("flag should override env, got %d", c.windowSize)
+	}
+}
+
+func TestYAMLConfigLoading(t *testing.T) {
+	yamlContent := `
+redis:
+  window:
+    window_size: 600
+dispatcher:
+  closed_workers: 16
+clickhouse:
+  batch_size: 3000
+`
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "test_config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("write temp yaml: %v", err)
+	}
+
+	c, err := parseFlags([]string{"-config", cfgPath})
+	if err != nil {
+		t.Fatalf("parseFlags with -config: %v", err)
+	}
+
+	if c.windowSize != 600 {
+		t.Fatalf("windowSize = %d, want 600 from YAML", c.windowSize)
+	}
+	if c.dispatcherClosedWorkers != 16 {
+		t.Fatalf("dispatcherClosedWorkers = %d, want 16 from YAML", c.dispatcherClosedWorkers)
+	}
+	if c.chBatchSize != 3000 {
+		t.Fatalf("chBatchSize = %d, want 3000 from YAML", c.chBatchSize)
+	}
+}
+
+func TestCLIOverridesYAML(t *testing.T) {
+	yamlContent := `
+redis:
+  window:
+    window_size: 600
+dispatcher:
+  closed_workers: 16
+clickhouse:
+  batch_size: 3000
+`
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "test_config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("write temp yaml: %v", err)
+	}
+
+	// Override window-size on CLI, but keep closed_workers from YAML
+	c, err := parseFlags([]string{"-config", cfgPath, "-window-size", "800"})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+
+	if c.windowSize != 800 {
+		t.Fatalf("windowSize = %d, want 800 (CLI override)", c.windowSize)
+	}
+	if c.dispatcherClosedWorkers != 16 {
+		t.Fatalf("dispatcherClosedWorkers = %d, want 16 (from YAML)", c.dispatcherClosedWorkers)
+	}
+	if c.chBatchSize != 3000 {
+		t.Fatalf("chBatchSize = %d, want 3000 (from YAML)", c.chBatchSize)
 	}
 }
 
@@ -89,7 +183,10 @@ func TestNewLoggerLevels(t *testing.T) {
 }
 
 func TestParseFlagsBackfillDefaults(t *testing.T) {
-	c, _ := parseFlags(nil)
+	c, err := parseFlags(nil)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
 	if !c.backfill || c.backfillRestRPS != 20 || c.backfillWorkers != 4 {
 		t.Fatalf("backfill defaults: %+v", c)
 	}
@@ -97,13 +194,19 @@ func TestParseFlagsBackfillDefaults(t *testing.T) {
 		t.Fatalf("backfill duration defaults: %+v", c)
 	}
 
-	c2, _ := parseFlags([]string{"-backfill=false", "-backfill-rest-rps", "50"})
+	c2, err := parseFlags([]string{"-backfill=false", "-backfill-rest-rps", "50"})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
 	if c2.backfill || c2.backfillRestRPS != 50 {
 		t.Fatalf("backfill overrides: %+v", c2)
 	}
 
 	t.Setenv("CHOMOSYNCER_BACKFILL", "false")
-	c3, _ := parseFlags(nil)
+	c3, err := parseFlags(nil)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
 	if c3.backfill {
 		t.Fatal("env CHOMOSYNCER_BACKFILL=false not honored")
 	}

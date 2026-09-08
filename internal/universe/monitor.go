@@ -53,6 +53,13 @@ type Config struct {
 	// HTTPClient overrides the HTTP client (tests point it at httptest).
 	HTTPClient *http.Client
 
+	// QuoteAssets filters contracts by quote asset. Defaults to []string{"USDT"}.
+	QuoteAssets []string
+	// ContractType filters contracts by type. Defaults to "PERPETUAL".
+	ContractType string
+	// Status filters contracts by trading status. Defaults to "TRADING".
+	Status string
+
 	Registerer prometheus.Registerer
 	Logger     *slog.Logger
 }
@@ -82,9 +89,12 @@ type Monitor struct {
 }
 
 type resolvedConfig struct {
-	baseURL string
-	refresh time.Duration
-	offset  time.Duration
+	baseURL      string
+	refresh      time.Duration
+	offset       time.Duration
+	quoteAssets  map[string]struct{}
+	contractType string
+	status       string
 }
 
 // New builds a Monitor. It performs no I/O; call Start (or Refresh).
@@ -104,6 +114,26 @@ func New(cfg Config) *Monitor {
 		rc.offset = 0
 	} else if rc.offset == 0 {
 		rc.offset = DefaultRefreshOffset
+	}
+
+	quoteMap := make(map[string]struct{})
+	for _, qa := range cfg.QuoteAssets {
+		if qa != "" {
+			quoteMap[qa] = struct{}{}
+		}
+	}
+	if len(quoteMap) == 0 {
+		quoteMap["USDT"] = struct{}{}
+	}
+	rc.quoteAssets = quoteMap
+
+	rc.contractType = cfg.ContractType
+	if rc.contractType == "" {
+		rc.contractType = "PERPETUAL"
+	}
+	rc.status = cfg.Status
+	if rc.status == "" {
+		rc.status = "TRADING"
 	}
 	httpTO := cfg.HTTPTimeout
 	if httpTO <= 0 {
@@ -270,7 +300,9 @@ func (m *Monitor) fetch(ctx context.Context) ([]string, error) {
 	}
 	out := make([]string, 0, len(info.Symbols))
 	for _, s := range info.Symbols {
-		if s.QuoteAsset == "USDT" && s.ContractType == "PERPETUAL" && s.Status == "TRADING" {
+		if _, ok := m.cfg.quoteAssets[s.QuoteAsset]; ok &&
+			(m.cfg.contractType == "" || s.ContractType == m.cfg.contractType) &&
+			(m.cfg.status == "" || s.Status == m.cfg.status) {
 			out = append(out, s.Symbol)
 		}
 	}

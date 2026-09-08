@@ -10,21 +10,25 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/HarvestStars/chomosyncer-go/internal/chwriter"
+	"github.com/HarvestStars/chomosyncer-go/internal/config"
 )
 
 // unreachable endpoints so no test touches a real service.
 func smokeConfig() Config {
+	cfg := config.DefaultConfig()
+	cfg.Collector.WSURL = "ws://127.0.0.1:1"
+	cfg.Universe.RESTURL = "http://127.0.0.1:1"
+	cfg.Collector.Intervals = []string{"1m", "1h"}
+	cfg.Collector.ShardsPerInterval = 2
+	cfg.Redis.Addr = "127.0.0.1:1"
+	cfg.ClickHouse.Addrs = []string{"127.0.0.1:1"}
+	cfg.ClickHouse.DialTimeout = 150 * time.Millisecond
+	cfg.App.MetricsAddr = "off"
+	cfg.Dispatcher.SectionTimeout = time.Second
+	cfg.Backfill.Enabled = false
 	return Config{
-		WSBaseURL:         "ws://127.0.0.1:1",
-		RESTBaseURL:       "http://127.0.0.1:1",
-		Intervals:         []string{"1m", "1h"},
-		ShardsPerInterval: 2,
-		RedisAddr:         "127.0.0.1:1",
-		CHAddrs:           []string{"127.0.0.1:1"},
-		CHDialTimeout:     150 * time.Millisecond,
-		MetricsAddr:       "off",
-		SectionTimeout:    time.Second,
-		Version:           "test",
+		Config:  cfg,
+		Version: "test",
 	}
 }
 
@@ -145,8 +149,8 @@ func TestBackfillWiring(t *testing.T) {
 	defer cancel()
 
 	cfg := smokeConfig()
-	cfg.Backfill = true
-	cfg.BackfillFlushWait = time.Millisecond
+	cfg.Backfill.Enabled = true
+	cfg.Backfill.FlushWait = time.Millisecond
 
 	a, err := New(ctx, cfg)
 	if err != nil {

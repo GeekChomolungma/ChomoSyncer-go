@@ -65,14 +65,15 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		return nil, fmt.Errorf("app: "+format, args...)
 	}
 
-	mxAddr := cfg.MetricsAddr
+	mxAddr := cfg.App.MetricsAddr
 	if mxAddr == "off" {
 		mxAddr = ""
 	}
 	mx, err := metrics.New(metrics.Config{
-		Addr:    mxAddr,
-		Version: cfg.Version,
-		Logger:  cfg.Logger,
+		Addr:            mxAddr,
+		ShutdownTimeout: cfg.App.ShutdownTimeout,
+		Version:         cfg.Version,
+		Logger:          cfg.Logger,
 		// live closure: not-ready until the cold-start backfill (if any) completes.
 		Readiness: func() bool { return a.backfiller == nil || a.backfiller.Ready() },
 	})
@@ -83,26 +84,47 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	reg := mx.Registerer()
 
 	a.closedRDB = redis.NewClient(&redis.Options{
-		Addr: cfg.RedisAddr, DB: cfg.RedisDB, Password: cfg.RedisPassword,
+		Addr:         cfg.Redis.Addr,
+		DB:           cfg.Redis.DB,
+		Password:     cfg.Redis.Password,
+		PoolSize:     cfg.Redis.PoolSize,
+		DialTimeout:  cfg.Redis.DialTimeout,
+		ReadTimeout:  cfg.Redis.ReadTimeout,
+		WriteTimeout: cfg.Redis.WriteTimeout,
 	})
-	liveOpts := rediswin.LiveClientOptions(cfg.LiveRedisAddr)
-	liveOpts.DB = cfg.LiveRedisDB
-	liveOpts.Password = cfg.LiveRedisPassword
+	liveAddr := cfg.Redis.Live.Addr
+	if liveAddr == "" {
+		liveAddr = cfg.Redis.Addr
+	}
+	liveOpts := rediswin.LiveClientOptions(liveAddr)
+	liveOpts.DB = cfg.Redis.Live.DB
+	liveOpts.Password = cfg.Redis.Live.Password
+	if cfg.Redis.Live.PoolSize > 0 {
+		liveOpts.PoolSize = cfg.Redis.Live.PoolSize
+	}
 	a.liveRDB = redis.NewClient(liveOpts)
 
 	// One ClickHouse batch writer per interval -> per-interval table. Each gets a
 	// registerer wrapped with an {interval} label so the (shared) metric names
 	// do not collide.
-	for _, iv := range cfg.Intervals {
+	for _, iv := range cfg.Collector.Intervals {
 		w, err := chwriter.New(ctx, chwriter.Config{
-			Addrs:       cfg.CHAddrs,
-			Database:    cfg.CHDatabase,
-			Username:    cfg.CHUsername,
-			Password:    cfg.CHPassword,
-			Table:       cfg.CHTablePrefix + "_" + iv,
-			DialTimeout: cfg.CHDialTimeout,
-			Registerer:  prometheus.WrapRegistererWith(prometheus.Labels{"interval": iv}, reg),
-			Logger:      cfg.Logger,
+			Addrs:           cfg.ClickHouse.Addrs,
+			Database:        cfg.ClickHouse.Database,
+			Username:        cfg.ClickHouse.Username,
+			Password:        cfg.ClickHouse.Password,
+			Table:           cfg.ClickHouse.TablePrefix + "_" + iv,
+			DialTimeout:     cfg.ClickHouse.DialTimeout,
+			TLS:             cfg.ClickHouse.TLS,
+			BatchSize:       cfg.ClickHouse.BatchSize,
+			FlushInterval:   cfg.ClickHouse.FlushInterval,
+			ChannelSize:     cfg.ClickHouse.ChannelSize,
+			MaxRetries:      cfg.ClickHouse.MaxRetries,
+			RetryBackoff:    cfg.ClickHouse.RetryBackoff,
+			MaxRetryBackoff: cfg.ClickHouse.MaxRetryBackoff,
+			ShutdownTimeout: cfg.ClickHouse.ShutdownTimeout,
+			Registerer:      prometheus.WrapRegistererWith(prometheus.Labels{"interval": iv}, reg),
+			Logger:          cfg.Logger,
 		})
 		if err != nil {
 			return fail("clickhouse writer (%s): %w", iv, err)
@@ -110,20 +132,45 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		a.chWriters[iv] = w
 	}
 
-	a.win, err = rediswin.New(a.closedRDB, rediswin.Config{Registerer: reg, Logger: cfg.Logger})
+	a.win, err = rediswin.New(a.closedRDB, rediswin.Config{
+		KeyPrefix:    cfg.Redis.Window.KeyPrefix,
+		WindowSize:   cfg.Redis.Window.WindowSize,
+		StreamKey:    cfg.Redis.Window.StreamKey,
+		StreamMaxLen: cfg.Redis.Window.StreamMaxLen,
+		Atomic:       cfg.Redis.Window.Atomic,
+		Registerer:   reg,
+		Logger:       cfg.Logger,
+	})
 	if err != nil {
 		return fail("redis window writer: %w", err)
 	}
 
 	a.live, err = rediswin.NewLiveBarWriter(ctx, a.liveRDB, rediswin.LiveBarConfig{
-		Publish: cfg.LivePublish, Registerer: reg, Logger: cfg.Logger,
+		KeyPrefix:     cfg.Redis.Live.KeyPrefix,
+		Workers:       cfg.Redis.Live.Workers,
+		ChannelSize:   cfg.Redis.Live.ChannelSize,
+		WriteTimeout:  cfg.Redis.Live.WriteTimeout,
+		TTLMultiple:   cfg.Redis.Live.TTLMultiple,
+		DefaultTTL:    cfg.Redis.Live.DefaultTTL,
+		Publish:       cfg.Redis.Live.Publish,
+		ChannelPrefix: cfg.Redis.Live.ChannelPrefix,
+		Registerer:    reg,
+		Logger:        cfg.Logger,
 	})
 	if err != nil {
 		return fail("redis live bar writer: %w", err)
 	}
 
 	a.univ = universe.New(universe.Config{
-		BaseURL: cfg.RESTBaseURL, Registerer: reg, Logger: cfg.Logger,
+		BaseURL:         cfg.Universe.RESTURL,
+		RefreshInterval: cfg.Universe.RefreshInterval,
+		RefreshOffset:   cfg.Universe.RefreshOffset,
+		HTTPTimeout:     cfg.Universe.HTTPTimeout,
+		QuoteAssets:     cfg.Universe.QuoteAssets,
+		ContractType:    cfg.Universe.ContractType,
+		Status:          cfg.Universe.Status,
+		Registerer:      reg,
+		Logger:          cfg.Logger,
 	})
 
 	router := &archiveRouter{
@@ -139,7 +186,12 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	a.gate = windowgate.New(reg)
 
 	a.disp, err = dispatcher.New(ctx, dispatcher.Config{
-		SectionTimeout: cfg.SectionTimeout, Registerer: reg, Logger: cfg.Logger,
+		ClosedWorkers:   cfg.Dispatcher.ClosedWorkers,
+		ClosedQueueSize: cfg.Dispatcher.ClosedQueueSize,
+		SectionTimeout:  cfg.Dispatcher.SectionTimeout,
+		PublishTimeout:  cfg.Dispatcher.PublishTimeout,
+		Registerer:      reg,
+		Logger:          cfg.Logger,
 	}, dispatcher.Sinks{
 		Live:    a.live,
 		Window:  a.gate.WrapWindow(a.win),
@@ -151,20 +203,24 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	}
 
 	// --- gapfill / backfiller (optional) ---
-	if cfg.Backfill {
+	if cfg.Backfill.Enabled {
 		a.chStore, err = backfill.NewCHStore(backfill.CHStoreConfig{
-			Addrs:       cfg.CHAddrs,
-			Database:    cfg.CHDatabase,
-			Username:    cfg.CHUsername,
-			Password:    cfg.CHPassword,
-			TablePrefix: cfg.CHTablePrefix,
-			DialTimeout: cfg.CHDialTimeout,
+			Addrs:       cfg.ClickHouse.Addrs,
+			Database:    cfg.ClickHouse.Database,
+			Username:    cfg.ClickHouse.Username,
+			Password:    cfg.ClickHouse.Password,
+			TablePrefix: cfg.ClickHouse.TablePrefix,
+			DialTimeout: cfg.ClickHouse.DialTimeout,
+			TLS:         cfg.ClickHouse.TLS,
 		})
 		if err != nil {
 			return fail("clickhouse read store: %w", err)
 		}
 		fetcher := backfill.NewBinanceFetcher(backfill.FetcherConfig{
-			BaseURL: cfg.RESTBaseURL, RPS: cfg.BackfillRestRPS, Registerer: reg, Logger: cfg.Logger,
+			BaseURL:    cfg.Universe.RESTURL,
+			RPS:        cfg.Backfill.RestRPS,
+			Registerer: reg,
+			Logger:     cfg.Logger,
 		})
 		archiveMap := make(map[string]backfill.ArchiveWriter, len(a.chWriters))
 		for iv, w := range a.chWriters {
@@ -172,10 +228,12 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		}
 		a.backfiller, err = backfill.New(backfill.Config{
 			MaxGapWindow: 0, // per-interval WindowSize×interval
-			GapDebounce:  cfg.BackfillGapDebounce,
-			Workers:      cfg.BackfillWorkers,
-			GateTimeout:  cfg.BackfillGateTimeout,
-			FlushWait:    cfg.BackfillFlushWait,
+			GapDebounce:  cfg.Backfill.GapDebounce,
+			Workers:      cfg.Backfill.Workers,
+			QueueSize:    cfg.Backfill.QueueSize,
+			WindowSize:   cfg.Redis.Window.WindowSize,
+			GateTimeout:  cfg.Backfill.GateTimeout,
+			FlushWait:    cfg.Backfill.FlushWait,
 			Registerer:   reg,
 			Logger:       cfg.Logger,
 		}, fetcher, archiveMap, a.chStore, a.win, gateAdapter{a.gate})
@@ -185,9 +243,15 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	}
 
 	colCfg := collector.Config{
-		Intervals:         cfg.Intervals,
-		ShardsPerInterval: cfg.ShardsPerInterval,
-		WSBaseURL:         cfg.WSBaseURL,
+		Intervals:         cfg.Collector.Intervals,
+		ShardsPerInterval: cfg.Collector.ShardsPerInterval,
+		WSBaseURL:         cfg.Collector.WSURL,
+		ConnectStagger:    cfg.Collector.ConnectStagger,
+		ConnectTimeout:    cfg.Collector.ConnectTimeout,
+		ReconnectBase:     cfg.Collector.ReconnectBase,
+		ReconnectMax:      cfg.Collector.ReconnectMax,
+		StaleTimeout:      cfg.Collector.StaleTimeout,
+		WatchdogInterval:  cfg.Collector.WatchdogInterval,
 		Registerer:        reg,
 		Logger:            cfg.Logger,
 	}
@@ -241,7 +305,7 @@ func (a *App) onUniverseChange(s universe.Snapshot) {
 	if a.coldStartSubmitted.Load() && len(added) > 0 {
 		a.log.Info("universe added symbols; scheduling backfill", "count", len(added))
 		a.backfiller.Submit(backfill.Request{
-			Keys:   keysOf(added, a.cfg.Intervals),
+			Keys:   keysOf(added, a.cfg.Collector.Intervals),
 			Reason: backfill.ReasonUniverseAdd,
 		})
 	}
@@ -268,20 +332,20 @@ func (a *App) Run(ctx context.Context) error {
 	if a.backfiller != nil {
 		syms := a.univ.Snapshot().Symbols
 		a.coldStartSubmitted.Store(true) // here is the first time we activate backfiller
-		a.backfiller.SubmitColdStart(keysOf(syms, a.cfg.Intervals))
-		a.log.Info("cold-start backfill submitted", "keys", len(syms)*len(a.cfg.Intervals))
+		a.backfiller.SubmitColdStart(keysOf(syms, a.cfg.Collector.Intervals))
+		a.log.Info("cold-start backfill submitted", "keys", len(syms)*len(a.cfg.Collector.Intervals))
 	}
 
 	a.log.Info("chomosyncer-go running",
 		"metrics_addr", a.metrics.Addr(),
-		"intervals", a.cfg.Intervals,
+		"intervals", a.cfg.Collector.Intervals,
 		"symbols", len(a.univ.Snapshot().Symbols),
 		"backfill", a.backfiller != nil)
 
 	<-ctx.Done()
 	a.log.Info("shutdown signal received; draining")
 
-	sctx, cancel := context.WithTimeout(context.Background(), a.cfg.ShutdownTimeout)
+	sctx, cancel := context.WithTimeout(context.Background(), a.cfg.App.ShutdownTimeout)
 	defer cancel()
 	return a.Shutdown(sctx)
 }

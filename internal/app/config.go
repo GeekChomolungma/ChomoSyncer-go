@@ -1,134 +1,211 @@
-// Package app wires the whole ChomoSyncer-go pipeline together:
-//
-//	universe (symbol discovery)
-//	   └─► collector (Binance WS shards)
-//	          └─► dispatcher (fan-out)
-//	                 ├─► rediswin.Writer        (closed 200-bar window + kline_ready)
-//	                 ├─► rediswin.LiveBarWriter (live snapshot)
-//	                 └─► chwriter.BatchWriter × interval (ClickHouse archive)
-//	metrics serves the shared registry over /metrics.
 package app
 
 import (
 	"log/slog"
-	"time"
+
+	"github.com/HarvestStars/chomosyncer-go/internal/config"
 )
 
-// Config is the fully-resolved runtime configuration. cmd/chomosyncer-go builds
-// it from flags + env.
+// Config is the runtime configuration for the App, embedding the modular
+// configuration plus process-level dependencies.
 type Config struct {
-	// --- Binance ---
-	WSBaseURL         string   // wss://fstream.binance.com
-	RESTBaseURL       string   // https://fapi.binance.com
-	Intervals         []string // {"1m","1h"}
-	ShardsPerInterval int
+	config.Config
 
-	// --- Redis: closed-bar window + kline_ready stream ---
-	RedisAddr     string
-	RedisDB       int
-	RedisPassword string
-
-	// --- Redis: live-bar snapshot (dedicated client) ---
-	// Empty LiveRedisAddr mirrors the closed-bar Redis endpoint.
-	LiveRedisAddr     string
-	LiveRedisDB       int
-	LiveRedisPassword string
-	LivePublish       bool
-
-	// --- ClickHouse ---
-	CHAddrs       []string
-	CHDatabase    string
-	CHUsername    string
-	CHPassword    string
-	CHTablePrefix string // per interval: "<prefix>_<interval>" (e.g. market.fapi_kline_1m)
-	CHDialTimeout time.Duration
-
-	// --- dispatcher ---
-	SectionTimeout time.Duration
-
-	// --- historical gapfill (see docs/GAPFILL_DESIGN.md) ---
-	Backfill            bool          // master switch; false => forward-only
-	BackfillRestRPS     float64       // token-bucket rate for /fapi/v1/klines, default 20
-	BackfillWorkers     int           // per-request parallel fetch, default 4
-	BackfillGapDebounce time.Duration // coalesce repeated shard-reconnect gaps, default 30s
-	BackfillGateTimeout time.Duration // force-release a stuck key after this, default 5m
-	BackfillFlushWait   time.Duration // wait after archiving before CH read-back, default 2s
-
-	// --- observability ---
-	MetricsAddr string // ":9090" (default); "off" disables the HTTP server
-	Version     string
-
-	// --- shutdown ---
-	ShutdownTimeout time.Duration
-
-	Logger *slog.Logger
+	Version string
+	Logger  *slog.Logger
 }
 
 func (c Config) withDefaults() Config {
-	if c.WSBaseURL == "" {
-		c.WSBaseURL = "wss://fstream.binance.com"
-	}
-	if c.RESTBaseURL == "" {
-		c.RESTBaseURL = "https://fapi.binance.com"
-	}
-	if len(c.Intervals) == 0 {
-		c.Intervals = []string{"1m", "1h"}
-	}
-	if c.ShardsPerInterval <= 0 {
-		c.ShardsPerInterval = 4
-	}
-	if c.RedisAddr == "" {
-		c.RedisAddr = "localhost:6379"
-	}
-	if c.LiveRedisAddr == "" {
-		c.LiveRedisAddr = c.RedisAddr
-		c.LiveRedisDB = c.RedisDB
-		c.LiveRedisPassword = c.RedisPassword
-	}
-	if len(c.CHAddrs) == 0 {
-		c.CHAddrs = []string{"localhost:9000"}
-	}
-	if c.CHDatabase == "" {
-		c.CHDatabase = "market"
-	}
-	if c.CHUsername == "" {
-		c.CHUsername = "default"
-	}
-	if c.CHTablePrefix == "" {
-		c.CHTablePrefix = "market.fapi_kline"
-	}
-	if c.CHDialTimeout <= 0 {
-		c.CHDialTimeout = 5 * time.Second
-	}
-	if c.SectionTimeout <= 0 {
-		c.SectionTimeout = 5 * time.Second
-	}
-	if c.BackfillRestRPS <= 0 {
-		c.BackfillRestRPS = 20
-	}
-	if c.BackfillWorkers <= 0 {
-		c.BackfillWorkers = 4
-	}
-	if c.BackfillGapDebounce <= 0 {
-		c.BackfillGapDebounce = 30 * time.Second
-	}
-	if c.BackfillGateTimeout <= 0 {
-		c.BackfillGateTimeout = 5 * time.Minute
-	}
-	if c.BackfillFlushWait <= 0 {
-		c.BackfillFlushWait = 2 * time.Second
-	}
-	if c.MetricsAddr == "" {
-		c.MetricsAddr = ":9090"
+	if c.Logger == nil {
+		c.Logger = slog.Default()
 	}
 	if c.Version == "" {
 		c.Version = "dev"
 	}
-	if c.ShutdownTimeout <= 0 {
-		c.ShutdownTimeout = 30 * time.Second
+
+	def := config.DefaultConfig()
+	if len(c.Collector.Intervals) == 0 {
+		c.Collector.Intervals = def.Collector.Intervals
 	}
-	if c.Logger == nil {
-		c.Logger = slog.Default()
+	if c.Collector.ShardsPerInterval <= 0 {
+		c.Collector.ShardsPerInterval = def.Collector.ShardsPerInterval
+	}
+	if c.Collector.WSURL == "" {
+		c.Collector.WSURL = def.Collector.WSURL
+	}
+	if c.Collector.ConnectStagger <= 0 {
+		c.Collector.ConnectStagger = def.Collector.ConnectStagger
+	}
+	if c.Collector.ConnectTimeout <= 0 {
+		c.Collector.ConnectTimeout = def.Collector.ConnectTimeout
+	}
+	if c.Collector.ReconnectBase <= 0 {
+		c.Collector.ReconnectBase = def.Collector.ReconnectBase
+	}
+	if c.Collector.ReconnectMax <= 0 {
+		c.Collector.ReconnectMax = def.Collector.ReconnectMax
+	}
+	if c.Collector.StaleTimeout <= 0 {
+		c.Collector.StaleTimeout = def.Collector.StaleTimeout
+	}
+	if c.Collector.WatchdogInterval <= 0 {
+		c.Collector.WatchdogInterval = def.Collector.WatchdogInterval
+	}
+
+	if c.Dispatcher.ClosedWorkers <= 0 {
+		c.Dispatcher.ClosedWorkers = def.Dispatcher.ClosedWorkers
+	}
+	if c.Dispatcher.ClosedQueueSize <= 0 {
+		c.Dispatcher.ClosedQueueSize = def.Dispatcher.ClosedQueueSize
+	}
+	if c.Dispatcher.SectionTimeout <= 0 {
+		c.Dispatcher.SectionTimeout = def.Dispatcher.SectionTimeout
+	}
+	if c.Dispatcher.PublishTimeout <= 0 {
+		c.Dispatcher.PublishTimeout = def.Dispatcher.PublishTimeout
+	}
+
+	if c.Redis.Addr == "" {
+		c.Redis.Addr = def.Redis.Addr
+	}
+	if c.Redis.PoolSize <= 0 {
+		c.Redis.PoolSize = def.Redis.PoolSize
+	}
+	if c.Redis.DialTimeout <= 0 {
+		c.Redis.DialTimeout = def.Redis.DialTimeout
+	}
+	if c.Redis.ReadTimeout <= 0 {
+		c.Redis.ReadTimeout = def.Redis.ReadTimeout
+	}
+	if c.Redis.WriteTimeout <= 0 {
+		c.Redis.WriteTimeout = def.Redis.WriteTimeout
+	}
+	if c.Redis.Window.WindowSize <= 0 {
+		c.Redis.Window.WindowSize = def.Redis.Window.WindowSize
+	}
+	if c.Redis.Window.KeyPrefix == "" {
+		c.Redis.Window.KeyPrefix = def.Redis.Window.KeyPrefix
+	}
+	if c.Redis.Window.StreamKey == "" {
+		c.Redis.Window.StreamKey = def.Redis.Window.StreamKey
+	}
+	if c.Redis.Window.StreamMaxLen <= 0 {
+		c.Redis.Window.StreamMaxLen = def.Redis.Window.StreamMaxLen
+	}
+
+	if c.Redis.Live.Addr == "" {
+		c.Redis.Live.Addr = c.Redis.Addr
+		c.Redis.Live.DB = c.Redis.DB
+		c.Redis.Live.Password = c.Redis.Password
+	}
+	if c.Redis.Live.PoolSize <= 0 {
+		c.Redis.Live.PoolSize = def.Redis.Live.PoolSize
+	}
+	if c.Redis.Live.Workers <= 0 {
+		c.Redis.Live.Workers = def.Redis.Live.Workers
+	}
+	if c.Redis.Live.ChannelSize <= 0 {
+		c.Redis.Live.ChannelSize = def.Redis.Live.ChannelSize
+	}
+	if c.Redis.Live.WriteTimeout <= 0 {
+		c.Redis.Live.WriteTimeout = def.Redis.Live.WriteTimeout
+	}
+	if c.Redis.Live.TTLMultiple <= 0 {
+		c.Redis.Live.TTLMultiple = def.Redis.Live.TTLMultiple
+	}
+	if c.Redis.Live.DefaultTTL <= 0 {
+		c.Redis.Live.DefaultTTL = def.Redis.Live.DefaultTTL
+	}
+	if c.Redis.Live.KeyPrefix == "" {
+		c.Redis.Live.KeyPrefix = def.Redis.Live.KeyPrefix
+	}
+	if c.Redis.Live.ChannelPrefix == "" {
+		c.Redis.Live.ChannelPrefix = def.Redis.Live.ChannelPrefix
+	}
+
+	if len(c.ClickHouse.Addrs) == 0 {
+		c.ClickHouse.Addrs = def.ClickHouse.Addrs
+	}
+	if c.ClickHouse.Database == "" {
+		c.ClickHouse.Database = def.ClickHouse.Database
+	}
+	if c.ClickHouse.Username == "" {
+		c.ClickHouse.Username = def.ClickHouse.Username
+	}
+	if c.ClickHouse.TablePrefix == "" {
+		c.ClickHouse.TablePrefix = def.ClickHouse.TablePrefix
+	}
+	if c.ClickHouse.DialTimeout <= 0 {
+		c.ClickHouse.DialTimeout = def.ClickHouse.DialTimeout
+	}
+	if c.ClickHouse.BatchSize <= 0 {
+		c.ClickHouse.BatchSize = def.ClickHouse.BatchSize
+	}
+	if c.ClickHouse.FlushInterval <= 0 {
+		c.ClickHouse.FlushInterval = def.ClickHouse.FlushInterval
+	}
+	if c.ClickHouse.ChannelSize <= 0 {
+		c.ClickHouse.ChannelSize = def.ClickHouse.ChannelSize
+	}
+	if c.ClickHouse.MaxRetries <= 0 {
+		c.ClickHouse.MaxRetries = def.ClickHouse.MaxRetries
+	}
+	if c.ClickHouse.RetryBackoff <= 0 {
+		c.ClickHouse.RetryBackoff = def.ClickHouse.RetryBackoff
+	}
+	if c.ClickHouse.MaxRetryBackoff <= 0 {
+		c.ClickHouse.MaxRetryBackoff = def.ClickHouse.MaxRetryBackoff
+	}
+	if c.ClickHouse.ShutdownTimeout <= 0 {
+		c.ClickHouse.ShutdownTimeout = def.ClickHouse.ShutdownTimeout
+	}
+
+	if c.Universe.RESTURL == "" {
+		c.Universe.RESTURL = def.Universe.RESTURL
+	}
+	if c.Universe.RefreshInterval <= 0 {
+		c.Universe.RefreshInterval = def.Universe.RefreshInterval
+	}
+	if c.Universe.RefreshOffset <= 0 {
+		c.Universe.RefreshOffset = def.Universe.RefreshOffset
+	}
+	if c.Universe.HTTPTimeout <= 0 {
+		c.Universe.HTTPTimeout = def.Universe.HTTPTimeout
+	}
+	if len(c.Universe.QuoteAssets) == 0 {
+		c.Universe.QuoteAssets = def.Universe.QuoteAssets
+	}
+	if c.Universe.ContractType == "" {
+		c.Universe.ContractType = def.Universe.ContractType
+	}
+	if c.Universe.Status == "" {
+		c.Universe.Status = def.Universe.Status
+	}
+
+	if c.Backfill.Workers <= 0 {
+		c.Backfill.Workers = def.Backfill.Workers
+	}
+	if c.Backfill.RestRPS <= 0 {
+		c.Backfill.RestRPS = def.Backfill.RestRPS
+	}
+	if c.Backfill.QueueSize <= 0 {
+		c.Backfill.QueueSize = def.Backfill.QueueSize
+	}
+	if c.Backfill.GapDebounce <= 0 {
+		c.Backfill.GapDebounce = def.Backfill.GapDebounce
+	}
+	if c.Backfill.GateTimeout <= 0 {
+		c.Backfill.GateTimeout = def.Backfill.GateTimeout
+	}
+	if c.Backfill.FlushWait <= 0 {
+		c.Backfill.FlushWait = def.Backfill.FlushWait
+	}
+
+	if c.App.MetricsAddr == "" {
+		c.App.MetricsAddr = def.App.MetricsAddr
+	}
+	if c.App.ShutdownTimeout <= 0 {
+		c.App.ShutdownTimeout = def.App.ShutdownTimeout
 	}
 	return c
 }

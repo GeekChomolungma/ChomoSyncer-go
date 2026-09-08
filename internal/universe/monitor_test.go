@@ -64,6 +64,21 @@ func TestRefreshWholeMarketFilter(t *testing.T) {
 	}
 }
 
+func TestRefreshCustomQuoteAssets(t *testing.T) {
+	m := newTestMonitor(t, Config{
+		QuoteAssets: []string{"USDT", "USDC"},
+	})
+
+	snap, err := m.Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	expected := []string{"BTCUSDC", "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"}
+	if !equalStrings(snap.Symbols, expected) {
+		t.Fatalf("Symbols = %v, want %v", snap.Symbols, expected)
+	}
+}
+
 func TestUniverseProviderInterface(t *testing.T) {
 	m := newTestMonitor(t, Config{})
 	if m.Size() != 0 {
