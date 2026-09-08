@@ -406,3 +406,131 @@ func TestNilFlusherRejected(t *testing.T) {
 		t.Fatal("expected error for nil flusher")
 	}
 }
+
+func TestExplicitFlushFlushesBufferedRows(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ff := &fakeFlusher{}
+	w := newTestWriter(t, ctx, Config{
+		BatchSize:     100,
+		FlushInterval: time.Hour, // ticker won't fire during test
+	}, ff)
+	defer func() { _ = w.Close() }()
+
+	const count = 15
+	for i := 0; i < count; i++ {
+		if err := w.Push(ctx, sampleRow(i)); err != nil {
+			t.Fatalf("Push: %v", err)
+		}
+	}
+
+	// Before Flush, rows are still buffered because BatchSize is 100
+	batches, total, _ := ff.snapshot()
+	if batches != 0 || total != 0 {
+		t.Fatalf("unexpected early flush: batches=%d, total=%d", batches, total)
+	}
+
+	// Explicit Flush forces immediate write
+	if err := w.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	batches, total, _ = ff.snapshot()
+	if batches != 1 || total != count {
+		t.Fatalf("after Flush: want 1 batch, %d rows; got %d batches, %d rows", count, batches, total)
+	}
+}
+
+func TestExplicitFlushMultipleBatches(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ff := &fakeFlusher{}
+	w := newTestWriter(t, ctx, Config{
+		BatchSize:     10,
+		FlushInterval: time.Hour,
+		ChannelSize:   100,
+	}, ff)
+	defer func() { _ = w.Close() }()
+
+	const count = 35
+	for i := 0; i < count; i++ {
+		if err := w.Push(ctx, sampleRow(i)); err != nil {
+			t.Fatalf("Push: %v", err)
+		}
+	}
+
+	if err := w.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	_, total, _ := ff.snapshot()
+	if total != count {
+		t.Fatalf("after Flush: want %d rows flushed, got %d", count, total)
+	}
+}
+
+func TestExplicitFlushEmpty(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ff := &fakeFlusher{}
+	w := newTestWriter(t, ctx, Config{
+		BatchSize:     10,
+		FlushInterval: time.Hour,
+	}, ff)
+	defer func() { _ = w.Close() }()
+
+	if err := w.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	batches, total, calls := ff.snapshot()
+	if batches != 0 || total != 0 || calls != 0 {
+		t.Fatalf("empty Flush should not call flusher: batches=%d total=%d calls=%d", batches, total, calls)
+	}
+}
+
+func TestExplicitFlushWhenClosed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ff := &fakeFlusher{}
+	w := newTestWriter(t, ctx, Config{
+		BatchSize:     10,
+		FlushInterval: time.Hour,
+	}, ff)
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := w.Flush(ctx); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Flush after Close: want ErrClosed, got %v", err)
+	}
+}
+
+func TestExplicitFlushContextCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ff := &fakeFlusher{delay: 200 * time.Millisecond}
+	w := newTestWriter(t, ctx, Config{
+		BatchSize:       10,
+		FlushInterval:   time.Hour,
+		ShutdownTimeout: 500 * time.Millisecond,
+	}, ff)
+	defer func() { _ = w.Close() }()
+
+	for i := 0; i < 5; i++ {
+		_ = w.Push(ctx, sampleRow(i))
+	}
+
+	flushCtx, flushCancel := context.WithTimeout(ctx, 30*time.Millisecond)
+	defer flushCancel()
+
+	err := w.Flush(flushCtx)
+	if err == nil || (!errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled)) {
+		t.Fatalf("want timeout/canceled error, got %v", err)
+	}
+}

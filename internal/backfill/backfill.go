@@ -69,6 +69,7 @@ type KlineFetcher interface {
 // ArchiveWriter is the per-interval ClickHouse writer. *chwriter.BatchWriter satisfies it.
 type ArchiveWriter interface {
 	Push(ctx context.Context, row chwriter.Row) error
+	Flush(ctx context.Context) error
 }
 
 // KlineStore reads back from ClickHouse.
@@ -475,11 +476,19 @@ func (b *Backfiller) processInterval(ctx context.Context, iv string, symbols []s
 		return
 	}
 
-	// 2. let chwriter flush
-	select {
-	case <-time.After(b.cfg.flushWait):
-	case <-ctx.Done():
-		return
+	// 2. flush chwriter to guarantee all rows are on ClickHouse before reading back
+	if aw != nil {
+		if err := aw.Flush(ctx); err != nil {
+			b.metrics.errors.WithLabelValues("archive").Inc()
+			b.log.Warn("archive flush failed before rebuild", "interval", iv, "err", err)
+			return
+		}
+	} else if b.cfg.flushWait > 0 {
+		select {
+		case <-time.After(b.cfg.flushWait):
+		case <-ctx.Done():
+			return
+		}
 	}
 
 	// 3. read the deduped tail back, rebuild windows

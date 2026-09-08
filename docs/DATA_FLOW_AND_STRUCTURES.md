@@ -629,10 +629,10 @@ Gapfill 负责与增量采集**并行运作**，在后台将缺失数据从币�
     - 处理单个请求时，在 [`processInterval`](../internal/backfill/backfill.go#L413) 内部通过信号量 Channel `sem := make(chan struct{}, b.cfg.workers)` 限制最大并发 Worker 数（默认 4 个）。
     - **分割方式**：**按 Symbol 进行并发分割**。每个 Symbol 启动一个临时 Goroutine 并发执行 `fetchAndArchive`。
     - **限流控制**：所有 Worker 共享一个全局 Token Bucket 限流器 [`rate.Limiter`](../internal/backfill/rest.go#L38)（默认 20 RPS），防止触发币安 429 / 418 IP 封禁。
-  - **落盘等待与尾部读回**：
+  - **显式 Flush 同步屏障与尾部读回**：
     - REST 拉取的数据逐行调用 `chwriter.Push` 写入 ClickHouse 缓冲队列。
-    - Worker 全部完成后，主循环 Sleep [`FlushWait`](../internal/backfill/backfill.go#L480)（默认 2s），确保 ClickHouse BatchWriter 已将数据物理写入磁盘。
-    - 调取 ClickHouse 读连接，执行带有 `FINAL` 的 SQL 查询，一次性读出该 interval 所有目标 symbol 最近的 200 根 Bar。
+    - Worker 全部完成后，主循环主动调用 `aw.Flush(ctx)` 触发显式落盘屏障，BatchWriter 立即清空 Channel 中堆积的所有行并阻塞等待 ClickHouse TCP 批次物理写入完成（若无 writer 则 fallback 到 `FlushWait`）。
+    - 调取 ClickHouse 读连接，执行带有 `FINAL` 的 SQL 查询，一次性读出该 interval 所有目标 symbol 最近的 200 根 Bar。若 Flush 出错则跳过重建，避免脏数据读入 Redis。
   - **Redis 窗口原子重建与解锁**：
     - 调用 [`Writer.RebuildWindow`](../internal/rediswin/writer.go#L222)，利用原子 Lua 脚本全量替换 List 元素。
     - 调用 [`gate.Release(keys)`](../internal/windowgate/gate.go#L77) 释放门控，实时流恢复写入。

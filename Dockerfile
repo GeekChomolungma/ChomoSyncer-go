@@ -10,7 +10,7 @@ ARG VERSION=dev
 # CGO off => static binary that runs on distroless/static.
 RUN CGO_ENABLED=0 go build -trimpath \
       -ldflags "-s -w -X main.version=${VERSION}" \
-      -o /out/chomosyncer-go ./cmd/chomosyncer-go
+      -o /out/chomosyncer-go ./cmd/chomosyncer-cmd
 
 # --- runtime ---
 FROM gcr.io/distroless/static-debian12:nonroot

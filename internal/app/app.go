@@ -237,6 +237,7 @@ func (a *App) onUniverseChange(s universe.Snapshot) {
 
 	// The first snapshot (pre-cold-start) just seeds prevSymbols; cold start
 	// covers those keys.
+	// Here is only for when each overnight refresh, and we only want to backfill the newly added symbols.
 	if a.coldStartSubmitted.Load() && len(added) > 0 {
 		a.log.Info("universe added symbols; scheduling backfill", "count", len(added))
 		a.backfiller.Submit(backfill.Request{
@@ -257,6 +258,8 @@ func (a *App) Run(ctx context.Context) error {
 	if a.backfiller != nil {
 		a.backfiller.Start(ctx)
 	}
+
+	// do the fn 'onUniverseChange' -> SetSymbols -> shards -> all subscriptions -> handle events -> dispatch to sinks (live, window, archive) -> write to redis and clickhouse
 	if err := a.univ.Start(ctx); err != nil {
 		_ = a.Shutdown(context.Background())
 		return fmt.Errorf("app: start universe: %w", err)
@@ -264,7 +267,7 @@ func (a *App) Run(ctx context.Context) error {
 
 	if a.backfiller != nil {
 		syms := a.univ.Snapshot().Symbols
-		a.coldStartSubmitted.Store(true)
+		a.coldStartSubmitted.Store(true) // here is the first time we activate backfiller
 		a.backfiller.SubmitColdStart(keysOf(syms, a.cfg.Intervals))
 		a.log.Info("cold-start backfill submitted", "keys", len(syms)*len(a.cfg.Intervals))
 	}

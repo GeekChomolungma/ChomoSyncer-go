@@ -59,9 +59,11 @@ func (f *fakeFetcher) lastCall() (fetchCall, bool) {
 }
 
 type fakeArchive struct {
-	mu   sync.Mutex
-	rows []chwriter.Row
-	err  error
+	mu         sync.Mutex
+	rows       []chwriter.Row
+	err        error
+	flushErr   error
+	flushCalls int
 }
 
 func (a *fakeArchive) Push(_ context.Context, r chwriter.Row) error {
@@ -73,6 +75,17 @@ func (a *fakeArchive) Push(_ context.Context, r chwriter.Row) error {
 	a.rows = append(a.rows, r)
 	return nil
 }
+
+func (a *fakeArchive) Flush(_ context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.flushCalls++
+	if a.flushErr != nil {
+		return a.flushErr
+	}
+	return a.err
+}
+
 func (a *fakeArchive) count() int { a.mu.Lock(); defer a.mu.Unlock(); return len(a.rows) }
 
 type fakeStore struct {
@@ -381,6 +394,28 @@ func TestGateReleasedOnStoreError(t *testing.T) {
 	}
 	if v := testutil.ToFloat64(h.b.metrics.errors.WithLabelValues("ch_read")); v != 1 {
 		t.Fatalf("errors{ch_read} = %v, want 1", v)
+	}
+}
+
+func TestGateReleasedOnArchiveFlushError(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.arc["1h"].flushErr = errors.New("archive flush boom")
+	h.fetch.rows["BTCUSDT/1h"] = []chwriter.Row{row("BTCUSDT", fixedNow.Add(-2*time.Hour).UnixMilli(), 1)}
+
+	h.b.Submit(Request{Keys: []Key{{"BTCUSDT", "1h"}}, Since: fixedNow.Add(-3 * time.Hour), Until: fixedNow, Reason: ReasonShardReconnect})
+
+	eventually(t, 2*time.Second, func() bool { return !h.gate.isHeld("BTCUSDT", "1h") })
+	if _, ok := h.rb.get("BTCUSDT", "1h"); ok {
+		t.Fatal("no rebuild expected when archive flush failed")
+	}
+	if h.store.lastCalls != 0 {
+		t.Fatalf("LastBars calls = %d, want 0", h.store.lastCalls)
+	}
+	if v := testutil.ToFloat64(h.b.metrics.errors.WithLabelValues("archive")); v != 1 {
+		t.Fatalf("errors{archive} = %v, want 1", v)
+	}
+	if h.arc["1h"].flushCalls != 1 {
+		t.Fatalf("flushCalls = %d, want 1", h.arc["1h"].flushCalls)
 	}
 }
 

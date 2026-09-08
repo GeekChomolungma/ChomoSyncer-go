@@ -44,12 +44,18 @@ type BatchWriter struct {
 	log     *slog.Logger
 	metrics *metrics
 
-	input  chan Row
-	stopCh chan struct{} // closed by Close to request graceful shutdown
-	done   chan struct{} // closed by the run loop on exit
+	input    chan Row
+	flushReq chan flushRequest
+	stopCh   chan struct{} // closed by Close to request graceful shutdown
+	done     chan struct{} // closed by the run loop on exit
 
 	closeOnce sync.Once
 	closed    atomic.Bool
+}
+
+type flushRequest struct {
+	ctx  context.Context
+	done chan error
 }
 
 // New builds a BatchWriter backed by a real ClickHouse connection (native
@@ -75,12 +81,13 @@ func NewWithFlusher(ctx context.Context, cfg Config, flusher Flusher) (*BatchWri
 		log = slog.Default()
 	}
 	w := &BatchWriter{
-		cfg:     cfg.resolve(),
-		flusher: flusher,
-		log:     log.With("component", "clickhouse_batch_writer"),
-		metrics: newMetrics(cfg.Registerer),
-		stopCh:  make(chan struct{}),
-		done:    make(chan struct{}),
+		cfg:      cfg.resolve(),
+		flusher:  flusher,
+		log:      log.With("component", "clickhouse_batch_writer"),
+		metrics:  newMetrics(cfg.Registerer),
+		flushReq: make(chan flushRequest),
+		stopCh:   make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 	w.input = make(chan Row, w.cfg.channelSize)
 	go w.loop(ctx)
@@ -139,6 +146,38 @@ func (w *BatchWriter) Close() error {
 // Done returns a channel closed when the run loop has fully stopped.
 func (w *BatchWriter) Done() <-chan struct{} { return w.done }
 
+// Flush forces an immediate flush of all currently buffered rows to ClickHouse,
+// waiting for completion or ctx cancellation. Safe for concurrent use.
+func (w *BatchWriter) Flush(ctx context.Context) error {
+	if w.closed.Load() {
+		return ErrClosed
+	}
+	req := flushRequest{
+		ctx:  ctx,
+		done: make(chan error, 1),
+	}
+	select {
+	case w.flushReq <- req:
+	case <-w.stopCh:
+		return ErrClosed
+	case <-w.done:
+		return ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	select {
+	case err := <-req.done:
+		return err
+	case <-w.stopCh:
+		return ErrClosed
+	case <-w.done:
+		return ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (w *BatchWriter) loop(rootCtx context.Context) {
 	defer close(w.done)
 
@@ -150,13 +189,14 @@ func (w *BatchWriter) loop(rootCtx context.Context) {
 	// flush writes the current batch (if any) and resets it. ctx bounds the
 	// flush; during shutdown a fresh bounded context is supplied because
 	// rootCtx may already be done.
-	flush := func(ctx context.Context, reason string) {
+	flush := func(ctx context.Context, reason string) error {
 		if len(batch) == 0 {
-			return
+			return nil
 		}
-		w.flushWithRetry(ctx, batch, reason)
+		err := w.flushWithRetry(ctx, batch, reason)
 		batch = batch[:0]
 		w.updateBufferGauge(len(batch))
+		return err
 	}
 
 	shutdown := func(reason string) {
@@ -164,7 +204,7 @@ func (w *BatchWriter) loop(rootCtx context.Context) {
 		w.drainInto(&batch, reason)
 		ctx, cancel := context.WithTimeout(context.Background(), w.cfg.shutdownTimeout)
 		defer cancel()
-		flush(ctx, reason)
+		_ = flush(ctx, reason)
 		w.log.Info("clickhouse batch writer stopped", "reason", reason)
 	}
 
@@ -182,12 +222,37 @@ func (w *BatchWriter) loop(rootCtx context.Context) {
 			batch = append(batch, row)
 			w.updateBufferGauge(len(batch))
 			if len(batch) >= w.cfg.batchSize {
-				flush(rootCtx, "batch_full")
+				_ = flush(rootCtx, "batch_full")
 				ticker.Reset(w.cfg.flushInterval)
 			}
 
 		case <-ticker.C:
-			flush(rootCtx, "interval")
+			_ = flush(rootCtx, "interval")
+
+		case req := <-w.flushReq:
+			var lastErr error
+		drain:
+			for {
+				select {
+				case row := <-w.input:
+					batch = append(batch, row)
+					w.updateBufferGauge(len(batch))
+					if len(batch) >= w.cfg.batchSize {
+						if err := flush(req.ctx, "manual_flush_batch_full"); err != nil {
+							lastErr = err
+						}
+					}
+				default:
+					break drain
+				}
+			}
+			if len(batch) > 0 {
+				if err := flush(req.ctx, "manual_flush"); err != nil {
+					lastErr = err
+				}
+			}
+			ticker.Reset(w.cfg.flushInterval)
+			req.done <- lastErr
 		}
 	}
 }
@@ -202,7 +267,7 @@ func (w *BatchWriter) drainInto(batch *[]Row, reason string) {
 			*batch = append(*batch, row)
 			if len(*batch) >= w.cfg.batchSize {
 				ctx, cancel := context.WithTimeout(context.Background(), w.cfg.shutdownTimeout)
-				w.flushWithRetry(ctx, *batch, reason+"_batch_full")
+				_ = w.flushWithRetry(ctx, *batch, reason+"_batch_full")
 				cancel()
 				*batch = (*batch)[:0]
 			}
@@ -214,7 +279,7 @@ func (w *BatchWriter) drainInto(batch *[]Row, reason string) {
 
 // flushWithRetry attempts a flush, retrying with exponential backoff + jitter up
 // to MaxRetries. On permanent failure the rows are dropped and counted.
-func (w *BatchWriter) flushWithRetry(ctx context.Context, rows []Row, reason string) {
+func (w *BatchWriter) flushWithRetry(ctx context.Context, rows []Row, reason string) error {
 	backoff := w.cfg.retryBackoff
 	for attempt := 0; ; attempt++ {
 		start := time.Now()
@@ -225,7 +290,7 @@ func (w *BatchWriter) flushWithRetry(ctx context.Context, rows []Row, reason str
 			if attempt > 0 {
 				w.log.Info("clickhouse flush recovered", "attempts", attempt+1, "rows", len(rows), "reason", reason)
 			}
-			return
+			return nil
 		}
 		w.metrics.observeFlushErr(elapsed)
 
@@ -233,7 +298,10 @@ func (w *BatchWriter) flushWithRetry(ctx context.Context, rows []Row, reason str
 			w.log.Error("clickhouse flush failed permanently; dropping rows",
 				"rows", len(rows), "attempts", attempt+1, "reason", reason, "err", err)
 			w.metrics.rowsDropped.Add(float64(len(rows)))
-			return
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
 		}
 
 		w.metrics.retries.Inc()
@@ -246,7 +314,7 @@ func (w *BatchWriter) flushWithRetry(ctx context.Context, rows []Row, reason str
 			w.log.Error("clickhouse flush aborted during backoff; dropping rows",
 				"rows", len(rows), "reason", reason, "err", ctx.Err())
 			w.metrics.rowsDropped.Add(float64(len(rows)))
-			return
+			return ctx.Err()
 		}
 		if backoff = backoff * 2; backoff > w.cfg.maxRetryBackoff {
 			backoff = w.cfg.maxRetryBackoff
