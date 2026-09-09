@@ -132,6 +132,26 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		a.chWriters[iv] = w
 	}
 
+	// Offline "backfill-only" mode: build only the historical-pull path
+	// (universe discovery -> REST fetch -> ClickHouse archive) and skip the
+	// entire live pipeline (WS collector, dispatcher, Redis writers, window
+	// gate). Run() drives one whole-universe cold-start pass and exits. This is
+	// phase one of a two-phase cold start: load deep history offline, verify it,
+	// then start the live service with a small cold_start_date.
+	if cfg.Backfill.OfflineOnly {
+		a.univ = newUniverse(cfg, reg)
+		a.chStore, err = newColdStore(cfg)
+		if err != nil {
+			return fail("clickhouse read store: %w", err)
+		}
+		a.backfiller, err = newBackfiller(cfg, reg, a.chWriters, a.chStore, nil, nil)
+		if err != nil {
+			return fail("backfiller: %w", err)
+		}
+		a.log.Info("backfill-only (offline) mode: WS collector, dispatcher and Redis writers are disabled")
+		return a, nil
+	}
+
 	a.win, err = rediswin.New(a.closedRDB, rediswin.Config{
 		KeyPrefix:    cfg.Redis.Window.KeyPrefix,
 		WindowSize:   cfg.Redis.Window.WindowSize,
@@ -161,17 +181,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		return fail("redis live bar writer: %w", err)
 	}
 
-	a.univ = universe.New(universe.Config{
-		BaseURL:         cfg.Universe.RESTURL,
-		RefreshInterval: cfg.Universe.RefreshInterval,
-		RefreshOffset:   cfg.Universe.RefreshOffset,
-		HTTPTimeout:     cfg.Universe.HTTPTimeout,
-		QuoteAssets:     cfg.Universe.QuoteAssets,
-		ContractType:    cfg.Universe.ContractType,
-		Status:          cfg.Universe.Status,
-		Registerer:      reg,
-		Logger:          cfg.Logger,
-	})
+	a.univ = newUniverse(cfg, reg)
 
 	router := &archiveRouter{
 		writers: archiveWritersOf(a.chWriters),
@@ -204,43 +214,11 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 
 	// --- gapfill / backfiller (optional) ---
 	if cfg.Backfill.Enabled {
-		a.chStore, err = backfill.NewCHStore(backfill.CHStoreConfig{
-			Addrs:       cfg.ClickHouse.Addrs,
-			Database:    cfg.ClickHouse.Database,
-			Username:    cfg.ClickHouse.Username,
-			Password:    cfg.ClickHouse.Password,
-			TablePrefix: cfg.ClickHouse.TablePrefix,
-			DialTimeout: cfg.ClickHouse.DialTimeout,
-			TLS:         cfg.ClickHouse.TLS,
-		})
+		a.chStore, err = newColdStore(cfg)
 		if err != nil {
 			return fail("clickhouse read store: %w", err)
 		}
-		fetcher := backfill.NewBinanceFetcher(backfill.FetcherConfig{
-			BaseURL:    cfg.Universe.RESTURL,
-			RPS:        cfg.Backfill.RestRPS,
-			Registerer: reg,
-			Logger:     cfg.Logger,
-		})
-		archiveMap := make(map[string]backfill.ArchiveWriter, len(a.chWriters))
-		for iv, w := range a.chWriters {
-			archiveMap[iv] = w
-		}
-		coldStartTime, parseErr := cfg.Backfill.ParseColdStartTime()
-		if parseErr != nil {
-			return fail("backfill cold_start_date: %w", parseErr)
-		}
-		a.backfiller, err = backfill.New(backfill.Config{
-			ColdStartTime: coldStartTime,
-			GapDebounce:   cfg.Backfill.GapDebounce,
-			Workers:       cfg.Backfill.Workers,
-			QueueSize:     cfg.Backfill.QueueSize,
-			WindowSize:    cfg.Redis.Window.WindowSize,
-			GateTimeout:   cfg.Backfill.GateTimeout,
-			FlushWait:     cfg.Backfill.FlushWait,
-			Registerer:    reg,
-			Logger:        cfg.Logger,
-		}, fetcher, archiveMap, a.chStore, a.win, gateAdapter{a.gate})
+		a.backfiller, err = newBackfiller(cfg, reg, a.chWriters, a.chStore, a.win, gateAdapter{a.gate})
 		if err != nil {
 			return fail("backfiller: %w", err)
 		}
@@ -280,10 +258,85 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	return a, nil
 }
 
+// newUniverse builds the market-discovery monitor.
+func newUniverse(cfg Config, reg prometheus.Registerer) *universe.Monitor {
+	return universe.New(universe.Config{
+		BaseURL:         cfg.Universe.RESTURL,
+		RefreshInterval: cfg.Universe.RefreshInterval,
+		RefreshOffset:   cfg.Universe.RefreshOffset,
+		HTTPTimeout:     cfg.Universe.HTTPTimeout,
+		QuoteAssets:     cfg.Universe.QuoteAssets,
+		ContractType:    cfg.Universe.ContractType,
+		Status:          cfg.Universe.Status,
+		Registerer:      reg,
+		Logger:          cfg.Logger,
+	})
+}
+
+// newColdStore builds the ClickHouse read-back store used by the backfiller to
+// resume from max(start_time) and to materialise Redis windows.
+func newColdStore(cfg Config) (*backfill.CHStore, error) {
+	return backfill.NewCHStore(backfill.CHStoreConfig{
+		Addrs:       cfg.ClickHouse.Addrs,
+		Database:    cfg.ClickHouse.Database,
+		Username:    cfg.ClickHouse.Username,
+		Password:    cfg.ClickHouse.Password,
+		TablePrefix: cfg.ClickHouse.TablePrefix,
+		DialTimeout: cfg.ClickHouse.DialTimeout,
+		TLS:         cfg.ClickHouse.TLS,
+	})
+}
+
+// newBackfiller wires a Backfiller. In offline backfill-only mode rebuild and
+// gate are nil (no Redis window to rebuild, no live window to gate) and the
+// per-request gate timeout is disabled so a multi-hour historical pull runs to
+// completion instead of being force-released after 5 minutes.
+func newBackfiller(
+	cfg Config,
+	reg prometheus.Registerer,
+	chWriters map[string]*chwriter.BatchWriter,
+	store *backfill.CHStore,
+	rebuild backfill.WindowRebuilder,
+	gate backfill.Gate,
+) (*backfill.Backfiller, error) {
+	fetcher := backfill.NewBinanceFetcher(backfill.FetcherConfig{
+		BaseURL:    cfg.Universe.RESTURL,
+		RPS:        cfg.Backfill.RestRPS,
+		Registerer: reg,
+		Logger:     cfg.Logger,
+	})
+	archiveMap := make(map[string]backfill.ArchiveWriter, len(chWriters))
+	for iv, w := range chWriters {
+		archiveMap[iv] = w
+	}
+	coldStartTime, err := cfg.Backfill.ParseColdStartTime()
+	if err != nil {
+		return nil, fmt.Errorf("cold_start_date: %w", err)
+	}
+	gateTimeout := cfg.Backfill.GateTimeout
+	if cfg.Backfill.OfflineOnly {
+		gateTimeout = -1 // unbounded: the historical pull must run to completion
+	}
+	return backfill.New(backfill.Config{
+		ColdStartTime: coldStartTime,
+		GapDebounce:   cfg.Backfill.GapDebounce,
+		Workers:       cfg.Backfill.Workers,
+		QueueSize:     cfg.Backfill.QueueSize,
+		WindowSize:    cfg.Redis.Window.WindowSize,
+		GateTimeout:   gateTimeout,
+		FlushWait:     cfg.Backfill.FlushWait,
+		Registerer:    reg,
+		Logger:        cfg.Logger,
+	}, fetcher, archiveMap, store, rebuild, gate)
+}
+
 // onUniverseChange fans a refreshed universe out to the collector, and (after
 // cold start) enqueues a scoped backfill for any newly listed symbols.
 func (a *App) onUniverseChange(s universe.Snapshot) {
 	a.log.Info("universe snapshot", "symbols", len(s.Symbols))
+	if a.col == nil {
+		return // backfill-only (offline) mode: no live collector to feed
+	}
 	a.col.SetSymbols(s.Symbols)
 
 	if a.backfiller == nil {
@@ -318,7 +371,13 @@ func (a *App) onUniverseChange(s universe.Snapshot) {
 // Run starts the metrics server, the backfiller, and the universe refresh loop
 // (whose first refresh drives the initial subscriptions and the cold-start
 // backfill), then blocks until ctx is cancelled and shuts down gracefully.
+//
+// In offline backfill-only mode it instead runs a single whole-universe
+// cold-start pass and returns (see runBackfillOnly).
 func (a *App) Run(ctx context.Context) error {
+	if a.cfg.Backfill.OfflineOnly {
+		return a.runBackfillOnly(ctx)
+	}
 	if err := a.metrics.Start(); err != nil {
 		_ = a.Shutdown(context.Background())
 		return fmt.Errorf("app: start metrics: %w", err)
@@ -352,6 +411,47 @@ func (a *App) Run(ctx context.Context) error {
 	sctx, cancel := context.WithTimeout(context.Background(), a.cfg.App.ShutdownTimeout)
 	defer cancel()
 	return a.Shutdown(sctx)
+}
+
+// runBackfillOnly drives a single whole-universe cold-start backfill into
+// ClickHouse and returns once it finishes (or ctx is cancelled). No live
+// pipeline is started. It returns nil only if the backfill ran to completion,
+// so a caller can gate "now start the live service" on a zero exit code; an
+// interrupted run returns ctx.Err() and its progress is durable in ClickHouse
+// (re-run to resume from max(start_time)).
+func (a *App) runBackfillOnly(ctx context.Context) error {
+	if err := a.metrics.Start(); err != nil {
+		_ = a.Shutdown(context.Background())
+		return fmt.Errorf("app: start metrics: %w", err)
+	}
+	a.backfiller.Start(ctx)
+
+	if err := a.univ.Start(ctx); err != nil {
+		_ = a.Shutdown(context.Background())
+		return fmt.Errorf("app: start universe: %w", err)
+	}
+
+	syms := a.univ.Snapshot().Symbols
+	a.coldStartSubmitted.Store(true)
+	a.backfiller.SubmitColdStart(keysOf(syms, a.cfg.Collector.Intervals))
+	a.log.Info("offline backfill started",
+		"symbols", len(syms),
+		"intervals", a.cfg.Collector.Intervals,
+		"cold_start_date", a.cfg.Backfill.ColdStartDate,
+		"metrics_addr", a.metrics.Addr())
+
+	waitErr := a.backfiller.WaitColdStart(ctx)
+
+	sctx, cancel := context.WithTimeout(context.Background(), a.cfg.App.ShutdownTimeout)
+	defer cancel()
+	shutErr := a.Shutdown(sctx)
+
+	if waitErr != nil {
+		a.log.Warn("offline backfill interrupted before completion; progress is persisted in ClickHouse, re-run to resume", "err", waitErr)
+		return waitErr
+	}
+	a.log.Info("offline backfill complete; verify with cmd/test-tools/check_clickhouse_integrity.py, then start the live service")
+	return shutErr
 }
 
 // Shutdown closes every component in reverse dependency order. Safe to call more

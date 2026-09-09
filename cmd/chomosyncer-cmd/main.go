@@ -90,6 +90,7 @@ type cliConfig struct {
 	universeQuoteAssets     string
 
 	backfill            bool
+	backfillOfflineOnly bool
 	backfillStartDate   string
 	backfillRestRPS     float64
 	backfillWorkers     int
@@ -155,6 +156,7 @@ func parseFlags(args []string) (cliConfig, error) {
 	fs.StringVar(&c.universeQuoteAssets, "universe-quote-assets", env("CHOMOSYNCER_UNIVERSE_QUOTE_ASSETS", "USDT"), "universe target quote assets (comma-separated, e.g. USDT,USDC)")
 
 	fs.BoolVar(&c.backfill, "backfill", envBool("CHOMOSYNCER_BACKFILL", true), "historical gapfill: cold-start + shard-reconnect backfill and CH->Redis window rebuild")
+	fs.BoolVar(&c.backfillOfflineOnly, "backfill-offline-only", envBool("CHOMOSYNCER_BACKFILL_OFFLINE_ONLY", false), "offline backfill-only: pull history into ClickHouse then exit; do NOT start the live WS/Redis pipeline (phase one of a two-phase cold start)")
 	fs.StringVar(&c.backfillStartDate, "backfill-start-date", env("CHOMOSYNCER_BACKFILL_START_DATE", ""), "initial historical backfill start date (e.g. 2024-01-01 or RFC3339)")
 	fs.Float64Var(&c.backfillRestRPS, "backfill-rest-rps", envFloat("CHOMOSYNCER_BACKFILL_REST_RPS", 20), "token-bucket rate for /fapi/v1/klines")
 	fs.IntVar(&c.backfillWorkers, "backfill-workers", envInt("CHOMOSYNCER_BACKFILL_WORKERS", 4), "per-request parallel REST fetch count")
@@ -302,6 +304,9 @@ func parseFlags(args []string) (cliConfig, error) {
 	if explicit("backfill", "CHOMOSYNCER_BACKFILL") {
 		baseCfg.Backfill.Enabled = c.backfill
 	}
+	if explicit("backfill-offline-only", "CHOMOSYNCER_BACKFILL_OFFLINE_ONLY") {
+		baseCfg.Backfill.OfflineOnly = c.backfillOfflineOnly
+	}
 	if explicit("backfill-start-date", "CHOMOSYNCER_BACKFILL_START_DATE") {
 		baseCfg.Backfill.ColdStartDate = c.backfillStartDate
 	}
@@ -361,6 +366,7 @@ func parseFlags(args []string) (cliConfig, error) {
 	c.universeRefreshInterval = baseCfg.Universe.RefreshInterval
 	c.universeQuoteAssets = strings.Join(baseCfg.Universe.QuoteAssets, ",")
 	c.backfill = baseCfg.Backfill.Enabled
+	c.backfillOfflineOnly = baseCfg.Backfill.OfflineOnly
 	c.backfillStartDate = baseCfg.Backfill.ColdStartDate
 	c.backfillRestRPS = baseCfg.Backfill.RestRPS
 	c.backfillWorkers = baseCfg.Backfill.Workers

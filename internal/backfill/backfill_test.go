@@ -488,6 +488,55 @@ func TestColdStartEmptyKeys(t *testing.T) {
 	}
 }
 
+func TestWaitColdStartReturnsAfterCompletion(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.b.SubmitColdStart([]Key{{"BTCUSDT", "1m"}, {"BTCUSDT", "1h"}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := h.b.WaitColdStart(ctx); err != nil {
+		t.Fatalf("WaitColdStart: %v", err)
+	}
+	if !h.b.Ready() {
+		t.Fatal("Ready() should be true once WaitColdStart returns nil")
+	}
+}
+
+func TestWaitColdStartHonoursContext(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.fetch.blockCh = make(chan struct{}) // Fetch blocks -> cold start never finishes
+	h.b.SubmitColdStart([]Key{{"BTCUSDT", "1m"}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if err := h.b.WaitColdStart(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitColdStart err = %v, want context.DeadlineExceeded", err)
+	}
+	if h.b.Ready() {
+		t.Fatal("Ready() must stay false while the cold-start fetch is blocked")
+	}
+	close(h.fetch.blockCh)
+}
+
+func TestNegativeGateTimeoutIsUnbounded(t *testing.T) {
+	h := newHarness(t, Config{GateTimeout: -1})
+	if h.b.cfg.gateTimeout != -1 {
+		t.Fatalf("gateTimeout = %v, want -1 (sentinel preserved, no default applied)", h.b.cfg.gateTimeout)
+	}
+
+	// With the bound disabled, a slow request is not force-released: the gate
+	// stays held until the fetch actually returns.
+	h.fetch.blockCh = make(chan struct{})
+	h.b.SubmitColdStart([]Key{{"BTCUSDT", "1m"}})
+	eventually(t, time.Second, func() bool { return h.fetch.callCount() == 1 })
+	time.Sleep(100 * time.Millisecond)
+	if !h.gate.isHeld("BTCUSDT", "1m") {
+		t.Fatal("gate released early despite gateTimeout < 0")
+	}
+	close(h.fetch.blockCh)
+	eventually(t, 2*time.Second, func() bool { return !h.gate.isHeld("BTCUSDT", "1m") })
+}
+
 func TestParseStream(t *testing.T) {
 	cases := map[string]struct {
 		key Key

@@ -112,7 +112,9 @@ type Config struct {
 	// WindowSize is the Redis window length. Default 200.
 	WindowSize int
 	// GateTimeout bounds one request; on expiry keys are force-released
-	// (forward-only degrade). Default 5m.
+	// (forward-only degrade). Default 5m. A negative value disables the bound
+	// entirely: used by offline "backfill-only" runs, where there is no live
+	// window to protect and a full historical pull can legitimately take hours.
 	GateTimeout time.Duration
 	// FlushWait is how long to wait after archiving before reading CH back
 	// (covers the chwriter flush interval). Default 2s.
@@ -155,9 +157,11 @@ func (c Config) resolve() resolved {
 	if r.windowSize <= 0 {
 		r.windowSize = 200
 	}
-	if r.gateTimeout <= 0 {
+	if r.gateTimeout == 0 {
 		r.gateTimeout = 5 * time.Minute
 	}
+	// A negative gateTimeout is a deliberate sentinel ("no bound") and passes
+	// through untouched.
 	if r.flushWait <= 0 {
 		r.flushWait = 2 * time.Second
 	}
@@ -253,6 +257,27 @@ func (b *Backfiller) Close() error {
 // needed). Feeds /readyz.
 func (b *Backfiller) Ready() bool {
 	return !b.coldStartSubmitted.Load() || b.coldStartDone.Load()
+}
+
+// WaitColdStart blocks until the cold-start backfill has finished (Ready reports
+// true) or ctx is done. Returns nil on completion, ctx.Err() on cancellation.
+// Intended for offline "backfill-only" runs that exit once history is loaded.
+func (b *Backfiller) WaitColdStart(ctx context.Context) error {
+	if b.Ready() {
+		return nil
+	}
+	t := time.NewTicker(250 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+			if b.Ready() {
+				return nil
+			}
+		}
+	}
 }
 
 // SubmitColdStart enqueues the whole-universe cold-start request and arms Ready().
@@ -371,8 +396,12 @@ func (b *Backfiller) drainRelease() {
 }
 
 func (b *Backfiller) process(parent context.Context, req Request) {
-	ctx, cancel := context.WithTimeout(parent, b.cfg.gateTimeout)
-	defer cancel()
+	ctx := parent
+	if b.cfg.gateTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(parent, b.cfg.gateTimeout)
+		defer cancel()
+	}
 	defer b.releaseKeys(req.Keys)
 	if req.Reason == ReasonColdStart {
 		defer b.coldStartDone.Store(true)

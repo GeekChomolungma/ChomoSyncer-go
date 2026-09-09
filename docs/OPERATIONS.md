@@ -108,6 +108,58 @@ cp config.example.yaml config.yaml
 
 ---
 
+### 方式 C：两阶段冷启动（`cold_start_date` 设为很久远时间时推荐）
+
+#### 背景
+
+在线模式下，冷启动历史回补由 `windowgate` 门控挡在 Redis 业务（收盘滑窗 `kline:*` 与截面就绪 `stream:market:kline_ready`）之前。但门控受 `backfill.gate_timeout`（默认 `5m`）兜底释放：当 `cold_start_date` 设为数月甚至一年前、全市场历史回补远超 5 分钟时，门控会**提前释放**，导致：
+
+- 历史尚未补齐，实时 K 线已开始写入 Redis 业务出口；
+- 中间那段深历史缺口由于实时写入不受门控、会"污染" ClickHouse 的 `max(start_time)`，重启也不会自动重补（成为粘性缺口）。
+
+因此，把深历史作为一个**独立的离线阶段**先跑完，再启动在线业务，是最干净的做法。
+
+#### 开关
+
+| 入口 | 值 |
+| :--- | :--- |
+| 配置文件 | `backfill.offline_only: true`（默认 `false`） |
+| 命令行 | `-backfill-offline-only` |
+| 环境变量 | `CHOMOSYNCER_BACKFILL_OFFLINE_ONLY=true` |
+
+`offline_only: true` 时：
+
+- 仅装配 **universe 发现 → REST 拉取 → ClickHouse 批量落库** 这条链路；
+- **不启动** WS 采集器、dispatcher、Redis 滑窗 / LiveBar 写入器、窗口门控；
+- `gate_timeout` 自动失效（负值哨兵），历史全量拉取不会被中途强制释放；
+- 执行一次全市场 whole-universe 冷启动回补，**跑完即退出**：
+  - 正常跑完 → 退出码 `0`；
+  - 被 `SIGINT` / `SIGTERM` 中断 → 退出码非 `0`，但进度已落盘，**重跑会从 `max(start_time)` 续上**；
+- `/metrics` 仍然可用，可通过 `backfill_bars_fetched_total` / `backfill_bars_written_total` / `backfill_errors_total` 观察进度。
+
+#### 操作流程
+
+```bash
+# ---- 阶段一：离线灌历史 ----
+# 只把历史 K 线灌入 ClickHouse，跑完即退出，不触碰 Redis / WS。
+./bin/chomosyncer-cmd -config config.yaml \
+  -backfill-offline-only \
+  -backfill-start-date 2024-01-01
+
+# 校验历史零断档、字段合法（必须全绿再进入阶段二）
+python cmd/test-tools/check_clickhouse_integrity.py --intervals 1m,1h
+
+# ---- 阶段二：启动完整在线业务 ----
+# cold_start_date 此时只需覆盖最近少量窗口（例如 7 天，足够填满 200 根滑窗 + 余量），
+# 在线冷启动秒级完成，永远撞不到 gate_timeout。
+./bin/chomosyncer-cmd -config config.yaml   # config.yaml 内 cold_start_date 改为最近 7 天
+```
+
+> 如果坚持单阶段在线冷启动大范围历史，则必须把 `backfill.gate_timeout` 调到大于真实回补耗时（例如 `2h`），
+> 并对 `windowgate_held_keys > 0 持续过久` 配置告警。不推荐。
+
+---
+
 ## 4. 探针与就绪检查
 
 服务启动后，内置 HTTP Server（默认 `:9090`）暴露三个关键端点：

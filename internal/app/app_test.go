@@ -176,6 +176,46 @@ func TestBackfillWiring(t *testing.T) {
 	}
 }
 
+func TestOfflineBackfillOnlyWiring(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := smokeConfig()
+	cfg.Backfill.Enabled = true
+	cfg.Backfill.OfflineOnly = true
+
+	a, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// The historical-pull path is wired.
+	if a.backfiller == nil || a.chStore == nil || a.univ == nil {
+		t.Fatalf("offline path not wired: bf=%v store=%v univ=%v",
+			a.backfiller != nil, a.chStore != nil, a.univ != nil)
+	}
+	// The live pipeline is not.
+	if a.col != nil || a.disp != nil || a.live != nil || a.win != nil || a.gate != nil {
+		t.Fatalf("live pipeline must be absent in offline mode: col=%v disp=%v live=%v win=%v gate=%v",
+			a.col != nil, a.disp != nil, a.live != nil, a.win != nil, a.gate != nil)
+	}
+	// The gate timeout is disabled so a long historical pull is never force-released.
+	if !a.backfiller.Ready() {
+		t.Fatal("Ready() should be true before any cold-start submission")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- a.Shutdown(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown hung in offline mode")
+	}
+}
+
 func TestBackfillDisabledByDefault(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

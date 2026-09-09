@@ -117,7 +117,12 @@ type UniverseConfig struct {
 
 // BackfillConfig configures historical gapfill and window rebuild.
 type BackfillConfig struct {
-	Enabled       bool          `yaml:"enabled"`
+	Enabled bool `yaml:"enabled"`
+	// OfflineOnly runs a one-shot historical backfill into ClickHouse and then
+	// exits, without starting the live WebSocket collector, dispatcher or Redis
+	// writers. Use it for phase one of a two-phase cold start ("load deep
+	// history offline, then start the live service"). Default false.
+	OfflineOnly   bool          `yaml:"offline_only"`
 	ColdStartDate string        `yaml:"cold_start_date"` // e.g. "2024-01-01" or RFC3339
 	Workers       int           `yaml:"workers"`
 	RestRPS       float64       `yaml:"rest_rps"`
@@ -229,6 +234,7 @@ func DefaultConfig() Config {
 		},
 		Backfill: BackfillConfig{
 			Enabled:       true,
+			OfflineOnly:   false,
 			ColdStartDate: "",
 			Workers:       4,
 			RestRPS:       20,
@@ -286,6 +292,9 @@ func (c *Config) Validate() error {
 		if _, err := c.Backfill.ParseColdStartTime(); err != nil {
 			return fmt.Errorf("backfill.cold_start_date: %w", err)
 		}
+	}
+	if c.Backfill.OfflineOnly && !c.Backfill.Enabled {
+		return fmt.Errorf("backfill.offline_only requires backfill.enabled = true")
 	}
 	return nil
 }

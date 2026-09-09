@@ -89,11 +89,14 @@ universe:
 
 backfill:
   enabled: true                  # 是否开启历史回补（冷启动 + 断线重连补洞）
+  offline_only: false            # 仅离线回补模式：true = 只把历史 K 线灌入 ClickHouse，跑完即退出，
+                                 #   不启动 WS 采集 / dispatcher / Redis 实时链路（"先灌历史再上线"两阶段冷启动的第一阶段）；
+                                 #   false = 完整在线业务。此模式下 gate_timeout 自动失效（历史全量拉取必须跑完）。
   cold_start_date: ""            # 空库冷启动同步起点 (例如 "2024-01-01" 或 RFC3339)，留空则回退至最近窗口
   workers: 4                     # 回补时并发 REST 请求抓取的协程数
   rest_rps: 20                   # 币安 REST API 令牌桶限流速率 (RPS)
   queue_size: 256                # 回补任务请求队列容量
   gap_debounce: 30s              # 断线重连重复缺口事件合并防抖时长
-  gate_timeout: 5m               # 窗口门控最长持有超时（防止回补卡死导致实时数据一直被压制）
+  gate_timeout: 10m               # 窗口门控最长持有超时（防止回补卡死导致实时数据一直被压制）
   flush_wait: 2s                 # 回补数据 Push 完毕后，若无 writer 时的回退等待时长
 

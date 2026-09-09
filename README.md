@@ -80,6 +80,24 @@ curl -i http://localhost:9090/healthz   # 进程存活检查 (HTTP 200)
 curl -i http://localhost:9090/readyz    # 全链路就绪检查 (冷启动回补完成返回 HTTP 200)
 ```
 
+#### 5.（可选）两阶段冷启动：先离线灌满历史，再上线实时业务
+
+当 `cold_start_date` 设为很久远的时间时，实时链路的冷启动门控存在 `gate_timeout` 兜底释放，无法保证"历史全部落库后才开启 Redis 业务"。推荐把深历史作为独立的离线阶段先跑完：
+
+```bash
+# 阶段一：仅离线回补。只把历史 K 线灌入 ClickHouse，跑完即退出（exit 0），不启动任何实时链路。
+#         被中断也没关系，进度已落盘，重跑会从 max(start_time) 续上。
+./bin/chomosyncer-cmd -config config.yaml -backfill-offline-only -backfill-start-date 2024-01-01
+
+# 校验历史零断档
+python cmd/test-tools/check_clickhouse_integrity.py
+
+# 阶段二：启动完整在线业务。此时 cold_start_date 只需覆盖最近少量窗口（如 7 天），冷启动秒级完成。
+./bin/chomosyncer-cmd -config config.yaml
+```
+
+也可在 `config.yaml` 中用 `backfill.offline_only: true` 开启（默认 `false`）。详见 [`docs/OPERATIONS.md`](docs/OPERATIONS.md)。
+
 ---
 
 ## 架构与设计细节文档导航

@@ -106,4 +106,17 @@ func TestValidateCatchesInvalid(t *testing.T) {
 	if err != nil || tParsed.Year() != 2024 {
 		t.Fatalf("ParseColdStartTime got %v, err: %v", tParsed, err)
 	}
+
+	cfg = DefaultConfig()
+	cfg.Backfill.Enabled = false
+	cfg.Backfill.OfflineOnly = true
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for offline_only without enabled")
+	}
+
+	cfg = DefaultConfig()
+	cfg.Backfill.OfflineOnly = true // Enabled defaults to true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid for offline_only + enabled, got %v", err)
+	}
 }

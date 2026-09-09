@@ -196,6 +196,9 @@ func TestParseFlagsBackfillDefaults(t *testing.T) {
 	if c.backfillStartDate != "" {
 		t.Fatalf("backfill start date default: %+v", c)
 	}
+	if c.backfillOfflineOnly {
+		t.Fatalf("backfill offline-only default should be false: %+v", c)
+	}
 
 	c2, err := parseFlags([]string{
 		"-backfill=false",
@@ -207,6 +210,14 @@ func TestParseFlagsBackfillDefaults(t *testing.T) {
 	}
 	if c2.backfill || c2.backfillRestRPS != 50 || c2.backfillStartDate != "2024-01-01" {
 		t.Fatalf("backfill overrides: %+v", c2)
+	}
+
+	c4, err := parseFlags([]string{"-backfill-offline-only", "-backfill-start-date", "2024-01-01"})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if !c4.backfillOfflineOnly {
+		t.Fatalf("-backfill-offline-only not honored: %+v", c4)
 	}
 
 	t.Setenv("CHOMOSYNCER_BACKFILL", "false")

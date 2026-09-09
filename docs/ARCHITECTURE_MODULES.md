@@ -207,3 +207,15 @@
 ### 8.4 REST 频控保护 (`BinanceFetcher`)
 - 采用 Token Bucket 令牌桶限流算法（参数 `rest_rps`，默认 20 RPS）；
 - 分页拉取（币安单次最大 1500 根），自适应重试网络抖动，杜绝触发交易所 429 / 418 IP 封禁。
+
+### 8.5 离线回补模式 (`backfill.offline_only`)
+
+门控受 `gate_timeout`（默认 `5m`）兜底释放，当 `cold_start_date` 设为很久远时间、全市场历史回补远超该时长时，门控会提前释放、实时业务提前开跑，且深历史缺口会因实时写入污染 `max(start_time)` 而变为粘性缺口。
+
+为此提供 `backfill.offline_only`（配置文件；或 `-backfill-offline-only` / `CHOMOSYNCER_BACKFILL_OFFLINE_ONLY`，默认 `false`）：
+
+- `true` 时只装配 **universe → REST 拉取 → ClickHouse 落库** 链路，**不启动** collector / dispatcher / rediswin / windowgate；
+- `gate_timeout` 自动失效（`internal/backfill` 内负值哨兵表示"无上限"），历史全量拉取不被中途强制释放；
+- 执行一次 whole-universe 冷启动回补后进程退出（正常完成退出码 `0`，被信号中断则非 `0` 但进度已落盘、重跑从 `max(start_time)` 续上）。
+
+配合"深历史离线灌满 → 校验 → 用最近少量窗口的 `cold_start_date` 启动在线业务"的两阶段流程，可确保历史落库完成后再开启 Redis 业务。详见 `docs/OPERATIONS.md` 方式 C。
