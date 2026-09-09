@@ -167,7 +167,7 @@ func TestLiveBarWriterWritesHash(t *testing.T) {
 
 	eventually(t, 6*time.Second, func() bool {
 		n, _ := client.Exists(ctx, key).Result()
-		return n == 1
+		return n == 1 && testutil.ToFloat64(w.metrics.updates) == 1
 	})
 
 	got, err := client.HGetAll(ctx, key).Result()
@@ -198,7 +198,7 @@ func TestLiveBarWriterWritesHash(t *testing.T) {
 }
 
 func TestLiveBarWriterOverwrites(t *testing.T) {
-	w, client, _ := newTestLiveWriter(t, LiveBarConfig{})
+	w, client, _ := newTestLiveWriter(t, LiveBarConfig{Workers: 1})
 	ctx := context.Background()
 	key := w.Key("BTCUSDT", "1m")
 

@@ -618,8 +618,8 @@ Gapfill 负责与增量采集**并行运作**，在后台将缺失数据从币�
 ### 8.3 核心调用者、并发模型与代码入口
 - **核心调用者**：[`backfill.Backfiller`](../internal/backfill/backfill.go#L182)
 - **三大触发源**：
-  1. **冷启动 (Cold Start)**：[`App.Run`](../internal/app/app.go#L268) 中在 Universe 首次获取后调用 `SubmitColdStart`，覆盖全市场全部合约。在此期间 HTTP 探针 `/readyz` 返回 503，回补完成后转为 200。
-  2. **Shard 断线重连 (Shard Reconnect)**：Shard 重连成功后回调 [`collector.OnGap`](../internal/app/app.go#L196) -> [`Backfiller.HandleGap`](../internal/backfill/backfill.go#L328)。带有 30s 防抖，回补范围封顶为 200 根。
+  1. **冷启动 (Cold Start)**：[`App.Run`](../internal/app/app.go#L268) 中在 Universe 首次获取后调用 `SubmitColdStart`。若 ClickHouse 为空库，以 `cold_start_date` 为起点拉取历史；若已有历史落档，从 ClickHouse `max(start_time) + 1 step` 开始持续接续同步至当下最新时刻。在此期间 HTTP 探针 `/readyz` 返回 503，回补完成后转为 200。
+  2. **Shard 断线重连 (Shard Reconnect)**：Shard 重连成功后回调 [`collector.OnGap`](../internal/app/app.go#L196) -> [`Backfiller.HandleGap`](../internal/backfill/backfill.go#L328)。带有 30s 防抖，不再设限窗口，直接查询 ClickHouse 的最新记录时间作为起点，保证零缺口 (Zero Gap) 补齐。
   3. **Universe 新增合约 (Universe Add)**：[`App.onUniverseChange`](../internal/app/app.go#L242) 检测到 Universe 发生增量，向队列提交新币的全窗口回补。
 - **并发与 Goroutine 模型**：
   - **主请求调度 Loop（单 Goroutine）**：
