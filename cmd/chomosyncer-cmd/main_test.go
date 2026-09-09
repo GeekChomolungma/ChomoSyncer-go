@@ -193,21 +193,32 @@ func TestParseFlagsBackfillDefaults(t *testing.T) {
 	if c.backfillGapDebounce != 30*time.Second || c.backfillGateTimeout != 5*time.Minute {
 		t.Fatalf("backfill duration defaults: %+v", c)
 	}
+	if c.backfillStartDate != "" {
+		t.Fatalf("backfill start date default: %+v", c)
+	}
 
-	c2, err := parseFlags([]string{"-backfill=false", "-backfill-rest-rps", "50"})
+	c2, err := parseFlags([]string{
+		"-backfill=false",
+		"-backfill-rest-rps", "50",
+		"-backfill-start-date", "2024-01-01",
+	})
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
 	}
-	if c2.backfill || c2.backfillRestRPS != 50 {
+	if c2.backfill || c2.backfillRestRPS != 50 || c2.backfillStartDate != "2024-01-01" {
 		t.Fatalf("backfill overrides: %+v", c2)
 	}
 
 	t.Setenv("CHOMOSYNCER_BACKFILL", "false")
+	t.Setenv("CHOMOSYNCER_BACKFILL_START_DATE", "2024-06-01")
 	c3, err := parseFlags(nil)
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
 	}
 	if c3.backfill {
 		t.Fatal("env CHOMOSYNCER_BACKFILL=false not honored")
+	}
+	if c3.backfillStartDate != "2024-06-01" {
+		t.Fatalf("env CHOMOSYNCER_BACKFILL_START_DATE not honored: %v", c3.backfillStartDate)
 	}
 }

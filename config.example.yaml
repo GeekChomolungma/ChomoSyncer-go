@@ -89,6 +89,7 @@ universe:
 
 backfill:
   enabled: true                  # 是否开启历史回补（冷启动 + 断线重连补洞）
+  cold_start_date: ""            # 空库冷启动同步起点 (例如 "2024-01-01" 或 RFC3339)，留空则回退至最近窗口
   workers: 4                     # 回补时并发 REST 请求抓取的协程数
   rest_rps: 20                   # 币安 REST API 令牌桶限流速率 (RPS)
   queue_size: 256                # 回补任务请求队列容量

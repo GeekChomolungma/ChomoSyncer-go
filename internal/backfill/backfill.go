@@ -66,6 +66,13 @@ type KlineFetcher interface {
 	Fetch(ctx context.Context, symbol, interval string, since, until time.Time) ([]chwriter.Row, error)
 }
 
+// StreamFetcher is optionally implemented by KlineFetcher to stream batches
+// of rows as they are fetched from the exchange, reducing memory usage and
+// ensuring partial progress is persisted even if later pages fail or time out.
+type StreamFetcher interface {
+	FetchStream(ctx context.Context, symbol, interval string, since, until time.Time, onBatch func([]chwriter.Row) error) error
+}
+
 // ArchiveWriter is the per-interval ClickHouse writer. *chwriter.BatchWriter satisfies it.
 type ArchiveWriter interface {
 	Push(ctx context.Context, row chwriter.Row) error
@@ -93,11 +100,9 @@ type Gate interface {
 // --- config ---
 
 type Config struct {
-	// ColdStartLookback per interval; a missing / zero entry defaults to
-	// WindowSize×interval + 5×interval.
-	ColdStartLookback map[string]time.Duration
-	// MaxGapWindow caps a shard-reconnect backfill range; 0 => WindowSize×interval.
-	MaxGapWindow time.Duration
+	// ColdStartTime is the initial historical backfill start time. If set,
+	// empty ClickHouse tables backfill from this time up to now.
+	ColdStartTime time.Time
 	// GapDebounce coalesces repeated gap events from the same shard. Default 30s.
 	GapDebounce time.Duration
 	// Workers is the per-request parallel REST fetch count. Default 4.
@@ -119,29 +124,24 @@ type Config struct {
 }
 
 type resolved struct {
-	lookback    map[string]time.Duration
-	maxGap      time.Duration
-	gapDebounce time.Duration
-	workers     int
-	queueSize   int
-	windowSize  int
-	gateTimeout time.Duration
-	flushWait   time.Duration
+	coldStartTime time.Time
+	gapDebounce   time.Duration
+	workers       int
+	queueSize     int
+	windowSize    int
+	gateTimeout   time.Duration
+	flushWait     time.Duration
 }
 
 func (c Config) resolve() resolved {
 	r := resolved{
-		lookback:    c.ColdStartLookback,
-		maxGap:      c.MaxGapWindow,
-		gapDebounce: c.GapDebounce,
-		workers:     c.Workers,
-		queueSize:   c.QueueSize,
-		windowSize:  c.WindowSize,
-		gateTimeout: c.GateTimeout,
-		flushWait:   c.FlushWait,
-	}
-	if r.lookback == nil {
-		r.lookback = map[string]time.Duration{}
+		coldStartTime: c.ColdStartTime,
+		gapDebounce:   c.GapDebounce,
+		workers:       c.Workers,
+		queueSize:     c.QueueSize,
+		windowSize:    c.WindowSize,
+		gateTimeout:   c.GateTimeout,
+		flushWait:     c.FlushWait,
 	}
 	if r.gapDebounce <= 0 {
 		r.gapDebounce = 30 * time.Second
@@ -162,20 +162,6 @@ func (c Config) resolve() resolved {
 		r.flushWait = 2 * time.Second
 	}
 	return r
-}
-
-func (r resolved) lookbackFor(interval string, ivDur time.Duration) time.Duration {
-	if d, ok := r.lookback[interval]; ok && d > 0 {
-		return d
-	}
-	return time.Duration(r.windowSize)*ivDur + 5*ivDur
-}
-
-func (r resolved) maxGapFor(ivDur time.Duration) time.Duration {
-	if r.maxGap > 0 {
-		return r.maxGap
-	}
-	return time.Duration(r.windowSize) * ivDur
 }
 
 // --- backfiller ---
@@ -419,7 +405,7 @@ func (b *Backfiller) processInterval(ctx context.Context, iv string, symbols []s
 	aw := b.archive[iv]
 
 	var chMax map[string]time.Time
-	if since.IsZero() && b.store != nil {
+	if b.store != nil {
 		m, err := b.store.MaxStartTime(ctx, iv, symbols)
 		if err != nil {
 			b.metrics.errors.WithLabelValues("ch_max").Inc()
@@ -428,25 +414,21 @@ func (b *Backfiller) processInterval(ctx context.Context, iv string, symbols []s
 			chMax = m
 		}
 	}
-	lookback := b.cfg.lookbackFor(iv, ivDur)
-	maxGap := b.cfg.maxGapFor(ivDur)
-
 	sinceFor := func(sym string) time.Time {
-		if !since.IsZero() { // shard reconnect
-			s := since.Add(-ivDur)
-			if floor := until.Add(-maxGap); s.Before(floor) {
-				s = floor
-			}
-			return s
-		}
 		if m, ok := chMax[sym]; ok && !m.IsZero() {
-			s := m.Add(ivDur)
-			if floor := until.Add(-lookback); s.Before(floor) {
-				s = floor
-			}
-			return s
+			// 2 & 3: 只要 ClickHouse 有历史落档（无论冷启动还是中断重连），
+			// 直接以 ClickHouse 档案最新时间 + 1 interval 作为同步起点，保证 100% 零 gap
+			return m.Add(ivDur)
 		}
-		return until.Add(-lookback)
+		// 1: 空库或该交易对在 ClickHouse 中无落档，直接使用 coldStartTime 作为启动锚点
+		if !b.cfg.coldStartTime.IsZero() {
+			return b.cfg.coldStartTime
+		}
+		// 降级兜底（未配置 coldStartTime 或单测无 store 场景）：若有 since 则按 since，否则按 windowSize 回溯
+		if !since.IsZero() {
+			return since.Add(-ivDur)
+		}
+		return until.Add(-time.Duration(b.cfg.windowSize) * ivDur)
 	}
 
 	// 1. fetch + archive, parallel
@@ -514,6 +496,32 @@ func (b *Backfiller) processInterval(ctx context.Context, iv string, symbols []s
 }
 
 func (b *Backfiller) fetchAndArchive(ctx context.Context, iv, sym string, since, until time.Time, aw ArchiveWriter) {
+	if sf, ok := b.fetch.(StreamFetcher); ok {
+		var totalFetched, totalWritten int
+		err := sf.FetchStream(ctx, sym, iv, since, until, func(batch []chwriter.Row) error {
+			totalFetched += len(batch)
+			if aw == nil {
+				return nil
+			}
+			for i := range batch {
+				if err := aw.Push(ctx, batch[i]); err != nil {
+					b.metrics.errors.WithLabelValues("archive").Inc()
+					b.log.Warn("archive push failed mid-backfill", "symbol", sym, "interval", iv, "err", err)
+					return err
+				}
+				totalWritten++
+			}
+			return nil
+		})
+		b.metrics.barsFetched.WithLabelValues(iv).Add(float64(totalFetched))
+		b.metrics.barsWritten.WithLabelValues(iv).Add(float64(totalWritten))
+		if err != nil {
+			b.metrics.errors.WithLabelValues("rest").Inc()
+			b.log.Warn("REST fetch failed", "symbol", sym, "interval", iv, "err", err)
+		}
+		return
+	}
+
 	rows, err := b.fetch.Fetch(ctx, sym, iv, since, until)
 	if err != nil {
 		b.metrics.errors.WithLabelValues("rest").Inc()

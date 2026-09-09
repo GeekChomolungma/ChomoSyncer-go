@@ -270,8 +270,8 @@ func TestColdStartFlow(t *testing.T) {
 	if fc.symbol != "BTCUSDT" || fc.interval != "1m" {
 		t.Fatalf("fetch call = %+v", fc)
 	}
-	// CH empty -> since ~ now - lookback (200*1m + 5m)
-	wantSince := fixedNow.Add(-(200*time.Minute + 5*time.Minute))
+	// CH empty and coldStartTime unset -> since ~ now - windowSize*ivDur (200*1m = 200m)
+	wantSince := fixedNow.Add(-200 * time.Minute)
 	if fc.since.Sub(wantSince).Abs() > time.Second {
 		t.Fatalf("fetch since = %v, want ~%v", fc.since, wantSince)
 	}
@@ -329,9 +329,25 @@ func TestColdStartSkipsUpToDateSymbol(t *testing.T) {
 	}
 }
 
-func TestShardReconnectBoundedByMaxGap(t *testing.T) {
+func TestColdStartResumesFromDeepCHMax(t *testing.T) {
 	h := newHarness(t, Config{})
-	// down for 10h; MaxGapWindow default = 200*1m = 200m
+	// downtime was 10 days (240 hours)
+	chMax := fixedNow.Add(-240 * time.Hour)
+	h.store.maxTimes["1m"] = map[string]time.Time{"BTCUSDT": chMax}
+
+	h.b.SubmitColdStart([]Key{{"BTCUSDT", "1m"}})
+	eventually(t, 2*time.Second, h.b.Ready)
+
+	fc, _ := h.fetch.lastCall()
+	want := chMax.Add(time.Minute) // strictly resumes from ClickHouse latest time + 1 interval
+	if !fc.since.Equal(want) {
+		t.Fatalf("fetch since = %v, want exactly chMax + 1m = %v", fc.since, want)
+	}
+}
+
+func TestShardReconnectNoCHDataUsesSince(t *testing.T) {
+	h := newHarness(t, Config{})
+	// down for 10h; no record in ClickHouse -> uses LastMsgAt - 1m without any maxGap truncation
 	h.b.HandleGap(GapEvent{
 		ShardID:     "kline_1m_0",
 		Streams:     []string{"btcusdt@kline_1m"},
@@ -340,9 +356,47 @@ func TestShardReconnectBoundedByMaxGap(t *testing.T) {
 	})
 	eventually(t, 2*time.Second, func() bool { return h.fetch.callCount() == 1 })
 	fc, _ := h.fetch.lastCall()
-	wantFloor := fixedNow.Add(-200 * time.Minute)
-	if fc.since.Sub(wantFloor).Abs() > time.Second {
-		t.Fatalf("since = %v, want capped to ~%v", fc.since, wantFloor)
+	wantSince := fixedNow.Add(-10*time.Hour - time.Minute)
+	if fc.since.Sub(wantSince).Abs() > time.Second {
+		t.Fatalf("since = %v, want uncapped ~%v", fc.since, wantSince)
+	}
+}
+
+func TestShardReconnectResumesFromCHMax(t *testing.T) {
+	chMax := fixedNow.Add(-30 * time.Minute)
+	h := newHarness(t, Config{})
+	h.store.maxTimes["1m"] = map[string]time.Time{
+		"BTCUSDT": chMax,
+	}
+	// Shard was down for 2 hours, but ClickHouse already has data up to -30m
+	h.b.HandleGap(GapEvent{
+		ShardID:     "kline_1m_0",
+		Streams:     []string{"btcusdt@kline_1m"},
+		LastMsgAt:   fixedNow.Add(-2 * time.Hour),
+		ReconnectAt: fixedNow,
+	})
+	eventually(t, 2*time.Second, func() bool { return h.fetch.callCount() == 1 })
+	fc, _ := h.fetch.lastCall()
+	wantSince := chMax.Add(time.Minute)
+	if !fc.since.Equal(wantSince) {
+		t.Fatalf("since = %v, want chMax+1m = %v", fc.since, wantSince)
+	}
+}
+
+func TestColdStartWithInitialDate(t *testing.T) {
+	startDate := fixedNow.Add(-72 * time.Hour)
+	h := newHarness(t, Config{
+		ColdStartTime: startDate,
+	})
+	h.b.SubmitColdStart([]Key{{"BTCUSDT", "1m"}})
+	eventually(t, 2*time.Second, h.b.Ready)
+
+	if h.fetch.callCount() != 1 {
+		t.Fatalf("fetch calls = %d, want 1", h.fetch.callCount())
+	}
+	fc, _ := h.fetch.lastCall()
+	if !fc.since.Equal(startDate) {
+		t.Fatalf("since = %v, want ColdStartTime %v", fc.since, startDate)
 	}
 }
 
@@ -468,4 +522,42 @@ func TestGracefulClose(t *testing.T) {
 	}
 	// submit after close is a no-op
 	h.b.Submit(Request{Keys: []Key{{"X", "1m"}}, Reason: ReasonUniverseAdd})
+}
+
+type fakeStreamFetcher struct {
+	fakeFetcher
+	batches [][]chwriter.Row
+}
+
+func (s *fakeStreamFetcher) FetchStream(ctx context.Context, sym, iv string, since, until time.Time, onBatch func([]chwriter.Row) error) error {
+	s.mu.Lock()
+	s.calls = append(s.calls, fetchCall{sym, iv, since, until})
+	s.mu.Unlock()
+	for _, b := range s.batches {
+		if err := onBatch(b); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestStreamFetcherIntegration(t *testing.T) {
+	sf := &fakeStreamFetcher{
+		batches: [][]chwriter.Row{
+			{row("BTCUSDT", fixedNow.Add(-2*time.Hour).UnixMilli(), 1)},
+			{row("BTCUSDT", fixedNow.Add(-1*time.Hour).UnixMilli(), 2)},
+		},
+	}
+	arc := map[string]ArchiveWriter{"1h": &fakeArchive{}}
+	b, err := New(Config{Clock: func() time.Time { return fixedNow }}, sf, arc, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Start(context.Background())
+	defer b.Close()
+
+	b.Submit(Request{Keys: []Key{{"BTCUSDT", "1h"}}, Since: fixedNow.Add(-3 * time.Hour), Reason: ReasonShardReconnect})
+	eventually(t, 2*time.Second, func() bool { return sf.callCount() == 1 })
+	fa := arc["1h"].(*fakeArchive)
+	eventually(t, 2*time.Second, func() bool { return fa.count() == 2 })
 }

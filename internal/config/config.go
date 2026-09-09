@@ -117,13 +117,33 @@ type UniverseConfig struct {
 
 // BackfillConfig configures historical gapfill and window rebuild.
 type BackfillConfig struct {
-	Enabled     bool          `yaml:"enabled"`
-	Workers     int           `yaml:"workers"`
-	RestRPS     float64       `yaml:"rest_rps"`
-	QueueSize   int           `yaml:"queue_size"`
-	GapDebounce time.Duration `yaml:"gap_debounce"`
-	GateTimeout time.Duration `yaml:"gate_timeout"`
-	FlushWait   time.Duration `yaml:"flush_wait"`
+	Enabled       bool          `yaml:"enabled"`
+	ColdStartDate string        `yaml:"cold_start_date"` // e.g. "2024-01-01" or RFC3339
+	Workers       int           `yaml:"workers"`
+	RestRPS       float64       `yaml:"rest_rps"`
+	QueueSize     int           `yaml:"queue_size"`
+	GapDebounce   time.Duration `yaml:"gap_debounce"`
+	GateTimeout   time.Duration `yaml:"gate_timeout"`
+	FlushWait     time.Duration `yaml:"flush_wait"`
+}
+
+// ParseColdStartTime parses ColdStartDate into time.Time (UTC). Supports "2006-01-02",
+// "2006-01-02 15:04:05", and RFC3339. Returns zero time if ColdStartDate is empty.
+func (b BackfillConfig) ParseColdStartTime() (time.Time, error) {
+	if b.ColdStartDate == "" {
+		return time.Time{}, nil
+	}
+	layouts := []string{
+		time.RFC3339,
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
+	for _, l := range layouts {
+		if t, err := time.Parse(l, b.ColdStartDate); err == nil {
+			return t.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("invalid cold_start_date %q: must be YYYY-MM-DD or RFC3339", b.ColdStartDate)
 }
 
 // DefaultConfig returns complete production defaults.
@@ -208,13 +228,14 @@ func DefaultConfig() Config {
 			Status:          "TRADING",
 		},
 		Backfill: BackfillConfig{
-			Enabled:     true,
-			Workers:     4,
-			RestRPS:     20,
-			QueueSize:   256,
-			GapDebounce: 30 * time.Second,
-			GateTimeout: 5 * time.Minute,
-			FlushWait:   2 * time.Second,
+			Enabled:       true,
+			ColdStartDate: "",
+			Workers:       4,
+			RestRPS:       20,
+			QueueSize:     256,
+			GapDebounce:   30 * time.Second,
+			GateTimeout:   5 * time.Minute,
+			FlushWait:     2 * time.Second,
 		},
 	}
 }
@@ -258,8 +279,13 @@ func (c *Config) Validate() error {
 	if c.ClickHouse.ChannelSize <= 0 {
 		return fmt.Errorf("clickhouse.channel_size must be > 0")
 	}
-	if c.Backfill.Enabled && c.Backfill.Workers <= 0 {
-		return fmt.Errorf("backfill.workers must be > 0")
+	if c.Backfill.Enabled {
+		if c.Backfill.Workers <= 0 {
+			return fmt.Errorf("backfill.workers must be > 0")
+		}
+		if _, err := c.Backfill.ParseColdStartTime(); err != nil {
+			return fmt.Errorf("backfill.cold_start_date: %w", err)
+		}
 	}
 	return nil
 }

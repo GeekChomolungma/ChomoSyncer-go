@@ -226,16 +226,20 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		for iv, w := range a.chWriters {
 			archiveMap[iv] = w
 		}
+		coldStartTime, parseErr := cfg.Backfill.ParseColdStartTime()
+		if parseErr != nil {
+			return fail("backfill cold_start_date: %w", parseErr)
+		}
 		a.backfiller, err = backfill.New(backfill.Config{
-			MaxGapWindow: 0, // per-interval WindowSize×interval
-			GapDebounce:  cfg.Backfill.GapDebounce,
-			Workers:      cfg.Backfill.Workers,
-			QueueSize:    cfg.Backfill.QueueSize,
-			WindowSize:   cfg.Redis.Window.WindowSize,
-			GateTimeout:  cfg.Backfill.GateTimeout,
-			FlushWait:    cfg.Backfill.FlushWait,
-			Registerer:   reg,
-			Logger:       cfg.Logger,
+			ColdStartTime: coldStartTime,
+			GapDebounce:   cfg.Backfill.GapDebounce,
+			Workers:       cfg.Backfill.Workers,
+			QueueSize:     cfg.Backfill.QueueSize,
+			WindowSize:    cfg.Redis.Window.WindowSize,
+			GateTimeout:   cfg.Backfill.GateTimeout,
+			FlushWait:     cfg.Backfill.FlushWait,
+			Registerer:    reg,
+			Logger:        cfg.Logger,
 		}, fetcher, archiveMap, a.chStore, a.win, gateAdapter{a.gate})
 		if err != nil {
 			return fail("backfiller: %w", err)

@@ -90,4 +90,20 @@ func TestValidateCatchesInvalid(t *testing.T) {
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for empty Intervals")
 	}
+
+	cfg = DefaultConfig()
+	cfg.Backfill.ColdStartDate = "invalid-date"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for invalid cold_start_date")
+	}
+
+	cfg = DefaultConfig()
+	cfg.Backfill.ColdStartDate = "2024-01-01"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid for 2024-01-01, got %v", err)
+	}
+	tParsed, err := cfg.Backfill.ParseColdStartTime()
+	if err != nil || tParsed.Year() != 2024 {
+		t.Fatalf("ParseColdStartTime got %v, err: %v", tParsed, err)
+	}
 }

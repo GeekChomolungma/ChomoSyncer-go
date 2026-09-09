@@ -97,21 +97,21 @@ func NewBinanceFetcher(cfg FetcherConfig) *BinanceFetcher {
 	}
 }
 
-// Fetch returns closed bars with open time in [since, until), ascending. A bar
-// is "closed" only if its closeTime is at least 1s in the past. Implements
-// backfill.KlineFetcher.
-func (f *BinanceFetcher) Fetch(ctx context.Context, symbol, interval string, since, until time.Time) ([]chwriter.Row, error) {
+// FetchStream calls onBatch with each page of closed rows as soon as it is fetched.
+// If onBatch returns an error, pagination terminates early and returns that error.
+// Implements backfill.StreamFetcher.
+func (f *BinanceFetcher) FetchStream(ctx context.Context, symbol, interval string, since, until time.Time, onBatch func([]chwriter.Row) error) error {
 	sinceMs := since.UnixMilli()
 	untilMs := until.UnixMilli()
 	closedBefore := f.now().Add(-time.Second).UnixMilli()
 
-	var out []chwriter.Row
 	cursor := sinceMs
 	for cursor < untilMs {
 		rows, lastOpen, err := f.page(ctx, symbol, interval, cursor, untilMs)
 		if err != nil {
-			return out, err
+			return err
 		}
+		var batch []chwriter.Row
 		for _, r := range rows {
 			if r.openMs < sinceMs || r.openMs >= untilMs || r.closeMs >= closedBefore {
 				continue
@@ -121,7 +121,12 @@ func (f *BinanceFetcher) Fetch(ctx context.Context, symbol, interval string, sin
 				f.log.Warn("skip malformed kline row", "symbol", symbol, "interval", interval, "err", cerr)
 				continue
 			}
-			out = append(out, row)
+			batch = append(batch, row)
+		}
+		if len(batch) > 0 && onBatch != nil {
+			if err := onBatch(batch); err != nil {
+				return err
+			}
 		}
 		if len(rows) == 0 || lastOpen < cursor {
 			break
@@ -135,7 +140,19 @@ func (f *BinanceFetcher) Fetch(ctx context.Context, symbol, interval string, sin
 			break // last page
 		}
 	}
-	return out, nil
+	return nil
+}
+
+// Fetch returns closed bars with open time in [since, until), ascending. A bar
+// is "closed" only if its closeTime is at least 1s in the past. Implements
+// backfill.KlineFetcher.
+func (f *BinanceFetcher) Fetch(ctx context.Context, symbol, interval string, since, until time.Time) ([]chwriter.Row, error) {
+	var out []chwriter.Row
+	err := f.FetchStream(ctx, symbol, interval, since, until, func(batch []chwriter.Row) error {
+		out = append(out, batch...)
+		return nil
+	})
+	return out, err
 }
 
 type rawKline struct {
