@@ -22,6 +22,16 @@
 --   Binance's boundaries. It does NOT for 1w (epoch is a Thursday) or calendar
 --   months — those are intentionally not offered here.
 --
+-- MV SHAPE — why the inner subquery
+--   26.10+ requires a `... TO <table>` MV's SELECT output column names to match
+--   the target table, so column 2 must be named `start_time`. But we also filter
+--   and argMin/argMax on the RAW 1m `start_time`. If the bucket expression were
+--   aliased `AS start_time` directly it would shadow the raw column and either
+--   break analysis or silently make argMin(open, start_time) pick by bucket.
+--   So: the inner query aggregates with the bucket aliased `bucket_start` (raw
+--   `start_time` stays unambiguous); the outer query only renames it to
+--   `start_time` for the target-table match.
+--
 -- NOT auto-run by docker-compose (only 001 is). Apply it by hand — see below.
 --
 -- APPLY ORDER (two-phase cold start — see docs/OPERATIONS.md §A.1 / §B.1)
@@ -41,12 +51,13 @@
 --   the rollup layer only after the 1m history has landed.
 --
 -- REQUIREMENTS
---   Refreshable materialized views need ClickHouse >= 24.8 (the SET below is
---   required on 24.x; on newer builds it is a harmless no-op, but if your server
---   rejects it as an unknown setting, just delete that one line). If refreshable
---   MVs are unavailable at all, delete every "CREATE MATERIALIZED VIEW ..."
---   block below and instead schedule 003_rollup_backfill.sql (rolling-window
---   variant) from cron / a systemd timer every 1-2 minutes.
+--   The refreshable-MV + APPEND syntax used below needs ClickHouse >= 24.10
+--   (24.8 parses REFRESH but not APPEND). The SET line is required on 24.x and a
+--   harmless no-op on newer builds; if your server rejects it as an unknown
+--   setting, just delete that line. If refreshable MVs are unavailable at all,
+--   delete every "CREATE MATERIALIZED VIEW ..." block below and instead schedule
+--   003_rollup_backfill.sql (rolling-window variant) from cron / a systemd timer
+--   every 1-2 minutes.
 -- ============================================================================
 
 SET allow_experimental_refreshable_materialized_view = 1;
@@ -85,21 +96,30 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS market.fapi_kline_5m_rmv
 REFRESH EVERY 60 SECOND APPEND TO market.fapi_kline_5m AS
 SELECT
     symbol,
-    toStartOfInterval(start_time, INTERVAL 5 MINUTE)  AS bucket_start,
-    max(end_time)                                     AS end_time,
-    argMin(open,  start_time)                         AS open,
-    max(high)                                         AS high,
-    min(low)                                          AS low,
-    argMax(close, start_time)                         AS close,
-    sum(volume)                                       AS volume,
-    sum(quote_volume)                                 AS quote_volume,
-    sum(taker_buy_volume)                             AS taker_buy_volume,
-    sum(taker_buy_quote_volume)                       AS taker_buy_quote_volume,
-    toUInt32(sum(trades_count))                       AS trades_count,
-    now64(3)                                          AS rollup_version
-FROM market.fapi_kline_1m FINAL
-WHERE start_time >= now() - INTERVAL 3 DAY
-GROUP BY symbol, bucket_start;
+    bucket_start AS start_time,
+    end_time, open, high, low, close,
+    volume, quote_volume, taker_buy_volume, taker_buy_quote_volume,
+    trades_count, rollup_version
+FROM
+(
+    SELECT
+        symbol,
+        toStartOfInterval(start_time, INTERVAL 5 MINUTE)  AS bucket_start,
+        max(end_time)                                     AS end_time,
+        argMin(open,  start_time)                         AS open,
+        max(high)                                         AS high,
+        min(low)                                          AS low,
+        argMax(close, start_time)                         AS close,
+        sum(volume)                                       AS volume,
+        sum(quote_volume)                                 AS quote_volume,
+        sum(taker_buy_volume)                             AS taker_buy_volume,
+        sum(taker_buy_quote_volume)                       AS taker_buy_quote_volume,
+        toUInt32(sum(trades_count))                       AS trades_count,
+        now64(3)                                          AS rollup_version
+    FROM market.fapi_kline_1m FINAL
+    WHERE start_time >= now() - INTERVAL 3 DAY
+    GROUP BY symbol, bucket_start
+);
 
 -- ---------------------------------------------------------------------------
 -- 15m
@@ -130,21 +150,30 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS market.fapi_kline_15m_rmv
 REFRESH EVERY 60 SECOND APPEND TO market.fapi_kline_15m AS
 SELECT
     symbol,
-    toStartOfInterval(start_time, INTERVAL 15 MINUTE) AS bucket_start,
-    max(end_time)                                     AS end_time,
-    argMin(open,  start_time)                         AS open,
-    max(high)                                         AS high,
-    min(low)                                          AS low,
-    argMax(close, start_time)                         AS close,
-    sum(volume)                                       AS volume,
-    sum(quote_volume)                                 AS quote_volume,
-    sum(taker_buy_volume)                             AS taker_buy_volume,
-    sum(taker_buy_quote_volume)                       AS taker_buy_quote_volume,
-    toUInt32(sum(trades_count))                       AS trades_count,
-    now64(3)                                          AS rollup_version
-FROM market.fapi_kline_1m FINAL
-WHERE start_time >= now() - INTERVAL 3 DAY
-GROUP BY symbol, bucket_start;
+    bucket_start AS start_time,
+    end_time, open, high, low, close,
+    volume, quote_volume, taker_buy_volume, taker_buy_quote_volume,
+    trades_count, rollup_version
+FROM
+(
+    SELECT
+        symbol,
+        toStartOfInterval(start_time, INTERVAL 15 MINUTE) AS bucket_start,
+        max(end_time)                                     AS end_time,
+        argMin(open,  start_time)                         AS open,
+        max(high)                                         AS high,
+        min(low)                                          AS low,
+        argMax(close, start_time)                         AS close,
+        sum(volume)                                       AS volume,
+        sum(quote_volume)                                 AS quote_volume,
+        sum(taker_buy_volume)                             AS taker_buy_volume,
+        sum(taker_buy_quote_volume)                       AS taker_buy_quote_volume,
+        toUInt32(sum(trades_count))                       AS trades_count,
+        now64(3)                                          AS rollup_version
+    FROM market.fapi_kline_1m FINAL
+    WHERE start_time >= now() - INTERVAL 3 DAY
+    GROUP BY symbol, bucket_start
+);
 
 -- ---------------------------------------------------------------------------
 -- 1h
@@ -175,21 +204,30 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS market.fapi_kline_1h_rmv
 REFRESH EVERY 60 SECOND APPEND TO market.fapi_kline_1h AS
 SELECT
     symbol,
-    toStartOfInterval(start_time, INTERVAL 1 HOUR)    AS bucket_start,
-    max(end_time)                                     AS end_time,
-    argMin(open,  start_time)                         AS open,
-    max(high)                                         AS high,
-    min(low)                                          AS low,
-    argMax(close, start_time)                         AS close,
-    sum(volume)                                       AS volume,
-    sum(quote_volume)                                 AS quote_volume,
-    sum(taker_buy_volume)                             AS taker_buy_volume,
-    sum(taker_buy_quote_volume)                       AS taker_buy_quote_volume,
-    toUInt32(sum(trades_count))                       AS trades_count,
-    now64(3)                                          AS rollup_version
-FROM market.fapi_kline_1m FINAL
-WHERE start_time >= now() - INTERVAL 3 DAY
-GROUP BY symbol, bucket_start;
+    bucket_start AS start_time,
+    end_time, open, high, low, close,
+    volume, quote_volume, taker_buy_volume, taker_buy_quote_volume,
+    trades_count, rollup_version
+FROM
+(
+    SELECT
+        symbol,
+        toStartOfInterval(start_time, INTERVAL 1 HOUR)    AS bucket_start,
+        max(end_time)                                     AS end_time,
+        argMin(open,  start_time)                         AS open,
+        max(high)                                         AS high,
+        min(low)                                          AS low,
+        argMax(close, start_time)                         AS close,
+        sum(volume)                                       AS volume,
+        sum(quote_volume)                                 AS quote_volume,
+        sum(taker_buy_volume)                             AS taker_buy_volume,
+        sum(taker_buy_quote_volume)                       AS taker_buy_quote_volume,
+        toUInt32(sum(trades_count))                       AS trades_count,
+        now64(3)                                          AS rollup_version
+    FROM market.fapi_kline_1m FINAL
+    WHERE start_time >= now() - INTERVAL 3 DAY
+    GROUP BY symbol, bucket_start
+);
 
 -- ---------------------------------------------------------------------------
 -- 4h
@@ -220,21 +258,30 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS market.fapi_kline_4h_rmv
 REFRESH EVERY 120 SECOND APPEND TO market.fapi_kline_4h AS
 SELECT
     symbol,
-    toStartOfInterval(start_time, INTERVAL 4 HOUR)    AS bucket_start,
-    max(end_time)                                     AS end_time,
-    argMin(open,  start_time)                         AS open,
-    max(high)                                         AS high,
-    min(low)                                          AS low,
-    argMax(close, start_time)                         AS close,
-    sum(volume)                                       AS volume,
-    sum(quote_volume)                                 AS quote_volume,
-    sum(taker_buy_volume)                             AS taker_buy_volume,
-    sum(taker_buy_quote_volume)                       AS taker_buy_quote_volume,
-    toUInt32(sum(trades_count))                       AS trades_count,
-    now64(3)                                          AS rollup_version
-FROM market.fapi_kline_1m FINAL
-WHERE start_time >= now() - INTERVAL 7 DAY
-GROUP BY symbol, bucket_start;
+    bucket_start AS start_time,
+    end_time, open, high, low, close,
+    volume, quote_volume, taker_buy_volume, taker_buy_quote_volume,
+    trades_count, rollup_version
+FROM
+(
+    SELECT
+        symbol,
+        toStartOfInterval(start_time, INTERVAL 4 HOUR)    AS bucket_start,
+        max(end_time)                                     AS end_time,
+        argMin(open,  start_time)                         AS open,
+        max(high)                                         AS high,
+        min(low)                                          AS low,
+        argMax(close, start_time)                         AS close,
+        sum(volume)                                       AS volume,
+        sum(quote_volume)                                 AS quote_volume,
+        sum(taker_buy_volume)                             AS taker_buy_volume,
+        sum(taker_buy_quote_volume)                       AS taker_buy_quote_volume,
+        toUInt32(sum(trades_count))                       AS trades_count,
+        now64(3)                                          AS rollup_version
+    FROM market.fapi_kline_1m FINAL
+    WHERE start_time >= now() - INTERVAL 7 DAY
+    GROUP BY symbol, bucket_start
+);
 
 -- ---------------------------------------------------------------------------
 -- 1d
@@ -265,27 +312,36 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS market.fapi_kline_1d_rmv
 REFRESH EVERY 300 SECOND APPEND TO market.fapi_kline_1d AS
 SELECT
     symbol,
-    toStartOfInterval(start_time, INTERVAL 1 DAY)     AS bucket_start,
-    max(end_time)                                     AS end_time,
-    argMin(open,  start_time)                         AS open,
-    max(high)                                         AS high,
-    min(low)                                          AS low,
-    argMax(close, start_time)                         AS close,
-    sum(volume)                                       AS volume,
-    sum(quote_volume)                                 AS quote_volume,
-    sum(taker_buy_volume)                             AS taker_buy_volume,
-    sum(taker_buy_quote_volume)                       AS taker_buy_quote_volume,
-    toUInt32(sum(trades_count))                       AS trades_count,
-    now64(3)                                          AS rollup_version
-FROM market.fapi_kline_1m FINAL
-WHERE start_time >= now() - INTERVAL 10 DAY
-GROUP BY symbol, bucket_start;
+    bucket_start AS start_time,
+    end_time, open, high, low, close,
+    volume, quote_volume, taker_buy_volume, taker_buy_quote_volume,
+    trades_count, rollup_version
+FROM
+(
+    SELECT
+        symbol,
+        toStartOfInterval(start_time, INTERVAL 1 DAY)     AS bucket_start,
+        max(end_time)                                     AS end_time,
+        argMin(open,  start_time)                         AS open,
+        max(high)                                         AS high,
+        min(low)                                          AS low,
+        argMax(close, start_time)                         AS close,
+        sum(volume)                                       AS volume,
+        sum(quote_volume)                                 AS quote_volume,
+        sum(taker_buy_volume)                             AS taker_buy_volume,
+        sum(taker_buy_quote_volume)                       AS taker_buy_quote_volume,
+        toUInt32(sum(trades_count))                       AS trades_count,
+        now64(3)                                          AS rollup_version
+    FROM market.fapi_kline_1m FINAL
+    WHERE start_time >= now() - INTERVAL 10 DAY
+    GROUP BY symbol, bucket_start
+);
 
 -- ============================================================================
 -- Adding another serve interval? Copy one block above and change ONLY:
 --   * the table name          fapi_kline_<IV>
 --   * the MV name             fapi_kline_<IV>_rmv
---   * both INTERVAL <N UNIT>  expressions (they must match)
+--   * both INTERVAL <N UNIT>  expressions in the inner query (they must match)
 --   * the REFRESH EVERY / WHERE lookback (>= a few target buckets wide)
 -- Then add "<IV>" to collector.serve_intervals (so the derived kline_ready
 -- fires) and to 003_rollup_backfill.sql (for the historical fold).
