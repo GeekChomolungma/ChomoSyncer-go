@@ -1,11 +1,42 @@
-# ChomoSyncer-go local / staging stack.
+# ChomoSyncer-go local / staging stack. Three services:
+#   clickhouse     - official image; auto-runs ONLY 001 (raw fapi_kline_1m) on
+#                    first start. 002 (rollup tables + MVs) and 003 (historical
+#                    fold) are deliberately NOT auto-run — apply them by hand once
+#                    the 1m history is loaded (see below / docs/OPERATIONS.md).
+#   redis          - official image; cache mode (no persistence, noeviction)
+#   chomosyncer-go - the daemon, BUILT FROM ../Dockerfile; behind profile "app".
+#                    Config is YAML-first: ../config.yaml is mounted in, exactly
+#                    like bare metal. The only Docker-specific bits are the two
+#                    service addresses in `environment:` below.
 #
-#   docker compose -f deploy/docker-compose.yml up -d            # ClickHouse + Redis only
-#   docker compose -f deploy/docker-compose.yml --profile app up # + the collector
+#   # 0. one-time: create the config the daemon reads
+#   cp config.example.yaml config.yaml        # then edit it
 #
-# ClickHouse auto-creates market.fapi_kline_1m / _1h on first start from the
-# mounted DDL. Ports: ClickHouse native 9000 / http 8123, Redis 6379,
-# chomosyncer-go metrics 9090.
+#   # 1. dependencies only (ClickHouse runs 001)
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+#   # 2. rollup layer — run once, AFTER any deep-history backfill (safe on a
+#   #    fresh empty DB too: there is just nothing to fold yet). clickhouse/ is
+#   #    mounted at /clickhouse inside the container.
+#   docker compose -f deploy/docker-compose.yml exec clickhouse \
+#     clickhouse-client --queries-file /clickhouse/002_kline_rollups.sql
+#   # ...and 003 only if you loaded 1m history in a phase-one backfill:
+#   docker compose -f deploy/docker-compose.yml exec clickhouse clickhouse-client \
+#     --param_m_start='2000-01-01 00:00:00' --param_m_end='2099-01-01 00:00:00' \
+#     --queries-file /clickhouse/003_rollup_backfill.sql
+#
+#   # 3. + the daemon (builds the image on first run)
+#   docker compose -f deploy/docker-compose.yml --profile app up -d --build
+#
+#   # one-off phase-one offline backfill (docs/OPERATIONS.md §A.1 / §B.1): run it
+#   #   BEFORE step 2, then run 002 and 003.
+#   docker compose -f deploy/docker-compose.yml run --rm chomosyncer-go \
+#     -backfill-offline-only -backfill-start-date 2024-01-01
+#
+#   # tear down (add -v to also wipe the ClickHouse volume)
+#   docker compose -f deploy/docker-compose.yml --profile app down
+#
+# Ports: ClickHouse 9000/8123, Redis 6379, daemon /metrics + /healthz on 9090.
 
 name: chomosyncer
 
@@ -25,8 +56,12 @@ services:
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     volumes:
       - ch-data:/var/lib/clickhouse
+      # Only 001 auto-runs on first start. 002 / 003 are manual (see file header)
+      # so the rollup MVs never race a deep-history backfill. The whole
+      # clickhouse/ dir is also mounted read-only at /clickhouse so you can run
+      # `... clickhouse-client --queries-file /clickhouse/002_kline_rollups.sql`.
       - ./clickhouse/001_fapi_kline.sql:/docker-entrypoint-initdb.d/001_fapi_kline.sql:ro
-      - ./clickhouse/002_kline_rollups.sql:/docker-entrypoint-initdb.d/002_kline_rollups.sql:ro
+      - ./clickhouse:/clickhouse:ro
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
       interval: 5s
@@ -65,12 +100,25 @@ services:
     container_name: chomo-app
     ports:
       - "9090:9090"   # /metrics + /healthz
-    env_file:
-      - ./chomosyncer-go.env.example
+    # YAML-first, same as bare metal: the repo-root config.yaml is the single
+    # source of truth. Create it first:  cp config.example.yaml config.yaml
+    # (if it is missing, Docker would bind-mount an empty dir and the daemon
+    # would crash-loop with "read config file: ... is a directory").
+    volumes:
+      - ../config.yaml:/etc/chomosyncer-go/config.yaml:ro
+    # The ONLY Docker-specific config: point the daemon at the mounted file, and
+    # override the two service addresses (config.yaml has localhost, which is
+    # wrong inside the compose network). Everything else comes from config.yaml.
+    # CHOMOSYNCER_* still wins over config.yaml, so add more here only for a
+    # deliberate container-only override.
     environment:
+      CHOMOSYNCER_CONFIG: /etc/chomosyncer-go/config.yaml
       CHOMOSYNCER_REDIS_ADDR: redis:6379
       CHOMOSYNCER_CH_ADDR: clickhouse:9000
-      CHOMOSYNCER_METRICS_ADDR: ":9090"
+    # Prefer env vars over YAML? Uncomment this and remove the config.yaml mount
+    # above. deploy/chomosyncer-go.env.example lists every CHOMOSYNCER_* var.
+    # env_file:
+    #   - ./chomosyncer-go.env.example
     depends_on:
       clickhouse:
         condition: service_healthy

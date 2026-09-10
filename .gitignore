@@ -2,13 +2,16 @@
 /bin/
 /dist/
 /build/
-chomosyncer-go
-chomosyncer-go.exe
-loadgen
-loadgen.exe
-*.exe
+# Root-level binaries from `go build ./cmd/...`. Anchored with a leading slash so
+# they do NOT match the source package dir cmd/chomosyncer-go/.
+/chomosyncer-go
+/chomosyncer-go.exe
+/loadgen
+/loadgen.exe
 *.test
 *.out
+# Windows build artifacts (never a source dir).
+*.exe
 
 # --- Go tooling ---
 /vendor/
@@ -28,8 +31,11 @@ cover.out
 # --- local runtime / secrets ---
 .env
 .env.*
+*.env
 !.env.example
+!*.env.example
 !deploy/*.env.example
+config.yaml
 *.local.yml
 *.local.yaml
 

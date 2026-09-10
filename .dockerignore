@@ -1,0 +1,33 @@
+# Keep the build context small: only Go sources + go.mod/go.sum are needed to
+# build the daemon (see Dockerfile).
+.git
+.github
+bin/
+dist/
+build/
+/chomosyncer-go
+/chomosyncer-go.exe
+*.exe
+*.test
+*.out
+*.prof
+*.pprof
+
+# not needed to build the Go binary
+docs/
+deploy/
+cmd/test-tools/
+**/__pycache__/
+*.md
+config.yaml
+config.example.yaml
+*.local.yml
+*.local.yaml
+.env
+.env.*
+
+# editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

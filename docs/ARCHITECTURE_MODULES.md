@@ -173,7 +173,7 @@
 
 ---
 
-## 模块 6：`internal/app` + `cmd/chomosyncer-cmd`（装配与生命周期）
+## 模块 6：`internal/app` + `cmd/chomosyncer-go`（装配与生命周期）
 
 - **模块装配**：在 `internal/app` 中执行依赖注入与网络拓扑构建。
 - **优雅关闭顺序**：
@@ -224,7 +224,7 @@
 - `gate_timeout` 自动失效（`internal/backfill` 内负值哨兵表示"无上限"），历史全量拉取不被中途强制释放；
 - 执行一次 whole-universe 冷启动回补后进程退出（正常完成退出码 `0`，被信号中断则非 `0` 但进度已落盘、重跑从 `max(start_time)` 续上）。
 
-配合"深历史离线灌满 → 校验 → 用最近少量窗口的 `cold_start_date` 启动在线业务"的两阶段流程，可确保历史落库完成后再开启 Redis 业务。详见 `docs/OPERATIONS.md` 方式 C。
+配合"深历史离线灌满 → 校验 → 用最近少量窗口的 `cold_start_date` 启动在线业务"的两阶段流程，可确保历史落库完成后再开启 Redis 业务。详见 `docs/OPERATIONS.md` §A.1 / §B.1（空库首次上线）。
 
 ### 8.6 更粗周期的 ClickHouse rollup（`deploy/clickhouse/002` + `003`）
 

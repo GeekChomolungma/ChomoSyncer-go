@@ -47,129 +47,158 @@
 
 ## 3. 快速启动指南
 
-### 方式 A：Docker Compose 模式（推荐本地与测试环境）
+按**是否已有 ClickHouse 历史数据**分两条线,每条线又分 Docker(方法 A)和裸机(方法 B):
 
-项目根目录提供了开箱即用的容器编排：
+| 场景 | 方法 A：Docker Compose（本地 / 测试） | 方法 B：二进制裸机（生产向） |
+| :--- | :--- | :--- |
+| **空库首次上线**（建表 → 离线灌历史 → 重启订阅） | §A.1 | §B.1 |
+| **已有库**（日常启动 / 重启 / 维护） | §A.2 | §B.2 |
 
-```bash
-# 1. 仅启动底层存储依赖 (ClickHouse + Redis)，并自动执行建表
-docker compose -f deploy/docker-compose.yml up -d
-
-# 检查依赖健康状态（等待两者状态变为 healthy）
-docker compose -f deploy/docker-compose.yml ps
-
-# 2. 启动采集器主程序（使用 --profile app 触发构建并拉起）
-docker compose -f deploy/docker-compose.yml --profile app up -d --build
-
-# 3. 观察实时运行日志
-docker compose -f deploy/docker-compose.yml logs -f chomosyncer-go
-
-# 4. 停机与清理
-docker compose -f deploy/docker-compose.yml --profile app down
-# 若需彻底清空数据卷：docker compose -f deploy/docker-compose.yml --profile app down -v
-```
+> **配置优先级**（低 → 高）：内置默认值 `<` `config.yaml` `<` `CHOMOSYNCER_*` 环境变量 `<` 显式命令行 flag。两种方法都以根目录 `config.yaml` 为准(Docker 也是把同一份挂进容器)。详见本节末 §3.3。
 
 ---
 
-### 方式 B：常规二进制裸机部署（生产推荐）
+### 方法 A：Docker Compose 模式
 
-#### 步骤 1：编译静态二进制
-```bash
-CGO_ENABLED=0 go build -trimpath   -ldflags "-s -w -X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo 'v1.0.0')"   -o bin/chomosyncer-cmd ./cmd/chomosyncer-cmd
-```
+#### A.0 这几个文件是什么关系
 
-#### 步骤 2：初始化 ClickHouse 数据库与表
-执行建表 SQL 脚本：
-```bash
-# 001：建库 market 与唯一原始表 fapi_kline_1m
-clickhouse-client --host 127.0.0.1 --port 9000 --multiquery < deploy/clickhouse/001_fapi_kline.sql
-
-# 002：建 5m/15m/1h/4h/1d rollup 表 + 刷新式物化视图（这些是从 fapi_kline_1m FINAL 幂等重算的派生表）
-clickhouse-client --host 127.0.0.1 --port 9000 --multiquery < deploy/clickhouse/002_kline_rollups.sql
-
-# 003：仅在“已有历史 1m 数据”（如两阶段冷启动阶段一之后）时运行一次，把历史折叠进 rollup 表。
-#      幂等：重跑不会让 volume 翻倍（详见文件头）。全量一次性：
-clickhouse-client --param_m_start='2000-01-01 00:00:00' --param_m_end='2099-01-01 00:00:00' \
-  --queries-file deploy/clickhouse/003_rollup_backfill.sql
-
-# 验证
-curl -s 'http://127.0.0.1:8123/?query=SHOW+TABLES+FROM+market'
-# 正常应返回: fapi_kline_1m / fapi_kline_5m / fapi_kline_15m / fapi_kline_1h / fapi_kline_4h / fapi_kline_1d (+ *_rmv 物化视图)
-```
-
-> **无刷新式物化视图支持**（ClickHouse < 24.8）：从 `002` 删掉全部 `CREATE MATERIALIZED VIEW` 段，改用 cron / systemd-timer 每 1–2 分钟执行一次 `003`（用滚动窗口，见 `003` 文件头的 “CRON FALLBACK”）。`003` 的重算是幂等的，怎么跑都不会重复累加。
-
-#### 步骤 3：配置与启动
-支持通过配置文件与命令行参数协同启动。优先读取 `config.yaml`（可从 `config.example.yaml` 复制）：
-
-```bash
-cp config.example.yaml config.yaml
-# 根据实际网络与集群修改 config.yaml 中的 redis / clickhouse 地址
-
-# 启动服务（显式指定配置文件）
-./bin/chomosyncer-cmd -config config.yaml
-
-# 或通过命令行参数覆盖部分配置项
-./bin/chomosyncer-cmd -config config.yaml -log-level debug -intervals 1m,1h
-```
-
----
-
-### 方式 C：两阶段冷启动（`cold_start_date` 设为很久远时间时推荐）
-
-#### 背景
-
-在线模式下，冷启动历史回补由 `windowgate` 门控挡在 Redis 业务（收盘滑窗 `kline:*` 与截面就绪 `stream:market:kline_ready`）之前。但门控受 `backfill.gate_timeout`（默认 `5m`）兜底释放：当 `cold_start_date` 设为数月甚至一年前、全市场历史回补远超 5 分钟时，门控会**提前释放**，导致：
-
-- 历史尚未补齐，实时 K 线已开始写入 Redis 业务出口；
-- 中间那段深历史缺口由于实时写入不受门控、会"污染" ClickHouse 的 `max(start_time)`，重启也不会自动重补（成为粘性缺口）。
-
-因此，把深历史作为一个**独立的离线阶段**先跑完，再启动在线业务，是最干净的做法。
-
-#### 开关
-
-| 入口 | 值 |
+| 文件 | 作用 |
 | :--- | :--- |
-| 配置文件 | `backfill.offline_only: true`（默认 `false`） |
-| 命令行 | `-backfill-offline-only` |
-| 环境变量 | `CHOMOSYNCER_BACKFILL_OFFLINE_ONLY=true` |
+| **`Dockerfile`**（仓库根目录） | 只负责**把 Go 源码编译成一个 `chomosyncer-go` 镜像**（多阶段:`golang:1.25` 编译 → `distroless/static` 运行，非 root）。镜像里**只有采集器二进制**，没有 Redis、没有 ClickHouse、没有配置文件。不单独手动用,由 compose 调用。 |
+| **`deploy/docker-compose.yml`** | 编排三个容器:`clickhouse`、`redis`、`chomosyncer-go`。`chomosyncer-go` 服务的 `build:` 指向根 `Dockerfile`,`profiles: ["app"]` 让它默认不启动(要 `--profile app`)。 |
+| **`deploy/clickhouse/001_fapi_kline.sql`** | 挂进 `clickhouse` 容器的 `/docker-entrypoint-initdb.d/`,**首次启动自动执行**(建 `market` 库 + 原始表 `fapi_kline_1m`)。 |
+| **`deploy/clickhouse/002` / `003`** | 通过 `./clickhouse:/clickhouse:ro` 只读挂进容器,但**不自动跑**——rollup 表 + 物化视图,由你在正确时机手动执行。 |
+| **根目录 `config.yaml`** | **配置的唯一来源**。compose 把它只读挂进 `chomosyncer-go` 容器(`../config.yaml → /etc/chomosyncer-go/config.yaml`),和裸机跑法一模一样。**必须先存在**,否则 Docker 会把挂载点建成空目录,采集器崩溃刷 `read config file: ... is a directory`。 |
+| **`deploy/chomosyncer-go.env.example`** | 仅作参考——列出所有可用的 `CHOMOSYNCER_*` 变量。compose **默认不读它**(YAML 优先)。 |
 
-`offline_only: true` 时：
+一句话:**`Dockerfile` = 编译打包;`docker-compose.yml` = 把采集器 + Redis + ClickHouse 拼成一套栈;配置就是那份 `config.yaml`,Docker 和裸机共用同一份。**
 
-- 仅装配 **universe 发现 → REST 拉取 → ClickHouse 批量落库** 这条链路；
-- **不启动** WS 采集器、dispatcher、Redis 滑窗 / LiveBar 写入器、窗口门控；
-- `gate_timeout` 自动失效（负值哨兵），历史全量拉取不会被中途强制释放；
-- 执行一次全市场 whole-universe 冷启动回补，**跑完即退出**：
-  - 正常跑完 → 退出码 `0`；
-  - 被 `SIGINT` / `SIGTERM` 中断 → 退出码非 `0`，但进度已落盘，**重跑会从 `max(start_time)` 续上**；
-- `/metrics` 仍然可用，可通过 `backfill_bars_fetched_total` / `backfill_bars_written_total` / `backfill_errors_total` 观察进度。
+#### A.1：空库首次上线（建表 → 离线灌历史 → 重启订阅）
 
-#### 操作流程
+**为什么要分两步而不是一把启动**：在线模式下,冷启动历史回补由 `windowgate` 门控挡在 Redis 业务(`kline:*` 滑窗 + `kline_ready` 截面)之前,但门控受 `backfill.gate_timeout`(默认 `10m`)兜底释放。如果 `cold_start_date` 设成几个月甚至一年前,全市场回补远超这个时长 → 门控**提前释放**,实时 K 线开始写 Redis,而中间那段深历史缺口会"污染" ClickHouse 的 `max(start_time)`,重启也不会自动重补(成为粘性缺口)。所以把深历史当一个**独立的离线阶段**先灌满,校验后再起在线业务。
 
 ```bash
-# ---- 阶段一：离线灌 1m 历史 ----
-# 只把 1m 历史灌入 ClickHouse fapi_kline_1m，跑完即退出，不触碰 Redis / WS。
-./bin/chomosyncer-cmd -config config.yaml \
-  -backfill-offline-only \
-  -backfill-start-date 2024-01-01
+# 0. 生成配置(compose 会挂进容器)。redis/clickhouse 地址不用改,compose 会覆盖成容器名。
+#    把 cold_start_date 设成你要的历史起点,例如 "2024-01-01"。
+cp config.example.yaml config.yaml
 
-# ---- 建 rollup 派生表，并折叠已灌好的历史 ----
-clickhouse-client --multiquery < deploy/clickhouse/002_kline_rollups.sql
-clickhouse-client --param_m_start='2000-01-01 00:00:00' --param_m_end='2099-01-01 00:00:00' \
-  --queries-file deploy/clickhouse/003_rollup_backfill.sql
+# 1. 起底层依赖。ClickHouse 首次启动只自动跑 001(建 fapi_kline_1m)。
+docker compose -f deploy/docker-compose.yml up -d
+docker compose -f deploy/docker-compose.yml ps            # 等两者都 healthy
 
-# 校验历史零断档 + 与币安外部对账（必须全绿再进入阶段二）
+# 2. 离线灌历史:一次性拉全市场 1m 历史进 fapi_kline_1m,跑完容器自己退出。
+#    - 只装配 universe→REST→ClickHouse 这条链路,不启 WS / dispatcher / Redis;
+#    - gate_timeout 自动失效,不会中途被强制释放;
+#    - 退出码 0 = 跑完;非 0 = 被中断,但进度已落盘,重跑会从 max(start_time) 续上;
+#    - 进度看 /metrics 的 backfill_bars_fetched_total / _written_total / _errors_total。
+docker compose -f deploy/docker-compose.yml run --rm chomosyncer-go \
+  -backfill-offline-only
+
+# 3. 历史灌完后,再建 rollup 层 + 折叠历史。
+#    此刻才建 MV → 刷新式物化视图只会跟新到的实时 1m,不会和上一步的大回补抢时间。
+docker compose -f deploy/docker-compose.yml exec clickhouse \
+  clickhouse-client --queries-file /clickhouse/002_kline_rollups.sql
+docker compose -f deploy/docker-compose.yml exec clickhouse clickhouse-client \
+  --param_m_start='2000-01-01 00:00:00' --param_m_end='2099-01-01 00:00:00' \
+  --queries-file /clickhouse/003_rollup_backfill.sql
+
+# 4. 校验(必须全绿再进下一步)。
 python cmd/test-tools/check_clickhouse_integrity.py --intervals 1m,5m,15m,1h,4h,1d
 python cmd/test-tools/check_vs_binance.py --intervals 1m,1h,4h
 
-# ---- 阶段二：启动完整在线业务 ----
-# cold_start_date 此时只需覆盖最近少量窗口（例如 7 天，足够填满 200 根 1m 滑窗 + 余量），
-# 在线冷启动秒级完成，永远撞不到 gate_timeout。rollup MV 会自动跟上新到的实时 1m。
-./bin/chomosyncer-cmd -config config.yaml   # config.yaml 内 cold_start_date 改为最近 7 天
+# 5. 把 config.yaml 的 cold_start_date 收窄到最近 7 天(够填满 200 根 1m 滑窗 + 余量),
+#    起在线服务。此时在线冷启动秒级完成,永远撞不到 gate_timeout,rollup MV 自动跟上。
+docker compose -f deploy/docker-compose.yml --profile app up -d --build
+docker compose -f deploy/docker-compose.yml logs -f chomosyncer-go
+curl -s localhost:9090/readyz
 ```
 
-> 如果坚持单阶段在线冷启动大范围历史，则必须把 `backfill.gate_timeout` 调到大于真实回补耗时（例如 `2h`），
-> 并对 `windowgate_held_keys > 0 持续过久` 配置告警。不推荐。
+> ClickHouse **< 24.8** 不支持刷新式物化视图:把 `002` 里所有 `CREATE MATERIALIZED VIEW` 段删掉,改用 cron / systemd-timer 每 1–2 分钟跑一次 `003`(滚动窗口,见 `003` 文件头 "CRON FALLBACK")。`003` 的重算是幂等的,怎么跑都不会重复累加。
+
+#### A.2：已有库（日常启动 / 重启 / 维护）
+
+库里已有 `fapi_kline_1m` 数据、rollup 表也建过,以后每次启动就是一条命令:
+
+```bash
+docker compose -f deploy/docker-compose.yml --profile app up -d --build
+```
+
+- **无需再跑 001/002/003**。`001` 只在 ClickHouse 数据卷为空时执行;`002` 的 MV 已存在;`003` 只在"新灌了一批历史 1m"后才需要补跑。
+- **断线/重启的缺口自动补**:采集器启动时读 `fapi_kline_1m` 的 `max(start_time)`,从那里续上回补,`/readyz` 在补完前返回 503。`config.yaml` 的 `cold_start_date` 保持"最近 7 天"即可(有历史时它只作为空库兜底,不生效)。
+- **改配置**:直接编辑根目录 `config.yaml` → `--profile app up -d` 重建容器。不需要第二份配置;唯一的容器专属项是 compose 写死的两个地址(`redis:6379` / `clickhouse:9000`)。
+- **加了新的 `serve_intervals`**:先 `docker compose ... exec clickhouse clickhouse-client --queries-file /clickhouse/002_kline_rollups.sql`(`002` 用 `CREATE ... IF NOT EXISTS`,只新增缺的表/视图),需要历史再按需跑 `003`,然后重启采集器。
+- **停机**:`docker compose -f deploy/docker-compose.yml --profile app down`(加 `-v` 连 ClickHouse 数据卷一起清空——慎用)。
+
+---
+
+### 方法 B：常规二进制裸机部署（生产向）
+
+#### B.0：编译
+
+```bash
+CGO_ENABLED=0 go build -trimpath \
+  -ldflags "-s -w -X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo 'v1.0.0')" \
+  -o bin/chomosyncer-go ./cmd/chomosyncer-go
+```
+
+自备 ClickHouse (≥ 24.8) 与 Redis (建议 `--maxmemory 1gb --maxmemory-policy noeviction --save ''`)。
+
+#### B.1：空库首次上线（建表 → 离线灌历史 → 重启在线业务）
+
+分两步的理由同 §A.1（深历史必须先离线灌满,否则 `gate_timeout` 提前释放门控会留下粘性缺口）。
+
+```bash
+# 1. 生成配置,填好 redis / clickhouse 地址,cold_start_date 设为历史起点(如 "2024-01-01")。
+cp config.example.yaml config.yaml
+
+# 2. 建原始表。
+clickhouse-client --host 127.0.0.1 --port 9000 --multiquery < deploy/clickhouse/001_fapi_kline.sql
+
+# 3. 离线灌历史:拉全市场 1m 历史进 fapi_kline_1m,跑完即退出。
+#    行为同 A.1 步骤 2:只装配 REST→ClickHouse,不启 WS/Redis;gate_timeout 失效;
+#    退出码 0=完成 / 非 0=中断但可重跑续上;进度看 /metrics 的 backfill_bars_*。
+./bin/chomosyncer-go -config config.yaml -backfill-offline-only
+
+# 4. 历史灌完后,建 rollup 层 + 折叠历史。
+clickhouse-client --host 127.0.0.1 --port 9000 --multiquery < deploy/clickhouse/002_kline_rollups.sql
+clickhouse-client --host 127.0.0.1 --port 9000 \
+  --param_m_start='2000-01-01 00:00:00' --param_m_end='2099-01-01 00:00:00' \
+  --queries-file deploy/clickhouse/003_rollup_backfill.sql
+
+# 5. 校验。
+curl -s 'http://127.0.0.1:8123/?query=SHOW+TABLES+FROM+market'
+# 应返回: fapi_kline_1m / _5m / _15m / _1h / _4h / _1d (+ *_rmv 物化视图)
+python cmd/test-tools/check_clickhouse_integrity.py --intervals 1m,5m,15m,1h,4h,1d
+python cmd/test-tools/check_vs_binance.py --intervals 1m,1h,4h
+
+# 6. 把 config.yaml 的 cold_start_date 收窄到最近 7 天,起在线业务。
+./bin/chomosyncer-go -config config.yaml
+curl -i http://localhost:9090/readyz     # 回补补完后转 200
+```
+
+> ClickHouse **< 24.8**:同 A.1 备注,`002` 去掉 `CREATE MATERIALIZED VIEW`,改 cron 跑 `003`。
+
+#### B.2：已有库（重启 / 后续维护）
+
+```bash
+./bin/chomosyncer-go -config config.yaml            # 就这一条
+```
+
+- **不用再跑 001/002/003**。断线期间的缺口在启动时从 `fapi_kline_1m` 的 `max(start_time)` 自动续补,`/readyz` 在补完前 503。
+- 建议用 systemd 托管(`Restart=on-failure`、`ExecStart=/opt/chomosyncer-go/bin/chomosyncer-go -config /opt/chomosyncer-go/config.yaml`),`SIGTERM` 会触发优雅停机排空落盘。
+- **改配置**:改 `config.yaml` 后重启进程即可;个别项也可用 `-flag` 或 `CHOMOSYNCER_*` 临时覆盖(优先级更高)。
+- **加了新的 `serve_intervals`**:重新执行 `002`(`IF NOT EXISTS`,只补缺的),需要历史再跑 `003`,然后重启进程。
+
+---
+
+### 3.3 配置来源与深度参数
+
+优先级(低 → 高):**内置 `DefaultConfig()`  <  `config.yaml`  <  `CHOMOSYNCER_*` 环境变量  <  显式命令行 flag**。`config.example.yaml` 里每一项都有内置生产级默认值,不写也能跑。
+
+- **裸机**:`-config config.yaml` 就是全部;要临时压某项用 `-flag` 或 `CHOMOSYNCER_*`。
+- **Docker**:只维护根目录 `config.yaml` 一份(挂进容器);compose 里写死的两个地址 env(`CHOMOSYNCER_REDIS_ADDR=redis:6379` / `CHOMOSYNCER_CH_ADDR=clickhouse:9000`)是仅有的容器专属覆盖——因为 `config.yaml` 里是 `localhost`,容器网络里不通。想在容器里再压某项,往 `chomosyncer-go` 服务的 `environment:` 加对应 `CHOMOSYNCER_*`(规则:flag `-redis-pool-size` ↔ env `CHOMOSYNCER_REDIS_POOL_SIZE`;全量 `chomosyncer-go -h`)。
+- **想彻底用环境变量不用 YAML**:在 `docker-compose.yml` 去掉 `config.yaml` 挂载、取消注释 `env_file:`(指向从 `chomosyncer-go.env.example` 复制的 `deploy/chomosyncer-go.env`)。
+- **只能写 YAML、没有环境变量双胞胎的参数**:`redis.dial_timeout` / `read_timeout` / `write_timeout`、`redis.window.stream_maxlen` / `key_prefix` / `atomic`、`redis.live.ttl_multiple` / `default_ttl` / `write_timeout` / `key_prefix`、`clickhouse.table_prefix` / `dial_timeout` / `tls` / `max_retries` / `retry_backoff` / `max_retry_backoff` / `shutdown_timeout`、`collector.connect_stagger` / `connect_timeout` / `reconnect_base` / `reconnect_max` / `watchdog_interval`、`dispatcher.publish_timeout`、`universe.refresh_offset` / `http_timeout` / `contract_type` / `status`、`backfill.queue_size`、`app.shutdown_timeout`。
 
 ---
 
@@ -318,7 +347,7 @@ python cmd/test-tools/run_all_checks.py --vs-binance
 - [ ] ClickHouse 建表完成，分区与 ReplacingMergeTree 确认无误；
 - [ ] Redis 已启动且配置 `noeviction`，连接池与密码配置正确；
 - [ ] 配置文件 `config.yaml` 或环境变量已配置生产环境地址；
-- [ ] 执行 `cmd/chomosyncer-cmd`，确认日志无 ERROR 报错；
+- [ ] 执行 `cmd/chomosyncer-go`，确认日志无 ERROR 报错；
 - [ ] 检查 `/healthz` 与 `/readyz` 探针均返回 HTTP 200；
 - [ ] 运行 `python cmd/test-tools/run_all_checks.py` 得到全绿 PASS 结论；
 - [ ] Prometheus 正常抓取 `/metrics`，配置了 `ws_connection_status` 和 `ws_last_message_age_seconds` 报警规则。

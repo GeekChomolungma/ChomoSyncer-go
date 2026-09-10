@@ -22,15 +22,23 @@
 --   Binance's boundaries. It does NOT for 1w (epoch is a Thursday) or calendar
 --   months — those are intentionally not offered here.
 --
--- APPLY ORDER (two-phase cold start — see docs/OPERATIONS.md "方式 C")
+-- NOT auto-run by docker-compose (only 001 is). Apply it by hand — see below.
+--
+-- APPLY ORDER (two-phase cold start — see docs/OPERATIONS.md §A.1 / §B.1)
 --   1. Phase one: run the collector with -backfill-offline-only so
 --      fapi_kline_1m holds the full history.
 --   2. Apply THIS file. The refreshable MVs then only pick up NEW live 1m rows.
 --   3. Run 003_rollup_backfill.sql once to fold the already-present 1m history
 --      into the rollup tables.
 --   4. Phase two: start the live service.
---   (Applying this before step 1 finishes is still correct — the MV and 003
---   both recompute from FINAL — just wasteful.)
+--
+--   On a FRESH empty DB (no deep-history phase one) just run this right after
+--   001 — there is nothing to fold, and the MVs start tracking live 1m data.
+--
+--   Applying this WHILE a big backfill is still running is not *wrong* (the
+--   refreshable MV and 003 both recompute from FINAL, never accumulate — so no
+--   double-counting), just wasteful. That is why the recommended order builds
+--   the rollup layer only after the 1m history has landed.
 --
 -- REQUIREMENTS
 --   Refreshable materialized views need ClickHouse >= 24.8 (the SET below is

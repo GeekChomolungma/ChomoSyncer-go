@@ -331,9 +331,6 @@ func parseFlags(args []string) (cliConfig, error) {
 		baseCfg.Backfill.FlushWait = c.backfillFlushWait
 	}
 
-	// Synchronize backfill window size with redis window size
-	baseCfg.Backfill.QueueSize = 256
-
 	if err := baseCfg.Validate(); err != nil {
 		return cliConfig{}, fmt.Errorf("invalid configuration: %w", err)
 	}
