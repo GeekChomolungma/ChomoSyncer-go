@@ -22,7 +22,7 @@ collector:
     - "1h"
     - "4h"
     - "1d"
-  shards_per_interval: 4         # 1m 基准周期的 WebSocket 分片连接数（哈希均匀打散标的）
+  shards_per_interval: 8         # 1m 基准周期的 WebSocket 分片连接数（哈希均匀打散标的）
   ws_url: "wss://fstream.binance.com" # 币安合约 WebSocket 基地址
   connect_stagger: 300ms         # 多个分片建连错峰等待时间（防止瞬间触发建连频控）
   connect_timeout: 20s           # 单个分片建连最长超时时间
@@ -32,7 +32,7 @@ collector:
   watchdog_interval: 10s         # 看门狗与增量订阅巡检周期
 
 dispatcher:
-  closed_workers: 4              # 消费已收盘 K 线的并发 Worker 协程数
+  closed_workers: 8              # 消费已收盘 K 线的并发 Worker 协程数
   closed_queue_size: 4096        # 已收盘 K 线待处理队列容量（通道缓冲区大小）
   section_timeout: 5s            # 截面对齐兜底超时：首根收盘 Bar 后等待此时间触发 kline_ready
   publish_timeout: 5s            # 发布 kline_ready 的单次最长等待超时
@@ -41,7 +41,7 @@ redis:
   addr: "localhost:6379"         # Redis 地址
   db: 0                          # Redis DB 序号
   password: ""                   # Redis 鉴权密码
-  pool_size: 20                  # 收盘滑窗专用客户端连接池大小
+  pool_size: 32                  # 收盘滑窗专用客户端连接池大小
   dial_timeout: 5s               # 建连超时
   read_timeout: 3s               # 读取超时
   write_timeout: 3s              # 写入超时
@@ -55,9 +55,9 @@ redis:
     addr: ""                     # 未收盘实时行情专用的 Redis 地址（留空则复用 redis.addr）
     db: 0                        # Live DB 序号
     password: ""                 # Live Redis 密码
-    pool_size: 8                 # Live 客户端独立连接池大小（与滑窗隔离，防止争抢连接）
-    workers: 2                   # 消费未收盘 Live Bar 并写入 Redis 的 Worker 协程数
-    channel_size: 8192           # Live Bar 待写入队列容量（满则丢弃未收盘瞬态数据）
+    pool_size: 12                # Live 客户端独立连接池大小（与滑窗隔离，防止争抢连接）
+    workers: 4                   # 消费未收盘 Live Bar 并写入 Redis 的 Worker 协程数
+    channel_size: 16384          # Live Bar 待写入队列容量（满则丢弃未收盘瞬态数据）
     write_timeout: 200ms         # 写入单次超时
     ttl_multiple: 2              # 过期时间倍数（TTL = ttl_multiple * interval）
     default_ttl: 2h              # 无法解析周期的默认 TTL
@@ -75,7 +75,7 @@ clickhouse:
   dial_timeout: 5s               # 建连超时
   tls: false                     # 是否开启 TLS 加密
   batch_size: 5000               # 强制触发批量落盘的行数阈值
-  flush_interval: 1000ms         # 最长攒批等待时间（未满 batch_size 达到此时间也强制落盘）
+  flush_interval: 2000ms         # 最长攒批等待时间（未满 batch_size 达到此时间也强制落盘）
   channel_size: 20000            # ClickHouse BatchWriter 待落盘队列容量
   max_retries: 5                 # 落盘失败后的最大重试次数
   retry_backoff: 200ms           # 失败重试基础退避时长
@@ -98,9 +98,9 @@ backfill:
                                  #   不启动 WS 采集 / dispatcher / Redis 实时链路（"先灌历史再上线"两阶段冷启动的第一阶段）；
                                  #   false = 完整在线业务。此模式下 gate_timeout 自动失效（历史全量拉取必须跑完）。
   cold_start_date: ""            # 空库冷启动同步起点 (例如 "2024-01-01" 或 RFC3339)，留空则回退至最近窗口
-  workers: 4                     # 回补时并发 REST 请求抓取的协程数
+  workers: 8                     # 回补时并发 REST 请求抓取的协程数
   rest_rps: 20                   # 币安 REST API 令牌桶限流速率 (RPS)
-  queue_size: 256                # 回补任务请求队列容量
+  queue_size: 512                # 回补任务请求队列容量
   gap_debounce: 30s              # 断线重连重复缺口事件合并防抖时长
   gate_timeout: 10m               # 窗口门控最长持有超时（防止回补卡死导致实时数据一直被压制）
   flush_wait: 2s                 # 回补数据 Push 完毕后，若无 writer 时的回退等待时长

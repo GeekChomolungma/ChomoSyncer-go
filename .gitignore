@@ -57,3 +57,7 @@ Thumbs.db
 /tmp/
 /scratch/
 /scratchpad/
+
+# --- logs ---
+*.log
+logs/

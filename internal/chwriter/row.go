@@ -24,6 +24,13 @@ type Row struct {
 	TradesCount         uint32
 }
 
+// insertColumns is the explicit column list for PrepareBatch, in the exact
+// order appendArgs emits values. It MUST stay in sync with appendArgs and the
+// market.fapi_kline_1m DDL. Naming the columns lets ClickHouse fill created_at
+// from its DEFAULT instead of demanding a 13th value from the driver.
+const insertColumns = "(symbol, start_time, end_time, open, high, low, close, " +
+	"volume, quote_volume, taker_buy_volume, taker_buy_quote_volume, trades_count)"
+
 // appendArgs returns the row's fields in DDL column order for driver.Batch.Append.
 func (r Row) appendArgs() []any {
 	return []any{

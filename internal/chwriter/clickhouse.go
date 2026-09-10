@@ -99,7 +99,7 @@ func (f *clickHouseFlusher) Flush(ctx context.Context, rows []Row) error {
 		return fmt.Errorf("acquire clickhouse connection: %w", err)
 	}
 
-	batch, err := conn.PrepareBatch(ctx, "INSERT INTO "+f.table)
+	batch, err := conn.PrepareBatch(ctx, "INSERT INTO "+f.table+" "+insertColumns)
 	if err != nil {
 		f.invalidate()
 		return fmt.Errorf("prepare batch: %w", err)
