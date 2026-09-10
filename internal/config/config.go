@@ -27,9 +27,26 @@ type AppConfig struct {
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 }
 
+// baseInterval is the only kline interval this build ingests from the exchange.
+// Coarser intervals are derived (ClickHouse rollups + derived kline_ready),
+// never subscribed or written directly (see docs/ARCHITECTURE_MODULES.md §8.6).
+// It is config-internal: consumers read the actual value from
+// Collector.Intervals[0], which Validate() pins to this.
+const baseInterval = "1m"
+
 // CollectorConfig configures WebSocket connections and shards.
 type CollectorConfig struct {
-	Intervals         []string      `yaml:"intervals"`
+	// Intervals is the WS ingestion set. This build ingests only the base
+	// interval, so it must be exactly ["1m"]; coarser intervals go in
+	// ServeIntervals.
+	Intervals []string `yaml:"intervals"`
+	// ServeIntervals are the coarser intervals the platform exposes downstream.
+	// They drive: (1) the ClickHouse rollup tables/MVs in
+	// deploy/clickhouse/002_kline_rollups.sql, and (2) the derived kline_ready
+	// section signals emitted by the dispatcher. Each must be an epoch-aligned
+	// integer multiple of 1m (any Xs/Xm/Xh, or 1d). No WS subscription or Go
+	// writer is created for them.
+	ServeIntervals    []string      `yaml:"serve_intervals"`
 	ShardsPerInterval int           `yaml:"shards_per_interval"`
 	WSURL             string        `yaml:"ws_url"`
 	ConnectStagger    time.Duration `yaml:"connect_stagger"`
@@ -161,7 +178,8 @@ func DefaultConfig() Config {
 			ShutdownTimeout: 30 * time.Second,
 		},
 		Collector: CollectorConfig{
-			Intervals:         []string{"1m", "1h"},
+			Intervals:         []string{baseInterval},
+			ServeIntervals:    []string{"5m", "15m", "1h", "4h", "1d"},
 			ShardsPerInterval: 4,
 			WSURL:             "wss://fstream.binance.com",
 			ConnectStagger:    300 * time.Millisecond,
@@ -262,10 +280,68 @@ func LoadYAML(path string) (Config, error) {
 	return cfg, nil
 }
 
+// parseIntervalMS parses a Binance interval string to milliseconds.
+// Calendar months ("M") are intentionally unsupported here.
+func parseIntervalMS(s string) (int64, bool) {
+	if len(s) < 2 {
+		return 0, false
+	}
+	unit := s[len(s)-1]
+	n := int64(0)
+	for _, r := range s[:len(s)-1] {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+		n = n*10 + int64(r-'0')
+	}
+	if n <= 0 {
+		return 0, false
+	}
+	switch unit {
+	case 's':
+		return n * 1000, true
+	case 'm':
+		return n * 60_000, true
+	case 'h':
+		return n * 3_600_000, true
+	case 'd':
+		return n * 86_400_000, true
+	case 'w':
+		return n * 604_800_000, true
+	default:
+		return 0, false
+	}
+}
+
+// IsDerivableInterval reports whether a coarser interval can be rolled up from
+// 1m bars by simple epoch-aligned bucketing. True for any Xs/Xm/Xh strictly
+// coarser than 1m, and for exactly "1d". False for "1w" (epoch aligns to
+// Thursday, not Binance's Monday), multi-day, and calendar months — aggregate
+// those downstream instead.
+func IsDerivableInterval(s string) bool {
+	ms, ok := parseIntervalMS(s)
+	if !ok || ms <= 60_000 || ms%60_000 != 0 {
+		return false
+	}
+	switch s[len(s)-1] {
+	case 's', 'm', 'h':
+		return true
+	case 'd':
+		return ms == 86_400_000 // only 1d
+	default:
+		return false
+	}
+}
+
 // Validate verifies that required parameters and sanity ranges are met.
 func (c *Config) Validate() error {
-	if len(c.Collector.Intervals) == 0 {
-		return fmt.Errorf("collector.intervals must not be empty")
+	if len(c.Collector.Intervals) != 1 || c.Collector.Intervals[0] != baseInterval {
+		return fmt.Errorf(`collector.intervals must be exactly ["%s"]: this build ingests only the base interval and derives coarser ones; put coarser intervals in collector.serve_intervals`, baseInterval)
+	}
+	for _, iv := range c.Collector.ServeIntervals {
+		if !IsDerivableInterval(iv) {
+			return fmt.Errorf("collector.serve_intervals: %q is not a supported rollup interval (use an Xs/Xm/Xh multiple of 1m, or 1d)", iv)
+		}
 	}
 	if c.Collector.ShardsPerInterval <= 0 {
 		return fmt.Errorf("collector.shards_per_interval must be > 0")

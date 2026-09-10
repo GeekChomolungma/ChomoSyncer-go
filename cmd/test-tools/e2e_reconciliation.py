@@ -186,7 +186,7 @@ def reconcile_symbol(
 def main():
     parser = argparse.ArgumentParser(description="End-to-End Reconciliation (Redis vs ClickHouse).")
     parser.add_argument("--config", help="Path to config.yaml")
-    parser.add_argument("--intervals", default="1m,1h", help="Comma-separated intervals (default: 1m,1h)")
+    parser.add_argument("--intervals", default="1m", help="Comma-separated intervals (default: 1m). Only the base interval has a Redis window; for coarser intervals reconcile ClickHouse against Binance with check_vs_binance.py.")
     parser.add_argument("--symbol", help="Specific symbol to check (e.g. BTCUSDT)")
     parser.add_argument("--limit-symbols", type=int, default=10, help="Limit number of symbols (default: 10)")
     parser.add_argument("--window-size", type=int, default=None, help="Bars to reconcile (default: 200)")

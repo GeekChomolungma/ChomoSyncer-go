@@ -18,7 +18,8 @@ func smokeConfig() Config {
 	cfg := config.DefaultConfig()
 	cfg.Collector.WSURL = "ws://127.0.0.1:1"
 	cfg.Universe.RESTURL = "http://127.0.0.1:1"
-	cfg.Collector.Intervals = []string{"1m", "1h"}
+	cfg.Collector.Intervals = []string{"1m"}
+	cfg.Collector.ServeIntervals = []string{"1h", "1d"}
 	cfg.Collector.ShardsPerInterval = 2
 	cfg.Redis.Addr = "127.0.0.1:1"
 	cfg.ClickHouse.Addrs = []string{"127.0.0.1:1"}
@@ -41,8 +42,9 @@ func TestNewAndShutdownNoExternalDeps(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	// Every interval got a ClickHouse writer.
-	if len(a.chWriters) != 2 || a.chWriters["1m"] == nil || a.chWriters["1h"] == nil {
+	// Only the base interval gets a ClickHouse writer; coarser intervals are
+	// ClickHouse-side rollups.
+	if len(a.chWriters) != 1 || a.chWriters["1m"] == nil {
 		t.Fatalf("chWriters = %v", a.chWriters)
 	}
 	if a.win == nil || a.live == nil || a.disp == nil || a.col == nil || a.univ == nil || a.metrics == nil {

@@ -14,6 +14,7 @@ from check_redis_livebars import validate_livebar_data
 from check_redis_closed_windows import validate_compact_bar, inspect_symbol_window
 from monitor_redis_kline_ready import parse_stream_entry
 from e2e_reconciliation import compare_bars
+from check_vs_binance import rel_close
 
 
 class TestCommon(unittest.TestCase):
@@ -159,6 +160,18 @@ class TestE2EReconciliation(unittest.TestCase):
         res = compare_bars(redis_bars, ch_rows)
         self.assertEqual(res["matched_count"], 0)
         self.assertEqual(res["price_mismatches"], 1)
+
+
+class TestVsBinance(unittest.TestCase):
+    def test_rel_close_exact_and_tolerant(self):
+        self.assertTrue(rel_close(100.0, 100.0, 1e-9))
+        # ~1e-8 relative drift passes the volume tolerance but fails the price one
+        self.assertTrue(rel_close(1234.56789, 1234.56789 * (1 + 5e-9), 1e-6))
+        self.assertFalse(rel_close(1234.56789, 1234.56789 * (1 + 5e-9), 1e-12))
+        # a real disagreement fails both
+        self.assertFalse(rel_close(100.0, 100.5, 1e-6))
+        # zero handling
+        self.assertTrue(rel_close(0.0, 0.0, 1e-9))
 
 
 class TestStreamParser(unittest.TestCase):

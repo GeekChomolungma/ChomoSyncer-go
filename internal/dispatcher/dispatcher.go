@@ -79,6 +79,15 @@ type Config struct {
 	// PublishTimeout bounds a single PublishKlineReady call. Default 5s.
 	PublishTimeout time.Duration
 
+	// BaseInterval is the only interval the collector ingests. Default "1m".
+	BaseInterval string
+	// ServeIntervals are coarser intervals whose kline_ready is *derived*: when
+	// the base section for the bar that closes a coarser bucket publishes, a
+	// kline_ready for that coarser interval is emitted too (same symbol count).
+	// No window / archive is written for them — consumers read the ClickHouse
+	// rollup tables. Entries must be epoch-aligned integer multiples of the base.
+	ServeIntervals []string
+
 	Registerer prometheus.Registerer
 	Logger     *slog.Logger
 }
@@ -162,6 +171,25 @@ func New(ctx context.Context, cfg Config, sinks Sinks, universe UniverseProvider
 		sinks.Ready, universe, d.metrics, log, &d.closed,
 		cfg.SectionTimeout, cfg.SectionRetention, defaultRetentionFloor, cfg.PublishTimeout,
 	)
+
+	baseIv := cfg.BaseInterval
+	if baseIv == "" {
+		baseIv = "1m"
+	}
+	baseMS := int64(60_000)
+	if dur, ok := parseIntervalDuration(baseIv); ok {
+		baseMS = dur.Milliseconds()
+	}
+	var derived []derivedInterval
+	for _, iv := range cfg.ServeIntervals {
+		dur, ok := parseIntervalDuration(iv)
+		if !ok || dur.Milliseconds() <= baseMS || dur.Milliseconds()%baseMS != 0 {
+			log.Warn("ignoring un-derivable serve interval", "interval", iv)
+			continue
+		}
+		derived = append(derived, derivedInterval{name: iv, ms: dur.Milliseconds()})
+	}
+	d.agg.configureDerived(baseIv, baseMS, derived)
 
 	for i := 0; i < cfg.ClosedWorkers; i++ {
 		d.wg.Add(1)

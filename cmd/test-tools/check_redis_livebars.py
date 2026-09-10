@@ -176,7 +176,7 @@ def inspect_livebars(
 def main():
     parser = argparse.ArgumentParser(description="Verify Redis living bars (livebar:SYMBOL:interval).")
     parser.add_argument("--config", help="Path to config.yaml")
-    parser.add_argument("--intervals", default="1m,1h", help="Comma-separated intervals (default: 1m,1h)")
+    parser.add_argument("--intervals", default="1m", help="Comma-separated intervals (default: 1m; only the base interval has Redis live bars)")
     parser.add_argument("--symbol", help="Specific symbol to check (e.g. BTCUSDT)")
     parser.add_argument("--limit-symbols", type=int, default=None, help="Limit number of symbols to inspect")
     parser.add_argument("--prefix", default=None, help="Key prefix override (default: from config or 'livebar')")

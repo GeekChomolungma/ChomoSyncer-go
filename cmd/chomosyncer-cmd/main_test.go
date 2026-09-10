@@ -18,8 +18,11 @@ func TestParseFlagsDefaults(t *testing.T) {
 	if c.metricsAddr != ":9090" || c.redisAddr != "localhost:6379" || c.chAddr != "localhost:9000" {
 		t.Fatalf("defaults wrong: %+v", c)
 	}
-	if c.intervals != "1m,1h" || c.shards != 4 {
+	if c.intervals != "1m" || c.shards != 4 {
 		t.Fatalf("interval/shard defaults wrong: %+v", c)
+	}
+	if c.serveIntervals != "5m,15m,1h,4h,1d" {
+		t.Fatalf("serve-intervals default wrong: %+v", c)
 	}
 	if c.sectionTimeout != 5*time.Second {
 		t.Fatalf("section timeout default = %v", c.sectionTimeout)
@@ -34,7 +37,7 @@ func TestParseFlagsOverride(t *testing.T) {
 		"-metrics-addr", "off",
 		"-redis-addr", "redis:6380",
 		"-ch-addr", "ch-a:9000,ch-b:9000",
-		"-intervals", "1m, 5m ,1h",
+		"-serve-intervals", "5m, 15m ,1h",
 		"-shards-per-interval", "8",
 		"-live-publish",
 		"-section-timeout", "3s",
@@ -59,8 +62,8 @@ func TestParseFlagsOverride(t *testing.T) {
 	if !reflect.DeepEqual(ac.ClickHouse.Addrs, []string{"ch-a:9000", "ch-b:9000"}) {
 		t.Fatalf("ClickHouse.Addrs = %v", ac.ClickHouse.Addrs)
 	}
-	if !reflect.DeepEqual(ac.Collector.Intervals, []string{"1m", "5m", "1h"}) {
-		t.Fatalf("Intervals = %v (CSV must trim spaces)", ac.Collector.Intervals)
+	if !reflect.DeepEqual(ac.Collector.ServeIntervals, []string{"5m", "15m", "1h"}) {
+		t.Fatalf("ServeIntervals = %v (CSV must trim spaces)", ac.Collector.ServeIntervals)
 	}
 	if ac.App.MetricsAddr != "off" || ac.Version != version {
 		t.Fatalf("toAppConfig mismatch: %+v", ac)

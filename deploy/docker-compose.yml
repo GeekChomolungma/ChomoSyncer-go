@@ -26,6 +26,7 @@ services:
     volumes:
       - ch-data:/var/lib/clickhouse
       - ./clickhouse/001_fapi_kline.sql:/docker-entrypoint-initdb.d/001_fapi_kline.sql:ro
+      - ./clickhouse/002_kline_rollups.sql:/docker-entrypoint-initdb.d/002_kline_rollups.sql:ro
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
       interval: 5s

@@ -27,6 +27,9 @@ func (c Config) withDefaults() Config {
 	if len(c.Collector.Intervals) == 0 {
 		c.Collector.Intervals = def.Collector.Intervals
 	}
+	if len(c.Collector.ServeIntervals) == 0 {
+		c.Collector.ServeIntervals = def.Collector.ServeIntervals
+	}
 	if c.Collector.ShardsPerInterval <= 0 {
 		c.Collector.ShardsPerInterval = def.Collector.ShardsPerInterval
 	}

@@ -14,10 +14,15 @@ app:
   shutdown_timeout: 30s          # 进程收到退出信号后的优雅停机最长等待时间
 
 collector:
-  intervals:                     # 订阅的 K 线周期列表
+  intervals:                     # WS 采集周期：本构建只采集 1m 基准 K 线，必须恰为 ["1m"]
     - "1m"
+  serve_intervals:               # 由 1m 派生的更粗周期：驱动 ① ClickHouse rollup 表/物化视图
+    - "5m"                       #   (deploy/clickhouse/002_kline_rollups.sql) ② dispatcher 的派生 kline_ready 截面信号。
+    - "15m"                      # 不为它们建立 WS 订阅或 Go 写入器；只能是 1m 的 Xs/Xm/Xh 整数倍或 1d。
     - "1h"
-  shards_per_interval: 4         # 每个 K 线周期的 WebSocket 分片连接数（哈希均匀打散标的）
+    - "4h"
+    - "1d"
+  shards_per_interval: 4         # 1m 基准周期的 WebSocket 分片连接数（哈希均匀打散标的）
   ws_url: "wss://fstream.binance.com" # 币安合约 WebSocket 基地址
   connect_stagger: 300ms         # 多个分片建连错峰等待时间（防止瞬间触发建连频控）
   connect_timeout: 20s           # 单个分片建连最长超时时间

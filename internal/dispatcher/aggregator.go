@@ -15,6 +15,13 @@ type sectionKey struct {
 	openTime int64
 }
 
+// derivedInterval is a coarser interval whose kline_ready piggybacks on the
+// base section that closes its bucket.
+type derivedInterval struct {
+	name string
+	ms   int64
+}
+
 type sectionState struct {
 	symbols   map[string]struct{}
 	published bool
@@ -36,8 +43,21 @@ type aggregator struct {
 	retention    time.Duration // 0 => derive from the interval
 	defaultReten time.Duration
 
+	// derived kline_ready cascade (set once, before workers run)
+	baseInterval string
+	baseMS       int64
+	derived      []derivedInterval
+
 	mu       sync.Mutex
 	sections map[sectionKey]*sectionState
+}
+
+// configureDerived wires the derived-section cascade. Called once from
+// dispatcher.New before any mark(), so it needs no locking.
+func (a *aggregator) configureDerived(base string, baseMS int64, derived []derivedInterval) {
+	a.baseInterval = base
+	a.baseMS = baseMS
+	a.derived = derived
 }
 
 func newAggregator(
@@ -121,7 +141,7 @@ func (a *aggregator) publish(key sectionKey, n int, reason string) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), a.publishTO)
-	_, err := a.ready.PublishKlineReady(ctx, rediswin.KlineReadyEvent{
+	id, err := a.ready.PublishKlineReady(ctx, rediswin.KlineReadyEvent{
 		Interval:     key.interval,
 		Timestamp:    key.openTime,
 		SymbolsCount: n,
@@ -137,6 +157,13 @@ func (a *aggregator) publish(key sectionKey, n int, reason string) {
 		a.metrics.sectionSize.WithLabelValues(key.interval).Observe(float64(n))
 		a.log.Debug("kline_ready published",
 			"interval", key.interval, "open_time", key.openTime, "symbols", n, "reason", reason)
+		// Cascade to derived (coarser) intervals — but only if this base
+		// publish actually went out. An empty id means the window gate
+		// suppressed it (a key of this interval is being backfilled), so a
+		// coarser section built on it would be premature.
+		if id != "" && key.interval == a.baseInterval {
+			a.publishDerived(key.openTime, n)
+		}
 	}
 
 	// Keep the key in a published state for one bar period so late stragglers
@@ -146,6 +173,39 @@ func (a *aggregator) publish(key sectionKey, n int, reason string) {
 		st.timer = time.AfterFunc(a.retentionFor(key.interval), func() { a.evict(key) })
 	}
 	a.mu.Unlock()
+}
+
+// publishDerived emits a kline_ready for every coarser interval whose bucket is
+// closed by the base bar at baseOpenTime. A base bar at t closes a D-bucket iff
+// (t + baseMS) % D == 0; that bucket started at t + baseMS - D. symbolCount is
+// carried over from the base section (same coverage semantics).
+func (a *aggregator) publishDerived(baseOpenTime int64, symbolCount int) {
+	for _, di := range a.derived {
+		if (baseOpenTime+a.baseMS)%di.ms != 0 {
+			continue
+		}
+		bucketStart := baseOpenTime + a.baseMS - di.ms
+		if a.closed.Load() {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), a.publishTO)
+		_, err := a.ready.PublishKlineReady(ctx, rediswin.KlineReadyEvent{
+			Interval:     di.name,
+			Timestamp:    bucketStart,
+			SymbolsCount: symbolCount,
+		})
+		cancel()
+		if err != nil {
+			a.log.Warn("publish derived kline_ready failed",
+				"interval", di.name, "bucket_start", bucketStart, "symbols", symbolCount, "err", err)
+			a.metrics.sectionErrors.Inc()
+			continue
+		}
+		a.metrics.sectionPub.WithLabelValues(di.name, "derived").Inc()
+		a.metrics.sectionSize.WithLabelValues(di.name).Observe(float64(symbolCount))
+		a.log.Debug("derived kline_ready published",
+			"interval", di.name, "bucket_start", bucketStart, "symbols", symbolCount)
+	}
 }
 
 func (a *aggregator) retentionFor(interval string) time.Duration {

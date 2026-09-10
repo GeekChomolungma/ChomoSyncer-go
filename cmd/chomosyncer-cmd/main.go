@@ -77,6 +77,7 @@ type cliConfig struct {
 	chChannelSize   int
 
 	intervals             string
+	serveIntervals        string
 	shards                int
 	wsURL                 string
 	collectorStaleTimeout time.Duration
@@ -142,7 +143,8 @@ func parseFlags(args []string) (cliConfig, error) {
 	fs.DurationVar(&c.chFlushInterval, "ch-flush-interval", envDur("CHOMOSYNCER_CH_FLUSH_INTERVAL", 1000*time.Millisecond), "ClickHouse batch writer flush interval")
 	fs.IntVar(&c.chChannelSize, "ch-channel-size", envInt("CHOMOSYNCER_CH_CHANNEL_SIZE", 20000), "ClickHouse batch writer ingest buffer capacity")
 
-	fs.StringVar(&c.intervals, "intervals", env("CHOMOSYNCER_INTERVALS", "1m,1h"), "kline intervals (comma-separated)")
+	fs.StringVar(&c.intervals, "intervals", env("CHOMOSYNCER_INTERVALS", "1m"), "WS ingestion interval set — this build ingests only 1m (must be \"1m\")")
+	fs.StringVar(&c.serveIntervals, "serve-intervals", env("CHOMOSYNCER_SERVE_INTERVALS", "5m,15m,1h,4h,1d"), "coarser intervals derived from 1m: ClickHouse rollup tables + derived kline_ready (comma-separated; Xs/Xm/Xh multiples of 1m, or 1d)")
 	fs.IntVar(&c.shards, "shards-per-interval", envInt("CHOMOSYNCER_SHARDS_PER_INTERVAL", 4), "WS shard connections per interval")
 	fs.StringVar(&c.wsURL, "ws-url", env("CHOMOSYNCER_WS_URL", "wss://fstream.binance.com"), "Binance futures WebSocket base URL")
 	fs.DurationVar(&c.collectorStaleTimeout, "collector-stale-timeout", envDur("CHOMOSYNCER_COLLECTOR_STALE_TIMEOUT", 60*time.Second), "watchdog staleness reconnect timeout")
@@ -271,6 +273,9 @@ func parseFlags(args []string) (cliConfig, error) {
 	if explicit("intervals", "CHOMOSYNCER_INTERVALS") {
 		baseCfg.Collector.Intervals = splitCSV(c.intervals)
 	}
+	if explicit("serve-intervals", "CHOMOSYNCER_SERVE_INTERVALS") {
+		baseCfg.Collector.ServeIntervals = splitCSV(c.serveIntervals)
+	}
 	if explicit("shards-per-interval", "CHOMOSYNCER_SHARDS_PER_INTERVAL") {
 		baseCfg.Collector.ShardsPerInterval = c.shards
 	}
@@ -356,6 +361,7 @@ func parseFlags(args []string) (cliConfig, error) {
 	c.chFlushInterval = baseCfg.ClickHouse.FlushInterval
 	c.chChannelSize = baseCfg.ClickHouse.ChannelSize
 	c.intervals = strings.Join(baseCfg.Collector.Intervals, ",")
+	c.serveIntervals = strings.Join(baseCfg.Collector.ServeIntervals, ",")
 	c.shards = baseCfg.Collector.ShardsPerInterval
 	c.wsURL = baseCfg.Collector.WSURL
 	c.collectorStaleTimeout = baseCfg.Collector.StaleTimeout

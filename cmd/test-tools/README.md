@@ -9,11 +9,12 @@
 | 文件 | 说明 |
 | :--- | :--- |
 | `common.py` | 基础公用库：配置文件加载、ClickHouse/Redis 客户端、交易标的探测、时间工具、表格格式化等 |
-| `check_clickhouse_integrity.py` | **ClickHouse 历史 K 线完整性检查器**：检测时间戳连续性（缺口/断档判定）与字段非空/有效性校验 |
-| `check_redis_livebars.py` | **Redis 未收盘 Live Bar 检查器**：检测各币种瞬态 Bar Hash 是否存在、TTL 时效、时延与字段完备性 |
-| `check_redis_closed_windows.py` | **Redis 已收盘滑窗检查器**：检测 200 根滑窗列表是否存在、单调递减连续性、内部有无漏 Bar、头部是否当下最新 |
-| `monitor_redis_kline_ready.py` | **Redis 截面通知 Stream 监控器**：监控 `stream:market:kline_ready`，评估就绪时延、标的收盘覆盖率与聚合原因 |
-| `e2e_reconciliation.py` | **端到端缓存与存储对账工具**：对比 Redis 滑窗与 ClickHouse 物理表最新数据，逐根对比时间戳与 OHLCV 一致性 |
+| `check_clickhouse_integrity.py` | **ClickHouse K 线完整性检查器**：检测 1m 原始表 + 各 rollup 表的时间戳连续性（缺口/断档判定）与字段非空/有效性校验 |
+| `check_redis_livebars.py` | **Redis 未收盘 Live Bar 检查器**：检测各币种 `livebar:{SYM}:1m` Hash 是否存在、TTL 时效、时延与字段完备性 |
+| `check_redis_closed_windows.py` | **Redis 已收盘滑窗检查器**：检测 `kline:{SYM}:1m` 200 根滑窗是否存在、单调递减连续性、内部有无漏 Bar、头部是否当下最新 |
+| `monitor_redis_kline_ready.py` | **Redis 截面通知 Stream 监控器**：监控 `stream:market:kline_ready`（含派生的粗周期信号），评估就绪时延、标的收盘覆盖率与聚合原因 |
+| `e2e_reconciliation.py` | **缓存与存储对账工具**：对比 Redis `kline:{SYM}:1m` 滑窗与 ClickHouse `fapi_kline_1m`，逐根对比时间戳与 OHLCV 一致性 |
+| `check_vs_binance.py` | **外部真值对账**：把 ClickHouse（1m 原始表 / rollup 表）逐根对回币安 `/fapi/v1/klines`，抓采集字段映射、单位、rollup 桶对齐与聚合函数的系统性偏差 |
 | `run_all_checks.py` | **一键全量预检调度器**：一键执行所有检查项，输出可视化红绿灯健康计分卡 (Scorecard) |
 | `test_toolkit.py` | 工具包内置单元测试与 Mock 验证套件 |
 | `requirements.txt` | Python 依赖包清单 |
@@ -134,20 +135,40 @@ python cmd/test-tools/monitor_redis_kline_ready.py --tail
 
 ### 5. 端到端双写一致性对账 (`e2e_reconciliation.py`)
 
-验证 Redis 滑窗缓存与 ClickHouse 持久化存储之间的数据完全一致性。
+验证 Redis 1m 滑窗缓存与 ClickHouse `fapi_kline_1m` 之间的数据完全一致性。
 
 #### 检查项目：
-- 取出 Redis `kline:SYMBOL:interval` 的 200 根数据与 ClickHouse `market.fapi_kline_interval` 降序排名前 200 根数据。
+- 取出 Redis `kline:SYMBOL:1m` 的 200 根与 ClickHouse `market.fapi_kline_1m` 降序前 200 根。
 - 逐根对齐时间戳 `t`。
-- 逐根比较 `Open, High, Low, Close, Volume, QuoteVolume` 数值，确保浮点差异在允许公差之内 (`< 1e-5`)。
+- 逐根比较 `Open, High, Low, Close, Volume, QuoteVolume`，浮点差异须在公差内 (`< 1e-5`)。
+
+> 只对 `1m`：更粗周期没有 Redis 窗口。更粗周期的正确性用 `check_vs_binance.py` 对回币安。
 
 #### 运行示例：
 ```bash
-# 随机抽样 10 个币种做 Redis vs ClickHouse 逐根对账
 python cmd/test-tools/e2e_reconciliation.py --limit-symbols 10
-
-# 专门针对特定主力币种全量对账
 python cmd/test-tools/e2e_reconciliation.py --symbol BTCUSDT --window-size 200
+```
+
+---
+
+### 5b. ClickHouse 与币安外部真值对账 (`check_vs_binance.py`)
+
+`e2e_reconciliation.py` 是"管道跟自己比"（Redis 与 ClickHouse 都是同一条链路写入的）。本工具把 ClickHouse 逐根对回**币安官方** `/fapi/v1/klines`，是唯一能发现 1m 采集或 rollup 聚合**系统性偏差**的检查。
+
+#### 检查项目：
+- `start_time` 必须精确对齐（桶对齐 / 采集时间基准）。
+- OHLC 相对容差 `1e-9`（`argMin/argMax/min/max` → 精确相等）。
+- `volume / quote_volume / taker_buy_*` 相对容差 `1e-6`（浮点求和顺序差异，约 1e-8）。
+- `trades_count` 必须精确相等（整数求和）。
+
+#### 运行示例：
+```bash
+# 1m 原始表 vs 币安 1m —— 验证采集字段映射/单位
+python cmd/test-tools/check_vs_binance.py --intervals 1m --limit-symbols 10
+
+# rollup 表 vs 币安 —— 验证 Phase B 的桶对齐与聚合函数
+python cmd/test-tools/check_vs_binance.py --intervals 1h,4h,1d --symbol BTCUSDT --bars 96
 ```
 
 ---

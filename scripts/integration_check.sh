@@ -77,6 +77,12 @@ lag=$(ch_q "SELECT toInt64(now() - max(start_time)) FROM fapi_kline_1m" | tr -d 
 bad_ohlc=$(ch_q "SELECT count() FROM fapi_kline_1m WHERE high < low OR high < open OR high < close OR low > open OR low > close" | tr -d '[:space:]')
 [ "${bad_ohlc:-1}" -eq 0 ] && ok "OHLC invariants hold" || bad "$bad_ohlc rows violate high>=max(o,c) / low<=min(o,c)"
 
+# rollup (Phase B): the 1h table is a refreshable MV over fapi_kline_1m
+roll=$(ch_q "SELECT count() FROM fapi_kline_1h FINAL" | tr -d '[:space:]')
+[ "${roll:-0}" -gt 0 ] && ok "fapi_kline_1h rollup rows=$roll" || bad "fapi_kline_1h empty (002 applied? MV refreshed?)"
+mism=$(ch_q "SELECT countIf(abs(r.close - g.c) > 1e-6) FROM (SELECT symbol, toStartOfHour(start_time) h, argMax(close, start_time) c FROM fapi_kline_1m FINAL WHERE start_time >= now() - INTERVAL 6 HOUR GROUP BY symbol, h) g INNER JOIN (SELECT symbol, start_time h, close FROM fapi_kline_1h FINAL WHERE start_time >= now() - INTERVAL 6 HOUR) r USING (symbol, h)" | tr -d '[:space:]')
+[ "${mism:-1}" -eq 0 ] && ok "1h rollup close matches recomputed 1m" || bad "$mism 1h buckets disagree with a fresh 1m recompute"
+
 echo
 echo "== result: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

@@ -51,6 +51,8 @@
 ### 1.1 职责与定位
 提供面向 ClickHouse 的高吞吐、低开销批量落库能力。规避高频单条插入对 LSM-tree 类引擎造成的部件合并风暴（Too many parts）。
 
+> 本构建只采集 1m 基准 K 线，因此**只实例化一个 `BatchWriter`**，写入唯一原始表 `market.fapi_kline_1m`。`5m/15m/1h/4h/1d` 等更粗周期不由 Go 写入，而是 ClickHouse 端从 `fapi_kline_1m FINAL` 幂等重算的 rollup 表（见本文 §8.6 与 `deploy/clickhouse/002_kline_rollups.sql`）。
+
 ### 1.2 核心机制
 - **列式批量写入**：基于官方 `clickhouse-go/v2` 原生 TCP 驱动，启用 LZ4 数据压缩。
 - **无锁通道缓冲**：内存维护 `chan Row` 队列（默认容量 20,000）。
@@ -71,7 +73,7 @@
 本包涵盖系统与 Redis 交互的所有核心逻辑，细分为三大子功能：
 
 ### 2.1 已收盘滚动滑窗 (`Writer`)
-- **存储结构**：Redis List，Key 命名为 `kline:{SYMBOL}:{interval}`（例如 `kline:BTCUSDT:1m`）。
+- **存储结构**：Redis List，Key 命名为 `kline:{SYMBOL}:1m`。本构建只写 1m 窗口；更粗周期无 Redis 窗口，下游查 ClickHouse rollup 表（见 §8.6）。
 - **原子单调推入 (`PushBarAndTrim`)**：
   - 采用内置 Lua 脚本执行 `LPUSH` + `LTRIM 0 199`；
   - **单调性防护**：推入前读取列表头部 `LINDEX 0` 的时间戳，仅当待写入 Bar 时间戳严格大于头部时才执行推入，杜绝网络乱序导致的滑窗时间倒流。
@@ -138,12 +140,16 @@
 ## 模块 4：`internal/dispatcher`（K 线事件编排与截面聚合器）
 
 ### 4.1 事件四路分流
-接收中性 `KlineEvent`，根据 `IsFinal` 状态机执行严格路由：
+接收中性 `KlineEvent`（本构建里 `Interval` 恒为 `1m`），根据 `IsFinal` 状态机执行严格路由：
 
 | 事件状态 | Live 快照 (Redis) | 收盘滑窗 (Redis) | 历史归档 (ClickHouse) | 截面聚合器 (Aggregator) |
 | :--- | :---: | :---: | :---: | :---: |
 | **未闭合** (`IsFinal=false`) | ✅ `LiveSink.TryEnqueue` | ❌ 忽略 | ❌ 忽略 | ❌ 忽略 |
-| **已闭合** (`IsFinal=true`) | ✅ `LiveSink.TryEnqueue` | ✅ `WindowSink.PushBarAndTrim` | ✅ `ArchiveSink.TryPush` | ✅ `aggregator.Mark` |
+| **已闭合** (`IsFinal=true`) | ✅ `LiveSink.TryEnqueue` | ✅ `WindowSink.PushBarAndTrim` | ✅ `ArchiveSink.TryPush` | ✅ `aggregator.mark` |
+
+### 4.1b 派生截面信号 (`serve_intervals`)
+
+1m 截面发布成功后，聚合器检查 `serve_intervals`（默认 `5m,15m,1h,4h,1d`）：若这根 1m Bar 的 `openTime` 恰好闭合某个更粗桶（`(openTime + 60000) % D == 0`），就以相同的 `symbols_count` 追加发布一条 `kline_ready`，`interval` 标注为该粗周期、`timestamp` 为粗桶开盘时刻。派生信号也受窗口门控约束——只有基准 1m 截面确实发出（未被 gapfill 压制）时才级联。粗周期的 200 根窗口不进 Redis，下游收到派生信号后直接查 ClickHouse rollup 表。
 
 ### 4.2 单调性递增防护
 维护 `(symbol, interval) -> lastClosedOpenTime` 状态。若收到 `<= lastClosedOpenTime` 的闭合帧，立即作为乱序/重复帧丢弃，保护下游时序单调性。
@@ -219,3 +225,13 @@
 - 执行一次 whole-universe 冷启动回补后进程退出（正常完成退出码 `0`，被信号中断则非 `0` 但进度已落盘、重跑从 `max(start_time)` 续上）。
 
 配合"深历史离线灌满 → 校验 → 用最近少量窗口的 `cold_start_date` 启动在线业务"的两阶段流程，可确保历史落库完成后再开启 Redis 业务。详见 `docs/OPERATIONS.md` 方式 C。
+
+### 8.6 更粗周期的 ClickHouse rollup（`deploy/clickhouse/002` + `003`）
+
+采集端只订阅 1m，避免"同一撮合事件在 1m/1h 两条 WS 链路各跑一遍"的连接与带宽冗余。更粗周期全部由 ClickHouse 从 `fapi_kline_1m` 派生：
+
+- **目标表** `fapi_kline_{5m,15m,1h,4h,1d}`：`ReplacingMergeTree(rollup_version)`，schema 与 `fapi_kline_1m` 一致，消费方式也一致（`... FINAL`）。
+- **刷新式物化视图** `*_rmv`：每 60–300s 从 `fapi_kline_1m FINAL` **重算**最近数天的桶并 `APPEND`。桶用 `toStartOfInterval`（epoch 对齐，5m/15m/1h/4h/1d 与币安边界一致）。
+- **幂等硬保证**：聚合是 `sum()/argMin()/argMax()/min()/max()` 的**全量重算**，没有任何累加器；`FINAL` 先折叠 1m 的重复行；每次重算写更新的 `rollup_version`，ReplacingMergeTree 保留最新。因此 1m 重发、回补重叠、`003` 反复重跑都**不会让 volume 翻倍**。严禁改成 `SummingMergeTree` 或非刷新式增量 MV——那会按插入块累加而漂移。
+- **历史折叠** `003_rollup_backfill.sql`：MV 只吃创建之后到达的 1m 行，故 `002` 应用后运行一次 `003`（按月分片或一次性）把已有历史折进 rollup 表。
+- **OHLC 精确、volume 有 ~1e-8 相对漂移**（浮点求和顺序 vs 币安从 trade 累加）——`check_vs_binance.py` 对价用 `1e-9`、对量用 `1e-6` 容差。

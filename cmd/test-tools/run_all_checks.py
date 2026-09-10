@@ -32,12 +32,14 @@ def run_subcommand(cmd: List[str]) -> Tuple[int, str]:
 def main():
     parser = argparse.ArgumentParser(description="Run all pre-deployment integrity checks.")
     parser.add_argument("--config", help="Path to config.yaml")
-    parser.add_argument("--intervals", default="1m,1h", help="Intervals to check (default: 1m,1h)")
+    parser.add_argument("--intervals", default="1m", help="Redis-facing intervals (default: 1m; only the base interval has Redis windows / live bars)")
+    parser.add_argument("--ch-intervals", default="1m,5m,15m,1h,4h,1d", help="ClickHouse intervals for the integrity check (base + rollup tables)")
     parser.add_argument("--symbol", help="Specific symbol to check")
     parser.add_argument("--quick", action="store_true", help="Quick smoke check with first 5 symbols")
     parser.add_argument("--skip-ch", action="store_true", help="Skip ClickHouse checks")
     parser.add_argument("--skip-redis", action="store_true", help="Skip Redis checks")
     parser.add_argument("--skip-e2e", action="store_true", help="Skip E2E cross reconciliation")
+    parser.add_argument("--vs-binance", action="store_true", help="Also reconcile ClickHouse rollups against Binance REST (slow; hits the exchange)")
     parser.add_argument("--verbose", action="store_true", help="Print full output of all sub-checks")
 
     args = parser.parse_args()
@@ -56,8 +58,8 @@ def main():
 
     # 1. ClickHouse Integrity Check
     if not args.skip_ch:
-        print(f"{Colors.BOLD}>>> [1/5] Running ClickHouse Continuity & Data Integrity Check...{Colors.RESET}")
-        cmd = [sys.executable, os.path.join(base_dir, "check_clickhouse_integrity.py"), "--intervals", args.intervals]
+        print(f"{Colors.BOLD}>>> [1/6] Running ClickHouse Continuity & Data Integrity Check...{Colors.RESET}")
+        cmd = [sys.executable, os.path.join(base_dir, "check_clickhouse_integrity.py"), "--intervals", args.ch_intervals]
         if args.config:
             cmd.extend(["--config", args.config])
         if args.symbol:
@@ -76,13 +78,13 @@ def main():
             status = f"{Colors.RED}FAIL{Colors.RESET}"
             detail = "Anomalies or missing bars detected"
             overall_ok = False
-        scorecard.append(["ClickHouse Integrity", f"fapi_kline_{args.intervals}", status, detail])
+        scorecard.append(["ClickHouse Integrity", f"fapi_kline_[{args.ch_intervals}]", status, detail])
     else:
         scorecard.append(["ClickHouse Integrity", "-", f"{Colors.DIM}SKIPPED{Colors.RESET}", "Skipped via flag"])
 
     # 2. Redis Living Bars Check
     if not args.skip_redis:
-        print(f"{Colors.BOLD}>>> [2/5] Running Redis Living Bars (LiveBar) Check...{Colors.RESET}")
+        print(f"{Colors.BOLD}>>> [2/6] Running Redis Living Bars (LiveBar) Check...{Colors.RESET}")
         cmd = [sys.executable, os.path.join(base_dir, "check_redis_livebars.py"), "--intervals", args.intervals]
         if args.config:
             cmd.extend(["--config", args.config])
@@ -108,7 +110,7 @@ def main():
 
     # 3. Redis Closed Rolling Windows Check
     if not args.skip_redis:
-        print(f"{Colors.BOLD}>>> [3/5] Running Redis Closed Rolling Windows Check...{Colors.RESET}")
+        print(f"{Colors.BOLD}>>> [3/6] Running Redis Closed Rolling Windows Check...{Colors.RESET}")
         cmd = [sys.executable, os.path.join(base_dir, "check_redis_closed_windows.py"), "--intervals", args.intervals]
         if args.config:
             cmd.extend(["--config", args.config])
@@ -134,7 +136,7 @@ def main():
 
     # 4. Redis Stream Notification Check
     if not args.skip_redis:
-        print(f"{Colors.BOLD}>>> [4/5] Running Redis Kline-Ready Stream Inspection...{Colors.RESET}")
+        print(f"{Colors.BOLD}>>> [4/6] Running Redis Kline-Ready Stream Inspection...{Colors.RESET}")
         cmd = [sys.executable, os.path.join(base_dir, "monitor_redis_kline_ready.py"), "--recent", "10"]
         if args.config:
             cmd.extend(["--config", args.config])
@@ -155,7 +157,7 @@ def main():
 
     # 5. E2E Cross Reconciliation
     if not args.skip_ch and not args.skip_redis and not args.skip_e2e:
-        print(f"{Colors.BOLD}>>> [5/5] Running End-to-End Cache vs Storage Reconciliation...{Colors.RESET}")
+        print(f"{Colors.BOLD}>>> [5/6] Running End-to-End Cache vs Storage Reconciliation...{Colors.RESET}")
         cmd = [sys.executable, os.path.join(base_dir, "e2e_reconciliation.py"), "--intervals", args.intervals]
         if args.config:
             cmd.extend(["--config", args.config])
@@ -178,6 +180,30 @@ def main():
         scorecard.append(["E2E Storage Consistency", "Redis <-> ClickHouse", status, detail])
     else:
         scorecard.append(["E2E Storage Consistency", "-", f"{Colors.DIM}SKIPPED{Colors.RESET}", "Skipped via flag"])
+
+    # 6. ClickHouse vs Binance (optional; hits the exchange)
+    if args.vs_binance and not args.skip_ch:
+        print(f"{Colors.BOLD}>>> [6/6] Reconciling ClickHouse rollups against Binance REST...{Colors.RESET}")
+        cmd = [sys.executable, os.path.join(base_dir, "check_vs_binance.py"), "--intervals", "1m,1h,4h"]
+        if args.config:
+            cmd.extend(["--config", args.config])
+        if args.symbol:
+            cmd.extend(["--symbol", args.symbol])
+        else:
+            cmd.extend(["--limit-symbols", "5" if limit_sym else "8"])
+        code, out = run_subcommand(cmd)
+        if args.verbose or code != 0:
+            print(out)
+        if code == 0:
+            status = f"{Colors.GREEN}PASS{Colors.RESET}"
+            detail = "ClickHouse matches Binance within tolerance"
+        else:
+            status = f"{Colors.RED}FAIL{Colors.RESET}"
+            detail = "ClickHouse disagrees with Binance (ingestion / rollup bug?)"
+            overall_ok = False
+        scorecard.append(["External Truth (Binance)", "ClickHouse <-> Binance REST", status, detail])
+    else:
+        scorecard.append(["External Truth (Binance)", "-", f"{Colors.DIM}SKIPPED{Colors.RESET}", "Pass --vs-binance to enable"])
 
     # Summary Report
     print()

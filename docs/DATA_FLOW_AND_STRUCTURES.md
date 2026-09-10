@@ -2,7 +2,9 @@
 
 > **文档定位**：本文档深入剖析 `ChomoSyncer-go` 全市场行情数据采集器的业务工作流、数据流转管道、核心并发/线程模型以及各存储/缓存层的数据结构设计。重点阐明**从外部调用 Redis / ClickHouse 查询具体内容时的键命名规范、查询命令示例、返回格式及各字段业务定义**。  
 > **适用版本**：`ChomoSyncer-go` v1.0+  
-> **涉及核心包**：`cmd/chomosyncer-go`、`internal/app`、`internal/universe`、`internal/collector`、`internal/dispatcher`、`internal/rediswin`、`internal/windowgate`、`internal/chwriter`、`internal/backfill`
+> **涉及核心包**：`cmd/chomosyncer-go`、`internal/app`、`internal/universe`、`internal/collector`、`internal/dispatcher`、`internal/rediswin`、`internal/windowgate`、`internal/chwriter`、`internal/backfill`  
+>
+> **重要（1m 基准 + 派生）**：本构建**只订阅 1 分钟 K 线**，只落一张原始表 `market.fapi_kline_1m`，Redis 只维护 1m 的 `livebar:{SYM}:1m` 与 `kline:{SYM}:1m`。下文凡出现 `{interval}` 的 Redis 键、`fapi_kline_<interval>` 表、"每个配置的 interval" 等表述，实际取值均为 `1m`。更粗周期（`serve_intervals`，默认 `5m/15m/1h/4h/1d`）由两处派生：① ClickHouse 侧从 `fapi_kline_1m FINAL` 幂等重算的 rollup 表 `fapi_kline_{5m,15m,1h,4h,1d}`（`deploy/clickhouse/002_kline_rollups.sql`）；② `stream:market:kline_ready` 上由"桶末 1m 截面"派生转发的截面信号。粗周期没有 Redis 窗口/livebar，下游直接查 ClickHouse。
 
 ---
 
@@ -119,10 +121,9 @@
 ### 2.2 核心调用者、并发模型与代码入口
 - **核心调用者**：[`collector.Collector`](../internal/collector/collector.go#L162) 与 [`collector.shard`](../internal/collector/shard.go#L41)
 - **并发与 Goroutine 模型**：
-  - **两级分片 (Two-Level Sharding)**：
-    1. **第一级（按周期）**：每个配置的 `interval`（如 `1m`, `1h`）彼此独立。
-    2. **第二级（按 Symbol 稳定哈希分桶）**：在同一 interval 内，根据 `crc32(SYMBOL) % ShardsPerInterval`（默认每个周期 4 个 shard）进行分桶。
-    - **分片命名与 ID**：`kline_<interval>_<bucket>`（例如 `kline_1m_0`, `kline_1m_1`, `kline_1h_0`）。每个 shard 承载约 100~130 个 stream，远低于 200 上限。
+  - **单周期哈希分片**：只订阅 `1m`，按 `crc32(SYMBOL) % ShardsPerInterval`（默认 4 个 shard）分桶。
+    - **分片命名与 ID**：`kline_1m_<bucket>`（`kline_1m_0` … `kline_1m_3`）。每个 shard 承载约 100~130 个 stream，远低于 200 上限。
+    - 之所以不再按周期开多套分片：更粗周期是 1m 的堆叠，同一撮合事件在 1m/1h 两条链路重复推送是纯浪费。见 `docs/ARCHITECTURE_MODULES.md` §8.6。
   - **Goroutine 分割与调度**：
     - **每个 Shard 对应一个独立的 Supervisor Goroutine**：在 [`Collector.SetSymbols`](../internal/collector/collector.go#L233) 中通过 `go s.run(c.rootCtx)` 启动。
     - **建连错峰**：新建 shard 启动前强制 Sleep 错峰（`startDelay += c.cfg.connectStagger`，默认 300ms），避免同一时刻突发握手被币安 IP 限流。
@@ -455,7 +456,7 @@ while True:
 
 | 字段名 | 数据类型 | 示例返回值 | 业务含义与消费端行为 |
 | :--- | :--- | :--- | :--- |
-| `interval` | `string` | `"1h"` 或 `"1m"` | 闭合的 K 线周期。决定策略层调用哪个频段的模型或因子。 |
+| `interval` | `string` | `"1m"`（原生）或 `"5m"/"1h"/…`（派生） | 闭合的 K 线周期。`1m` 由聚合器原生发布；`serve_intervals` 中的粗周期在其"桶末 1m 截面"就绪时派生转发一条，`symbols_count` 继承 1m 截面。收到粗周期信号后直接查 `market.fapi_kline_<interval> FINAL`。 |
 | `timestamp` | `int64` 字符串 | `"1719835200000"` | 刚刚闭合截面的基准开盘毫秒时间戳（`k.t`）。策略层用于对齐跨周期截面矩阵。 |
 | `symbols_count` | `int` 字符串 | `"182"` | 本截面实际成功归档并更新滑窗的交易对数量。策略层可据此校验截面覆盖度。 |
 
@@ -489,10 +490,9 @@ while True:
 
 #### 1. 数据库与表命名结构 (Table Naming Pattern)
 - **数据库名**：`market`
-- **表命名规范**：`market.fapi_kline_<interval>`（按 interval 拆表存储，规避大表锁与分区扫描负担）
-  - 1 分钟表：`market.fapi_kline_1m`
-  - 1 小时表：`market.fapi_kline_1h`
-- **表引擎**：`ReplacingMergeTree(created_at)`，主键与排序键：`(symbol, start_time)`，分区键：`toYYYYMM(start_time)`。
+- **原始表**：`market.fapi_kline_1m` —— 唯一由采集器直接写入的表。引擎 `ReplacingMergeTree(created_at)`，主键/排序键 `(symbol, start_time)`，分区 `toYYYYMM(start_time)`。
+- **派生 rollup 表**：`market.fapi_kline_{5m,15m,1h,4h,1d}` —— 由刷新式物化视图从 `fapi_kline_1m FINAL` 幂等重算（`deploy/clickhouse/002_kline_rollups.sql`）。引擎 `ReplacingMergeTree(rollup_version)`，schema 与消费方式（`... FINAL`）与 1m 表完全一致。桶用 `toStartOfInterval`（epoch/UTC 对齐，与币安边界一致）。
+- **查询约定**：所有 kline 表一律 `SELECT ... FROM market.fapi_kline_<iv> FINAL ...`。
 
 #### 2. 外部查询命令与代码示例
 ```bash
@@ -562,8 +562,8 @@ ClickHouse 是全系统底层持久化的**唯一权威事实库**（Cold Storag
 ### 7.3 核心调用者、并发模型与代码入口
 - **核心调用者**：`archiveRouter` 与 [`chwriter.BatchWriter`](../internal/chwriter/writer.go#L41)
 - **并发与 Goroutine 模型**：
-  - **按 Interval 实例独立分割**：
-    - 系统启动时为每个配置的 `interval` 实例化独立的 `*chwriter.BatchWriter`（例如 `fapi_kline_1m` 与 `fapi_kline_1h` 分属两个不同的 writer 实例，互不干扰）。
+  - **单一 writer 实例**：
+    - 本构建只采集 1m，故只实例化一个 `*chwriter.BatchWriter`，写 `market.fapi_kline_1m`。更粗周期由 ClickHouse rollup（§7.1）承担，不经过 Go 写入路径。
   - **生产者并发入队**：
     - 实时采集流：Dispatcher Workers 调用 [`TryPush(row)`](../internal/chwriter/writer.go#L110)，非阻塞推入 `input chan Row`（容量 65536），满则丢弃报错。
     - 历史回补流：Backfiller 调用 [`Push(ctx, row)`](../internal/chwriter/writer.go#L93)，阻塞等待通道容量，确保历史数据零丢失。

@@ -200,6 +200,8 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		ClosedQueueSize: cfg.Dispatcher.ClosedQueueSize,
 		SectionTimeout:  cfg.Dispatcher.SectionTimeout,
 		PublishTimeout:  cfg.Dispatcher.PublishTimeout,
+		BaseInterval:    cfg.Collector.Intervals[0], // pinned to "1m" by config.Validate; withDefaults guarantees len>=1
+		ServeIntervals:  cfg.Collector.ServeIntervals,
 		Registerer:      reg,
 		Logger:          cfg.Logger,
 	}, dispatcher.Sinks{

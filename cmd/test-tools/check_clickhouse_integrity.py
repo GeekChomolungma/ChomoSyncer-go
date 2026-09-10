@@ -164,7 +164,7 @@ def check_symbol_table(
 def main():
     parser = argparse.ArgumentParser(description="Check ClickHouse K-Line data continuity and field integrity.")
     parser.add_argument("--config", help="Path to config.yaml (auto-discovered if omitted)")
-    parser.add_argument("--intervals", default="1m,1h", help="Comma-separated intervals (default: 1m,1h)")
+    parser.add_argument("--intervals", default="1m,5m,15m,1h,4h,1d", help="Comma-separated intervals (default: 1m plus the standard rollup tables)")
     parser.add_argument("--symbol", help="Specific symbol to check (e.g. BTCUSDT), or check all if omitted")
     parser.add_argument("--limit-symbols", type=int, default=None, help="Limit number of symbols to inspect")
     parser.add_argument("--table-prefix", default="market.fapi_kline", help="Table prefix (default: market.fapi_kline)")

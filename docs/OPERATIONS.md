@@ -38,7 +38,7 @@
 | 依赖组件 | 最低版本 | 推荐版本 | 说明 |
 | :--- | :--- | :--- | :--- |
 | **Go** | ≥ 1.25 | 1.25+ | 编译构建生产二进制 (`CGO_ENABLED=0`) |
-| **ClickHouse** | ≥ 23.8 | 24.8+ | 必须启用 ReplacingMergeTree 引擎 |
+| **ClickHouse** | ≥ 24.8 | 24.8+ | ReplacingMergeTree + 刷新式物化视图（rollup 派生周期，见 `002_kline_rollups.sql`）。无刷新式 MV 时可退回 cron 方案 |
 | **Redis** | ≥ 6.2 | 7.0+ (Alpine) | 建议禁用持久化，配置 `noeviction` |
 | **Python** | ≥ 3.9 | 3.10+ | 运行 `cmd/test-tools` 预检工具包 |
 | **网络要求** | 出网连接 | 低延迟直连 | 需稳定访问 `fstream.binance.com` 与 `fapi.binance.com` |
@@ -81,16 +81,23 @@ CGO_ENABLED=0 go build -trimpath   -ldflags "-s -w -X main.version=$(git describ
 #### 步骤 2：初始化 ClickHouse 数据库与表
 执行建表 SQL 脚本：
 ```bash
-# 原生客户端方式：
+# 001：建库 market 与唯一原始表 fapi_kline_1m
 clickhouse-client --host 127.0.0.1 --port 9000 --multiquery < deploy/clickhouse/001_fapi_kline.sql
 
-# 或直接通过 HTTP 接口执行：
-curl -s 'http://127.0.0.1:8123/' --data-binary @deploy/clickhouse/001_fapi_kline.sql
+# 002：建 5m/15m/1h/4h/1d rollup 表 + 刷新式物化视图（这些是从 fapi_kline_1m FINAL 幂等重算的派生表）
+clickhouse-client --host 127.0.0.1 --port 9000 --multiquery < deploy/clickhouse/002_kline_rollups.sql
 
-# 验证数据表是否创建成功
+# 003：仅在“已有历史 1m 数据”（如两阶段冷启动阶段一之后）时运行一次，把历史折叠进 rollup 表。
+#      幂等：重跑不会让 volume 翻倍（详见文件头）。全量一次性：
+clickhouse-client --param_m_start='2000-01-01 00:00:00' --param_m_end='2099-01-01 00:00:00' \
+  --queries-file deploy/clickhouse/003_rollup_backfill.sql
+
+# 验证
 curl -s 'http://127.0.0.1:8123/?query=SHOW+TABLES+FROM+market'
-# 正常应返回: fapi_kline_1h 和 fapi_kline_1m
+# 正常应返回: fapi_kline_1m / fapi_kline_5m / fapi_kline_15m / fapi_kline_1h / fapi_kline_4h / fapi_kline_1d (+ *_rmv 物化视图)
 ```
+
+> **无刷新式物化视图支持**（ClickHouse < 24.8）：从 `002` 删掉全部 `CREATE MATERIALIZED VIEW` 段，改用 cron / systemd-timer 每 1–2 分钟执行一次 `003`（用滚动窗口，见 `003` 文件头的 “CRON FALLBACK”）。`003` 的重算是幂等的，怎么跑都不会重复累加。
 
 #### 步骤 3：配置与启动
 支持通过配置文件与命令行参数协同启动。优先读取 `config.yaml`（可从 `config.example.yaml` 复制）：
@@ -140,18 +147,24 @@ cp config.example.yaml config.yaml
 #### 操作流程
 
 ```bash
-# ---- 阶段一：离线灌历史 ----
-# 只把历史 K 线灌入 ClickHouse，跑完即退出，不触碰 Redis / WS。
+# ---- 阶段一：离线灌 1m 历史 ----
+# 只把 1m 历史灌入 ClickHouse fapi_kline_1m，跑完即退出，不触碰 Redis / WS。
 ./bin/chomosyncer-cmd -config config.yaml \
   -backfill-offline-only \
   -backfill-start-date 2024-01-01
 
-# 校验历史零断档、字段合法（必须全绿再进入阶段二）
-python cmd/test-tools/check_clickhouse_integrity.py --intervals 1m,1h
+# ---- 建 rollup 派生表，并折叠已灌好的历史 ----
+clickhouse-client --multiquery < deploy/clickhouse/002_kline_rollups.sql
+clickhouse-client --param_m_start='2000-01-01 00:00:00' --param_m_end='2099-01-01 00:00:00' \
+  --queries-file deploy/clickhouse/003_rollup_backfill.sql
+
+# 校验历史零断档 + 与币安外部对账（必须全绿再进入阶段二）
+python cmd/test-tools/check_clickhouse_integrity.py --intervals 1m,5m,15m,1h,4h,1d
+python cmd/test-tools/check_vs_binance.py --intervals 1m,1h,4h
 
 # ---- 阶段二：启动完整在线业务 ----
-# cold_start_date 此时只需覆盖最近少量窗口（例如 7 天，足够填满 200 根滑窗 + 余量），
-# 在线冷启动秒级完成，永远撞不到 gate_timeout。
+# cold_start_date 此时只需覆盖最近少量窗口（例如 7 天，足够填满 200 根 1m 滑窗 + 余量），
+# 在线冷启动秒级完成，永远撞不到 gate_timeout。rollup MV 会自动跟上新到的实时 1m。
 ./bin/chomosyncer-cmd -config config.yaml   # config.yaml 内 cold_start_date 改为最近 7 天
 ```
 
@@ -193,8 +206,8 @@ pip install -r cmd/test-tools/requirements.txt
 
 ### 5.1 ClickHouse 历史数据连续性与字段质量检查
 ```bash
-# 检查 1m 和 1h 周期全库数据是否连续、有无断档、字段是否饱满
-python cmd/test-tools/check_clickhouse_integrity.py --intervals 1m,1h
+# 检查 1m 原始表 + 全部 rollup 表是否连续、有无断档、字段是否饱满（默认 1m,5m,15m,1h,4h,1d）
+python cmd/test-tools/check_clickhouse_integrity.py
 
 # 针对特定主力币种深度检查
 python cmd/test-tools/check_clickhouse_integrity.py --symbol BTCUSDT --show-all-gaps
@@ -203,15 +216,15 @@ python cmd/test-tools/check_clickhouse_integrity.py --symbol BTCUSDT --show-all-
 
 ### 5.2 Redis 未收盘 Live Bar 实时检查
 ```bash
-python cmd/test-tools/check_redis_livebars.py --intervals 1m,1h
+python cmd/test-tools/check_redis_livebars.py   # 仅 1m：只有基准周期有 livebar
 ```
-- **核心判定**：扫描全市场 `livebar:{SYMBOL}:{interval}`，验证 Key 存在性、TTL（`2 * interval`）、时延时效（防止假死）以及 11 个 Hash 字段的完备性。
+- **核心判定**：扫描全市场 `livebar:{SYMBOL}:1m`，验证 Key 存在性、TTL（`2 * interval`）、时延时效（防止假死）以及 11 个 Hash 字段的完备性。
 
 ### 5.3 Redis 已收盘滚动滑窗检查
 ```bash
-python cmd/test-tools/check_redis_closed_windows.py --intervals 1m,1h
+python cmd/test-tools/check_redis_closed_windows.py   # 仅 1m：更粗周期不建 Redis 窗口，改查 ClickHouse rollup 表
 ```
-- **核心判定**：检查 `kline:{SYMBOL}:{interval}` 列表长度是否达到期望的 200 根，头部时间戳是否紧跟当前收盘边界，且滑窗内部每两根 Bar 之间严格连续无漏根。
+- **核心判定**：检查 `kline:{SYMBOL}:1m` 列表长度是否达到期望的 200 根，头部时间戳是否紧跟当前收盘边界，且滑窗内部每两根 Bar 之间严格连续无漏根。
 
 ### 5.4 截面通知 Stream 监控与回溯
 ```bash
@@ -224,17 +237,28 @@ python cmd/test-tools/monitor_redis_kline_ready.py --tail
 
 ### 5.5 Redis 与 ClickHouse 双写一致性对账
 ```bash
-python cmd/test-tools/e2e_reconciliation.py --limit-symbols 20
+python cmd/test-tools/e2e_reconciliation.py --limit-symbols 20   # 仅 1m：Redis 只有 1m 窗口
 ```
-- **核心判定**：直接将 Redis 滑窗与 ClickHouse 最新落盘数据进行逐根比对，时间戳与 OHLCV 数值必须 100% 吻合（容差 `< 1e-5`）。
+- **核心判定**：将 Redis `kline:{SYMBOL}:1m` 滑窗与 ClickHouse `fapi_kline_1m` 最新落盘逐根比对，时间戳与 OHLCV 必须 100% 吻合（容差 `< 1e-5`）。
 
-### 5.6 上线前一键综合评分
+### 5.6 ClickHouse 与币安外部真值对账（抓采集/聚合的系统性偏差）
+```bash
+# 1m 原始表 vs 币安 1m —— 验证采集字段映射/单位没错
+python cmd/test-tools/check_vs_binance.py --intervals 1m
+
+# rollup 表 vs 币安 —— 验证 Phase B 的桶对齐与聚合函数
+python cmd/test-tools/check_vs_binance.py --intervals 1h,4h,1d
+```
+- **核心判定**：逐根对回币安 `/fapi/v1/klines`。`start_time` 必须精确对齐；OHLC 相对容差 `1e-9`（≈精确）；volume 类字段相对容差 `1e-6`（浮点求和顺序差异）；`trades_count` 必须精确相等。
+- `e2e_reconciliation.py` 是“管道跟自己比”，只有这一项能发现 1m 采集或 rollup 的系统性错误。
+
+### 5.7 上线前一键综合评分
 ```bash
 # 快速冒烟扫描
 python cmd/test-tools/run_all_checks.py --quick
 
-# 深度全量扫描
-python cmd/test-tools/run_all_checks.py
+# 深度全量扫描（含币安外部对账）
+python cmd/test-tools/run_all_checks.py --vs-binance
 ```
 - 控制台将打印全红绿灯 Scorecard，并给出最终发布决策：`READY FOR PRODUCTION DEPLOYMENT` 或 `DEPLOYMENT BLOCKED`。
 

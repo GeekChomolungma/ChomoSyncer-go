@@ -8,14 +8,15 @@
 
 ## 核心数据产出与多级接口语义
 
-系统采集并标准化后的数据推向 **ClickHouse** 与 **Redis**，构成了层次分明的数据消费接口：
+系统只从币安采集 **1 分钟基准 K 线**，所有更粗周期（`5m/15m/1h/4h/1d`…）都由它派生：ClickHouse 端用物化视图 rollup 落成 `fapi_kline_<interval>` 表，实时链路只把 `kline_ready` 截面信号派生转发。因此 Redis 只保留 1m 的实时接口，更粗周期一律查 ClickHouse。
 
 | 数据出口 / 接口 | 存储介质与键结构 | 数据形态与协议 | 核心业务语义与应用场景 |
 | :--- | :--- | :--- | :--- |
-| **时序事实归档** | **ClickHouse**<br>`market.fapi_kline_<interval>` | ReplacingMergeTree 物理表<br>以 `(symbol, start_time)` 去重 | **全局权威事实账本**。持久化保存全市场所有历史 K 线，保证绝对零缺口，专供离线量化回测、特征工程计算与时序大数据挖掘。 |
-| **实时未收盘快照** | **Redis Hash**<br>`livebar:{SYMBOL}:{interval}` | Hash 结构（11 字段）<br>`t, o, h, l, c, v, qv, tbv, tbqv, n, x` | **未收盘瞬态形态读取**。毫秒级高频刷新当前正在跳动的这一根 K 线，带自动过期 TTL。供盘口监控、即时预警及高频执行策略进行实时价格与量能观测。 |
-| **已收盘滚动滑窗** | **Redis List**<br>`kline:{SYMBOL}:{interval}` | List 列表（定长 200 根）<br>9 元素紧凑 JSON 数组 (无 Key) | **策略特征极速计算缓存**。仅存放最近已闭合的 200 根 Bar，头部 (index 0) 为最新闭合。供量化策略引擎在单个 RTT 内批量拉取，全量重算均线、波动率等因子。 |
-| **截面就绪通知** | **Redis Stream**<br>`stream:market:kline_ready` | Stream 流事件<br>`interval, timestamp, symbols_count` | **跨币种截面策略同步触发器**。当全市场标的全部收盘（或触发兜底超时）时发布。下游截面 Alpha 策略阻塞监听此事件，收到后立即触发全市场横截面排序与仓位平衡。 |
+| **1m 时序事实归档** | **ClickHouse**<br>`market.fapi_kline_1m` | ReplacingMergeTree 物理表<br>以 `(symbol, start_time)` 去重 | **全局权威事实账本**。唯一直接落库的原始表，保证绝对零缺口。 |
+| **派生周期归档** | **ClickHouse**<br>`market.fapi_kline_{5m,15m,1h,4h,1d}` | ReplacingMergeTree + 刷新式物化视图<br>由 `fapi_kline_1m FINAL` 重算聚合 | **多周期回测/特征库**。从 1m 幂等重算（`deploy/clickhouse/002_kline_rollups.sql`），永不累加、不会重复计数。 |
+| **实时未收盘快照** | **Redis Hash**<br>`livebar:{SYMBOL}:1m` | Hash 结构（11 字段）<br>`t, o, h, l, c, v, qv, tbv, tbqv, n, x` | **未收盘瞬态形态读取**。仅 1m。毫秒级刷新当前跳动的这根 K 线，带自动过期 TTL。 |
+| **已收盘滚动滑窗** | **Redis List**<br>`kline:{SYMBOL}:1m` | List 列表（定长 200 根）<br>9 元素紧凑 JSON 数组 (无 Key) | **策略特征极速计算缓存**。仅 1m，最近 200 根已闭合 Bar。更粗周期请直接查 ClickHouse rollup 表。 |
+| **截面就绪通知** | **Redis Stream**<br>`stream:market:kline_ready` | Stream 流事件<br>`interval, timestamp, symbols_count` | **跨币种截面策略同步触发器**。1m 截面到齐时发布；`serve_intervals` 中每个周期在其“桶末 1m 截面”就绪时派生转发一条（`interval` 标注为该粗周期）。 |
 
 ---
 
@@ -54,11 +55,11 @@ CGO_ENABLED=0 go build -trimpath   -ldflags "-s -w -X main.version=$(git describ
 
 #### 2. 初始化 ClickHouse 表结构
 ```bash
-# 执行部署 DDL（建库 market 与物理分表 fapi_kline_1m / fapi_kline_1h）
+# 001：建库 market 与唯一原始表 fapi_kline_1m
 clickhouse-client --host 127.0.0.1 --port 9000 --multiquery < deploy/clickhouse/001_fapi_kline.sql
-
-# 或直接通过 ClickHouse HTTP 接口执行：
-curl -s 'http://127.0.0.1:8123/' --data-binary @deploy/clickhouse/001_fapi_kline.sql
+# 002：建 5m/15m/1h/4h/1d rollup 表 + 刷新式物化视图（需要 ClickHouse ≥ 24.8）
+clickhouse-client --host 127.0.0.1 --port 9000 --multiquery < deploy/clickhouse/002_kline_rollups.sql
+# 003：仅在“已有历史 1m 数据”时运行一次，把历史折叠进 rollup 表（幂等，详见文件头与两阶段冷启动）
 ```
 
 #### 3. 配置文件启动
@@ -85,12 +86,19 @@ curl -i http://localhost:9090/readyz    # 全链路就绪检查 (冷启动回补
 当 `cold_start_date` 设为很久远的时间时，实时链路的冷启动门控存在 `gate_timeout` 兜底释放，无法保证"历史全部落库后才开启 Redis 业务"。推荐把深历史作为独立的离线阶段先跑完：
 
 ```bash
-# 阶段一：仅离线回补。只把历史 K 线灌入 ClickHouse，跑完即退出（exit 0），不启动任何实时链路。
+# 阶段一：仅离线回补。只把 1m 历史灌入 ClickHouse fapi_kline_1m，跑完即退出（exit 0），不启动任何实时链路。
 #         被中断也没关系，进度已落盘，重跑会从 max(start_time) 续上。
 ./bin/chomosyncer-cmd -config config.yaml -backfill-offline-only -backfill-start-date 2024-01-01
 
-# 校验历史零断档
+# 建 rollup 表 + 刷新式物化视图（此后 MV 只吃新到的实时 1m 行）
+clickhouse-client --multiquery < deploy/clickhouse/002_kline_rollups.sql
+# 把阶段一已灌好的 1m 历史一次性折叠进各 rollup 表（幂等，可重跑）
+clickhouse-client --param_m_start='2000-01-01 00:00:00' --param_m_end='2099-01-01 00:00:00' \
+  --queries-file deploy/clickhouse/003_rollup_backfill.sql
+
+# 校验历史零断档 + 与币安对账
 python cmd/test-tools/check_clickhouse_integrity.py
+python cmd/test-tools/check_vs_binance.py --intervals 1m,1h,4h
 
 # 阶段二：启动完整在线业务。此时 cold_start_date 只需覆盖最近少量窗口（如 7 天），冷启动秒级完成。
 ./bin/chomosyncer-cmd -config config.yaml
@@ -125,8 +133,9 @@ python cmd/test-tools/check_clickhouse_integrity.py
   - `check_redis_livebars.py`：巡检实时 Live Bar 存在性、TTL 与时延；
   - `check_redis_closed_windows.py`：验证 200 根滑窗列表完整度、头部时效与滑窗内连续性；
   - `monitor_redis_kline_ready.py`：实时监控与回溯截面就绪通知流时延；
-  - `e2e_reconciliation.py`：Redis 缓存与 ClickHouse 权威事实库逐根对账；
-  - `run_all_checks.py`：上线前一键综合评分卡。
+  - `e2e_reconciliation.py`：Redis 1m 滑窗与 ClickHouse 逐根对账；
+  - `check_vs_binance.py`：把 ClickHouse（1m 原始表 / rollup 表）逐根对回币安 REST，抓采集与聚合的系统性偏差；
+  - `run_all_checks.py`：上线前一键综合评分卡（加 `--vs-binance` 纳入外部对账）。
 
 ---
 

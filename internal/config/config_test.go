@@ -7,6 +7,21 @@ import (
 	"time"
 )
 
+func TestIsDerivableInterval(t *testing.T) {
+	ok := []string{"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "300s"}
+	bad := []string{"1m", "1s", "0m", "1w", "2d", "3d", "1M", "", "h", "1.5h", "90s" /* not a multiple of 60s */}
+	for _, s := range ok {
+		if !IsDerivableInterval(s) {
+			t.Errorf("IsDerivableInterval(%q) = false, want true", s)
+		}
+	}
+	for _, s := range bad {
+		if IsDerivableInterval(s) {
+			t.Errorf("IsDerivableInterval(%q) = true, want false", s)
+		}
+	}
+}
+
 func TestDefaultConfigValid(t *testing.T) {
 	cfg := DefaultConfig()
 	if err := cfg.Validate(); err != nil {
@@ -89,6 +104,24 @@ func TestValidateCatchesInvalid(t *testing.T) {
 	cfg.Collector.Intervals = nil
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for empty Intervals")
+	}
+
+	cfg = DefaultConfig()
+	cfg.Collector.Intervals = []string{"1m", "1h"}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal(`expected error: collector.intervals must be exactly ["1m"]`)
+	}
+
+	cfg = DefaultConfig()
+	cfg.Collector.ServeIntervals = []string{"1h", "1w"} // 1w not derivable
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for non-derivable serve interval 1w")
+	}
+
+	cfg = DefaultConfig()
+	cfg.Collector.ServeIntervals = []string{"5m", "15m", "1h", "4h", "1d"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid for standard serve intervals, got %v", err)
 	}
 
 	cfg = DefaultConfig()

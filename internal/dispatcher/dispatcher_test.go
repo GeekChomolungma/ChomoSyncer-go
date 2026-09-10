@@ -79,10 +79,11 @@ func (f *fakeArchive) TryPush(interval string, r chwriter.Row) error {
 func (f *fakeArchive) count() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.rows) }
 
 type fakeReady struct {
-	mu     sync.Mutex
-	events []rediswin.KlineReadyEvent
-	err    error
-	n      atomic.Int64
+	mu       sync.Mutex
+	events   []rediswin.KlineReadyEvent
+	err      error
+	suppress bool // mimic the window gate: record nothing, return ("", nil)
+	n        atomic.Int64
 }
 
 func (f *fakeReady) PublishKlineReady(_ context.Context, e rediswin.KlineReadyEvent) (string, error) {
@@ -91,8 +92,16 @@ func (f *fakeReady) PublishKlineReady(_ context.Context, e rediswin.KlineReadyEv
 	if f.err != nil {
 		return "", f.err
 	}
+	if f.suppress {
+		return "", nil
+	}
 	f.events = append(f.events, e)
 	return "id-" + strconv.FormatInt(f.n.Add(1), 10), nil
+}
+func (f *fakeReady) snapshot() []rediswin.KlineReadyEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]rediswin.KlineReadyEvent(nil), f.events...)
 }
 func (f *fakeReady) count() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.events) }
 func (f *fakeReady) last() (rediswin.KlineReadyEvent, bool) {
@@ -264,6 +273,64 @@ func TestSectionCompletePublishesOnce(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if f.ready.count() != 1 {
 		t.Fatalf("republished: %d", f.ready.count())
+	}
+}
+
+func TestDerivedSectionPublished(t *testing.T) {
+	d, f := newTestDispatcher(t,
+		Config{SectionTimeout: time.Hour, BaseInterval: "1m", ServeIntervals: []string{"5m", "1h"}},
+		NewStaticUniverse("A", "B"))
+
+	// openTime 240000 = the 5th 1m bar (indexes 0..4): it closes the 5m bucket
+	// that started at 0, since (240000 + 60000) % 300000 == 0.
+	// openTime 240000 is the 5th 1m bar (indexes 0..4); it closes the 5m bucket
+	// starting at 0, since (240000 + 60000) % 300000 == 0.
+	_ = d.HandleKlineEvent(ev("A", "1m", 240000, true))
+	_ = d.HandleKlineEvent(ev("B", "1m", 240000, true))
+
+	eventually(t, time.Second, func() bool { return f.ready.count() == 2 })
+
+	var got1m, got5m, got1h bool
+	for _, e := range f.ready.snapshot() {
+		switch e.Interval {
+		case "1m":
+			got1m = e.Timestamp == 240000 && e.SymbolsCount == 2
+		case "5m":
+			got5m = e.Timestamp == 0 && e.SymbolsCount == 2
+		case "1h":
+			got1h = true
+		}
+	}
+	if !got1m || !got5m || got1h {
+		t.Fatalf("derived cascade wrong: 1m=%v 5m=%v 1h=%v events=%+v", got1m, got5m, got1h, f.ready.snapshot())
+	}
+	if v := testutil.ToFloat64(d.metrics.sectionPub.WithLabelValues("5m", "derived")); v != 1 {
+		t.Fatalf("section_published{5m,derived} = %v, want 1", v)
+	}
+
+	// openTime 300000 is the 6th bar: (300000 + 60000) % 300000 == 60000, so it
+	// closes no coarser bucket and must cascade to nothing.
+	_ = d.HandleKlineEvent(ev("A", "1m", 300000, true))
+	_ = d.HandleKlineEvent(ev("B", "1m", 300000, true))
+	eventually(t, time.Second, func() bool { return f.ready.count() == 3 })
+	time.Sleep(30 * time.Millisecond)
+	if f.ready.count() != 3 {
+		t.Fatalf("non-closing section produced a derived event: %+v", f.ready.snapshot())
+	}
+}
+
+func TestDerivedSectionSuppressedWhenBaseGated(t *testing.T) {
+	d, f := newTestDispatcher(t,
+		Config{SectionTimeout: time.Hour, BaseInterval: "1m", ServeIntervals: []string{"5m"}},
+		NewStaticUniverse("A", "B"))
+	f.ready.suppress = true // window gate holds the 1m interval
+
+	_ = d.HandleKlineEvent(ev("A", "1m", 240000, true))
+	_ = d.HandleKlineEvent(ev("B", "1m", 240000, true))
+
+	time.Sleep(80 * time.Millisecond)
+	if f.ready.count() != 0 {
+		t.Fatalf("derived event leaked while base was gated: %+v", f.ready.snapshot())
 	}
 }
 
