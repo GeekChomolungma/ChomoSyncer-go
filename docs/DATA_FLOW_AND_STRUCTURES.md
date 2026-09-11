@@ -231,7 +231,7 @@ The Dispatcher is the data hub of the entire system, responsible for three core 
       symbol   string               // symbol, uppercase
       interval string               // interval
       openTime int64                // millisecond timestamp (k.t)
-      bar      rediswin.CompactBar  // compact 9-element array for Redis
+      bar      rediswin.CompactBar  // compact 10-element array for Redis
       row      chwriter.Row         // columnar row struct for ClickHouse
       hasRow   bool                 // whether a Row was successfully parsed
   }
@@ -374,11 +374,11 @@ for sym, raw_bars in zip(universe_symbols, batch_results):
 - **LRANGE return value format**: a string list `List[string]`, with at most 200 elements.
   - Index `0`: the **newest** closed kline;
   - Index `199`: the **oldest** closed kline.
-- **Single list element value structure**: to save 60%+ memory, **keyed JSON objects are not used**; instead a uniform **9-element compact JSON array** is used:
+- **Single list element value structure**: to save 60%+ memory, **keyed JSON objects are not used**; instead a uniform **10-element compact JSON array** is used:
   ```json
-  [1719835200000, 60250.5, 60800.0, 60100.2, 60720.0, 12450.85, 75602300.5, 6120.4, 37150000.2]
+  [1719835200000, 60250.5, 60800.0, 60100.2, 60720.0, 12450.85, 75602300.5, 6120.4, 37150000.2, 1420]
   ```
-- **Exact field definitions for the 9 array positions**:
+- **Exact field definitions for the 10 array positions**:
 
 | Array Index | Field Name | Data Type | Example Value | Business Meaning |
 | :--- | :--- | :--- | :--- | :--- |
@@ -391,6 +391,7 @@ for sym, raw_bars in zip(universe_symbols, batch_results):
 | `[6]` | `quote_volume` | `float64` | `75602300.5` | Total traded turnover (quote volume, USDT) |
 | `[7]` | `taker_buy_volume` | `float64` | `6120.40` | Taker buy volume (used to compute CVD) |
 | `[8]` | `taker_buy_quote_volume` | `float64` | `37150000.20` | Taker buy turnover (USDT) |
+| `[9]` | `trades_count` | `int64` (`k.n`) | `1420` | Number of trades matched within this bar. Added so the closed window carries the same trade-count signal `livebar` already exposes via `n` — previously only `end_time` and `trades_count` were missing versus the ClickHouse row; now only `end_time` is. |
 
 ---
 
@@ -613,7 +614,7 @@ redis-cli LINDEX kline:BTCUSDT:1m 199 # check whether the oldest bar is correctl
 
 #### 3. Return Value Format & Data Structure
 - **ClickHouse query return**: executing the SQL `SELECT ... FINAL ORDER BY symbol ASC, start_time DESC LIMIT 200 BY symbol` returns fields entirely consistent with [Section 7.1](#71-external-storage-query-contract-clickhouse-query-contract).
-- **Redis List return after rebuild**: returns 200 arranged 9-element compact arrays, entirely consistent with [Section 5.1](#51-external-storage-query-contract-redis-query-contract).
+- **Redis List return after rebuild**: returns 200 arranged 10-element compact arrays, entirely consistent with [Section 5.1](#51-external-storage-query-contract-redis-query-contract).
 
 ---
 
@@ -705,7 +706,7 @@ While the Gapfill backfill pipeline is re-materializing 200 bars from ClickHouse
 | **WebSocket ingestion** | `collector.shard.run` | Multi-goroutine sharding | 1. by interval; 2. `crc32(SYM) % 4` hash bucketing | In-memory Dispatcher | Combined Stream: `<sym>@kline_<iv>` | Pure network stream/internal event |
 | **Dispatcher routing** | `Dispatcher.HandleKlineEvent` | Multiple upstreams + worker pool | 4 `ClosedWorkers` competing on a channel | In-memory sinks | `closedJob` + in-memory monotonic map (`sym\|iv`) | Pure in-memory/internal queue |
 | **Redis Live Bar snapshot** | `LiveBarWriter.TryEnqueue` | Worker pool | 2 workers competing on a channel | Redis (dedicated client) | `livebar:{SYM}:{iv}` (Hash, TTL=2x) | Redis Hash dictionary (`t`, `o`, `h`, `l`, `c`, `v`...) |
-| **Redis closed rolling window** | `Writer.PushBarAndTrim` | Dispatcher workers | Dispatched by the Dispatcher, arbitrated via the gate | Redis (main client) | `kline:{SYM}:{iv}` (List 200, compact JSON) | Redis List (200 9-element compact arrays, newest at 0) |
+| **Redis closed rolling window** | `Writer.PushBarAndTrim` | Dispatcher workers | Dispatched by the Dispatcher, arbitrated via the gate | Redis (main client) | `kline:{SYM}:{iv}` (List 200, compact JSON) | Redis List (200 10-element compact arrays, newest at 0) |
 | **Market-wide cross-section aggregation** | `aggregator.mark` | Dispatcher workers | In-memory mutex + per-section timer | Redis Stream | `stream:market:kline_ready` | Redis Stream entry (`interval`, `timestamp`, `count`) |
 | **ClickHouse batch archiving** | `BatchWriter.loop` | Single goroutine / interval | Each interval has its own dedicated BatchWriter | ClickHouse | `market.fapi_kline_<iv>` (ReplacingMergeTree) | Columnar/row table result (12-column raw fact data) |
 | **Historical Gapfill backfill** | `Backfiller.run` | Main loop + worker pool | Main loop serial; worker pool concurrent by symbol (4 workers) | CH + Redis | REST `/fapi/v1/klines` + Lua DEL/RPUSH | CH FINAL table + Redis 200-element List after overwrite |

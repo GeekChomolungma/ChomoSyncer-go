@@ -194,7 +194,7 @@ Checks the closed rolling window (`kline:<SYMBOL>:<interval>`) that quant strate
 - **Head freshness**: whether the start timestamp of the first list element (index 0) is strictly aligned with the boundary of the interval that just closed, and whether it lags behind.
 - **Strictly decreasing order**: verifies timestamps are strictly ordered from newest to oldest (`t[0] > t[1] > ...`).
 - **Internal continuity with no gaps**: verifies bar-by-bar that `t[i] - t[i+1] == interval_ms`, ruling out any missing bar inside the window.
-- **Compact JSON format validation**: parses the 9-element compact array `[t, o, h, l, c, v, qv, tbv, tbqv]` and validates its values.
+- **Compact JSON format validation**: parses the 10-element compact array `[t, o, h, l, c, v, qv, tbv, tbqv, n]` and validates its values.
 
 #### Flags:
 | Flag | Default | Meaning |

@@ -194,7 +194,7 @@ python cmd/test-tools/check_redis_livebars.py --show-only-failures
 - **头部新鲜度 (Head Freshness)**：列表首元素 (index 0) 的起始时间戳是否严格对齐当下刚刚收盘的周期边界，是否滞后。
 - **严格单调递减**：验证时间戳是否严格从新到旧排列 (`t[0] > t[1] > ...`)。
 - **滑窗内部连续无断档**：逐根验证 `t[i] - t[i+1] == interval_ms`，杜绝滑窗内部出现缺失漏 Bar。
-- **紧凑 JSON 格式校验**：9 元素紧凑数组 `[t, o, h, l, c, v, qv, tbv, tbqv]` 解析及数值合法性。
+- **紧凑 JSON 格式校验**：10 元素紧凑数组 `[t, o, h, l, c, v, qv, tbv, tbqv, n]` 解析及数值合法性。
 
 #### 参数：
 | 参数 | 默认值 | 说明 |

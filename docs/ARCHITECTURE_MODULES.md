@@ -81,7 +81,7 @@ This package covers all core logic for the system's interaction with Redis, divi
 - **Batch cross-section push (`PushBarsAndTrim`)**:
   - A single-RTT pipeline batch-writes the closed Bars for hundreds of market-wide symbols, keeping write latency under 5ms.
 - **Compact serialization**:
-  - Uses a keyless 9-element compact JSON array: `[t, o, h, l, c, v, qv, tbv, tbqv]`, greatly reducing memory footprint and parsing/deserialization time on the Python side.
+  - Uses a keyless 10-element compact JSON array: `[t, o, h, l, c, v, qv, tbv, tbqv, n]`, greatly reducing memory footprint and parsing/deserialization time on the Python side.
 
 ### 2.2 Unclosed Real-Time Snapshot (`LiveBarWriter`)
 - **Storage structure**: Redis Hash, with the key named `livebar:{SYMBOL}:{interval}` (e.g., `livebar:BTCUSDT:1m`).

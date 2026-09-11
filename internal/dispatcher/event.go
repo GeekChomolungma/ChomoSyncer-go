@@ -51,6 +51,7 @@ func (e KlineEvent) toCompactBar() (rediswin.CompactBar, error) {
 		e.Open, e.High, e.Low, e.Close,
 		e.Volume, e.QuoteVolume,
 		e.TakerBuyVolume, e.TakerBuyQuoteVolume,
+		e.TradeCount,
 	)
 }
 

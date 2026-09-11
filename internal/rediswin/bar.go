@@ -11,11 +11,16 @@ import (
 // engine expects (design doc section 3.2 "序列化协议 (Payload)"):
 //
 //	[ start_time, open, high, low, close, volume, quote_volume,
-//	  taker_buy_volume, taker_buy_quote_volume ]
+//	  taker_buy_volume, taker_buy_quote_volume, trades_count ]
 //
-// start_time is emitted as an integer (milliseconds, k.t); every other field is
-// a JSON number. A keyless array is used instead of an object to cut Redis
-// memory and Python parse cost.
+// start_time and trades_count are emitted as integers (milliseconds k.t, and
+// k.n respectively); every other field is a JSON number. A keyless array is
+// used instead of an object to cut Redis memory and Python parse cost.
+//
+// This mirrors chwriter.Row's column set exactly except end_time, which the
+// window has no use for (only start_time is needed to align/dedupe bars) — see
+// docs/DATA_CONSUMER_GUIDE.md for the full field-by-field comparison against
+// the ClickHouse and livebar representations.
 type CompactBar struct {
 	StartTime           int64 // milliseconds, k.t
 	Open                float64
@@ -26,10 +31,11 @@ type CompactBar struct {
 	QuoteVolume         float64
 	TakerBuyVolume      float64
 	TakerBuyQuoteVolume float64
+	TradesCount         int64 // k.n
 }
 
 // compactBarLen is the number of positions in the serialized array.
-const compactBarLen = 9
+const compactBarLen = 10
 
 // Marshal renders the bar as a compact, keyless JSON array via sonic.
 func (b CompactBar) Marshal() ([]byte, error) {
@@ -43,6 +49,7 @@ func (b CompactBar) Marshal() ([]byte, error) {
 		b.QuoteVolume,
 		b.TakerBuyVolume,
 		b.TakerBuyQuoteVolume,
+		b.TradesCount,
 	}
 	p, err := sonic.Marshal(&arr)
 	if err != nil {
@@ -60,6 +67,7 @@ func NewCompactBar(
 	open, high, low, closePrice string,
 	volume, quoteVolume string,
 	takerBuyVolume, takerBuyQuoteVolume string,
+	tradesCount int64,
 ) (CompactBar, error) {
 	parse := func(name, s string) (float64, error) {
 		v, err := strconv.ParseFloat(s, 64)
@@ -98,5 +106,9 @@ func NewCompactBar(
 	if b.TakerBuyQuoteVolume, err = parse("taker_buy_quote_volume", takerBuyQuoteVolume); err != nil {
 		return CompactBar{}, err
 	}
+	if tradesCount < 0 {
+		tradesCount = 0
+	}
+	b.TradesCount = tradesCount
 	return b, nil
 }

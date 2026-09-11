@@ -301,6 +301,7 @@ func (d *Dispatcher) drain() {
 func (d *Dispatcher) handleClosed(job closedJob) {
 	// Window push first, then section mark: by the time a section completes and
 	// kline_ready fires, every counted symbol's window is already written.
+	// 4. closed kline window, kline:symbol:1m
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := d.sinks.Window.PushBarAndTrim(ctx, job.symbol, job.interval, job.bar); err != nil {
 		d.metrics.sinkErrors.WithLabelValues("window").Inc()
@@ -309,11 +310,13 @@ func (d *Dispatcher) handleClosed(job closedJob) {
 	cancel()
 
 	if job.hasRow {
+		// 5. clickhouse archive push, kline_archive:1m
 		if err := d.sinks.Archive.TryPush(job.interval, job.row); err != nil {
 			d.metrics.dropped.WithLabelValues("archive").Inc()
 		}
 	}
 
+	// 6. cross-section aggregator: mark this symbol's closed bar for the interval.
 	d.agg.mark(job.symbol, job.interval, job.openTime)
 }
 

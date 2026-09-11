@@ -82,7 +82,7 @@
 - **批量截面推入 (`PushBarsAndTrim`)**：
   - 单一 RTT Pipeline 批量写入全市场数百个币种的已收盘 Bar，写入延迟控制在 5ms 以内。
 - **紧凑序列化**：
-  - 采用 9 元素无 key JSON 紧凑数组：`[t, o, h, l, c, v, qv, tbv, tbqv]`，极大降低内存占用与 Python 端解析反序列化耗时。
+  - 采用 10 元素无 key JSON 紧凑数组：`[t, o, h, l, c, v, qv, tbv, tbqv, n]`，极大降低内存占用与 Python 端解析反序列化耗时。
 
 ### 2.2 未收盘实时快照 (`LiveBarWriter`)
 - **存储结构**：Redis Hash，Key 命名为 `livebar:{SYMBOL}:{interval}`（例如 `livebar:BTCUSDT:1m`）。

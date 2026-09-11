@@ -328,7 +328,7 @@ python cmd/test-tools/run_all_checks.py --vs-binance
 
 ### 7.2 Redis 资源与策略
 - **内存占用**：
-  - 每个闭合滑窗约 200 根 × 9 元素 ≈ 30 KB；
+  - 每个闭合滑窗约 200 根 × 10 元素 ≈ 33 KB；
   - 400 币种 × 2 周期 (1m, 1h) ≈ 25 MB；
   - Live Bar 快照 400 币种 × 2 周期 ≈ 2 MB；
   - 全量 Redis 稳态运行内存通常小于 **100 MB**。
