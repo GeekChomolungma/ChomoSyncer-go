@@ -1,237 +1,238 @@
-# ChomoSyncer-go 模块架构与核心设计详解
+> **Language:** English | [简体中文](ARCHITECTURE_MODULES.zh-CN.md)
 
-本文档详细剖析 `ChomoSyncer-go` 各核心业务模块的设计原则、内部机制、并发模型、容错策略与接口规范。
+# ChomoSyncer-go Module Architecture and Core Design Details
+
+This document provides a detailed analysis of the design principles, internal mechanisms, concurrency model, fault-tolerance strategy, and interface specifications of each core business module in `ChomoSyncer-go`.
 
 ---
 
-## 模块全景与依赖拓扑
+## Module Overview and Dependency Topology
 
 ```text
                   ┌──────────────────────┐
-                  │   internal/universe  │ (全市场动态标的发现)
-                  └──────────┬───────────┘
-                             │ OnChange(Symbols)
-                             ▼
-┌────────────────────────────────────────────────────────┐
-│                   internal/collector                   │ (WebSocket 分片流接入)
-│            crc32(symbol) % ShardsPerInterval           │
-└────────────────────────────┬───────────────────────────┘
-                             │ KlineEvent (中性事件)
-                             ▼
-┌────────────────────────────────────────────────────────┐
-│                  internal/dispatcher                   │ (分发器 + 截面聚合)
-│         单调防护 + 四路扇出 + 截面就绪定时对齐           │
-└───────┬──────────────┬──────────────┬──────────────────┘
-        │              │              │
-        │ Live Bar     │ 闭合 Bar     │ 闭合 Bar
-        ▼              ▼              ▼
-┌──────────────┐ ┌──────────────┐ ┌──────────────────────┐
-│ rediswin     │ │ windowgate   │ │ chwriter             │
-│ (LiveBar-    │ │ (窗口门控)   │ │ (ClickHouse 批量写)  │
-│  Writer)     │ └──────┬───────┘ └──────────┬───────────┘
-└──────────────┘        │                    │
-                        ▼                    │
-                 ┌──────────────┐            │
-                 │ rediswin     │            │
-                 │ (SlidingWin) │            │
-                 └──────┬───────┘            │
-                        │                    │
-                        │ kline_ready Stream │
-                        ▼                    ▼
-┌────────────────────────────────────────────────────────┐
-│                   internal/backfill                    │ (历史回补与零缺口修复)
-│    冷启动 / 断线重连 / 窗口重建 / Token Bucket 限流    │
-└────────────────────────────────────────────────────────┘
+                  │  internal/universe   │ (market-wide dynamic symbol discovery)
+                  └───────────┬──────────┘
+                              │ OnChange(Symbols)
+                              ▼
+┌──────────────────────────────────────────────────────────┐
+│                    internal/collector                    │ (WebSocket sharded stream ingestion)
+│            crc32(symbol) % ShardsPerInterval             │
+└─────────────────────────────┬────────────────────────────┘
+                              │ KlineEvent (neutral event)
+                              ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                              internal/dispatcher                              │ (dispatcher + cross-section aggregation)
+│  monotonicity guard + four-way fan-out + timed cross-section-ready alignment  │
+└───────┬─────────────────┬────────────────────────┬────────────────────────────┘
+        │                 │                        │
+        │Live Bar         │Closed Bar              │Closed Bar
+        ▼                 ▼                        ▼
+┌──────────────┐ ┌────────────────┐ ┌────────────────────────────┐
+│ rediswin     │ │ windowgate     │ │ chwriter                   │
+│ (LiveBar-    │ │ (window gate)  │ │ (ClickHouse batch writer)  │
+│  Writer)     │ └────────┬───────┘ └──────────────┬─────────────┘
+└──────────────┘          ▼                        │
+                 ┌────────────────┐                │
+                 │ rediswin       │                │
+                 │ (SlidingWin)   │                │
+                 └────────┬───────┘                │
+                          │                        │
+                          │ kline_ready Stream     │
+                          ▼                        ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                           internal/backfill                            │ (historical backfill and zero-gap repair)
+│  cold start / reconnect / window rebuild / token bucket rate limiting  │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 模块 1：`internal/chwriter`（ClickHouse 批量缓冲写入器）
+## Module 1: `internal/chwriter` (ClickHouse Batch Buffered Writer)
 
-### 1.1 职责与定位
-提供面向 ClickHouse 的高吞吐、低开销批量落库能力。规避高频单条插入对 LSM-tree 类引擎造成的部件合并风暴（Too many parts）。
+### 1.1 Responsibilities and Positioning
+Provides high-throughput, low-overhead batch persistence capability for ClickHouse. This avoids the "part merge storm" (Too many parts) that high-frequency single-row inserts cause on LSM-tree-style engines.
 
-> 本构建只采集 1m 基准 K 线，因此**只实例化一个 `BatchWriter`**，写入唯一原始表 `market.fapi_kline_1m`。`5m/15m/1h/4h/1d` 等更粗周期不由 Go 写入，而是 ClickHouse 端从 `fapi_kline_1m FINAL` 幂等重算的 rollup 表（见本文 §8.6 与 `deploy/clickhouse/002_kline_rollups.sql`）。
+> This build only collects the 1m base kline, so **only a single `BatchWriter` is instantiated**, writing to the sole raw table `market.fapi_kline_1m`. Coarser intervals such as `5m/15m/1h/4h/1d` are not written by Go; instead they are rollup tables idempotently recomputed on the ClickHouse side from `fapi_kline_1m FINAL` (see §8.6 of this document and `deploy/clickhouse/002_kline_rollups.sql`).
 
-### 1.2 核心机制
-- **列式批量写入**：基于官方 `clickhouse-go/v2` 原生 TCP 驱动，启用 LZ4 数据压缩。
-- **无锁通道缓冲**：内存维护 `chan Row` 队列（默认容量 20,000）。
-  - WebSocket 实时流走 `TryPush(row)`：非阻塞写入，队列满时丢弃并记录报警指标；
-  - 历史回补流走 `Push(ctx, row)`：阻塞入队，确保历史补齐数据零丢失。
-- **双触发 Flush 规则**（先到先触发）：
-  1. **行数满**：队列累积达到 `BatchSize`（默认 5,000 行）；
-  2. **时间到**：距上次落盘间隔达到 `FlushInterval`（默认 1,000 ms）；
-  3. **停机信号**：进程退出时触发带超时的排空（Drain & Flush）。
-- **重试与连接自愈**：
-  - 单批写入失败后执行带随机抖动的指数退避重试（最多 5 次）；
-  - 遇到连接断开或网络异常，底层自动废弃旧连接并在下次写入前重新握手。
-
----
-
-## 模块 2：`internal/rediswin`（Redis 滑窗、LiveBar 与截面通知）
-
-本包涵盖系统与 Redis 交互的所有核心逻辑，细分为三大子功能：
-
-### 2.1 已收盘滚动滑窗 (`Writer`)
-- **存储结构**：Redis List，Key 命名为 `kline:{SYMBOL}:1m`。本构建只写 1m 窗口；更粗周期无 Redis 窗口，下游查 ClickHouse rollup 表（见 §8.6）。
-- **原子单调推入 (`PushBarAndTrim`)**：
-  - 采用内置 Lua 脚本执行 `LPUSH` + `LTRIM 0 199`；
-  - **单调性防护**：推入前读取列表头部 `LINDEX 0` 的时间戳，仅当待写入 Bar 时间戳严格大于头部时才执行推入，杜绝网络乱序导致的滑窗时间倒流。
-- **批量截面推入 (`PushBarsAndTrim`)**：
-  - 单一 RTT Pipeline 批量写入全市场数百个币种的已收盘 Bar，写入延迟控制在 5ms 以内。
-- **紧凑序列化**：
-  - 采用 9 元素无 key JSON 紧凑数组：`[t, o, h, l, c, v, qv, tbv, tbqv]`，极大降低内存占用与 Python 端解析反序列化耗时。
-
-### 2.2 未收盘实时快照 (`LiveBarWriter`)
-- **存储结构**：Redis Hash，Key 命名为 `livebar:{SYMBOL}:{interval}`（例如 `livebar:BTCUSDT:1m`）。
-- **独立连接池与 Worker**：
-  - 配置独立的 Redis Client（默认小连接池、200ms 短超时、无重试），防止实时行情突发写入争抢已收盘滑窗的连接资源；
-  - 内部具备独立的 `input chan`（容量 8192）和工作协程池（默认 2 个 Worker）。
-- **字段契约**：
-  - 覆盖写入 11 个 Hash 字段：`t, o, h, l, c, v, qv, tbv, tbqv, n, x`；
-  - 附带毫秒级 TTL（默认 `2 * interval`，例如 1m 对应 120s），无更新自动消亡。
-  - 可选开启 `publish: true`，将实时快照同步 PUBLISH 到频道 `livebar.<interval>`。
-
-### 2.3 截面就绪通知 (`PublishKlineReady`)
-- **存储结构**：Redis Stream，Key 为 `stream:market:kline_ready`。
-- **通知 Payload**：
-  - `interval`：K 线周期（"1m", "1h"）；
-  - `timestamp`：收盘周期开盘毫秒时间戳（`k.t`）；
-  - `symbols_count`：当前截面实际到齐的标的数量。
-- 采用 `MAXLEN ~ 10000` 近似修剪，防止 Stream 无限膨胀。
+### 1.2 Core Mechanisms
+- **Columnar batch writes**: Built on the official `clickhouse-go/v2` native TCP driver, with LZ4 data compression enabled.
+- **Lock-free channel buffering**: An in-memory `chan Row` queue is maintained (default capacity 20,000).
+  - The WebSocket real-time stream goes through `TryPush(row)`: non-blocking write; when the queue is full, rows are dropped and an alert metric is recorded;
+  - The historical backfill stream goes through `Push(ctx, row)`: blocking enqueue, ensuring zero loss of backfilled historical data.
+- **Dual-trigger flush rule** (whichever comes first):
+  1. **Row count reached**: the queue accumulates up to `BatchSize` (default 5,000 rows);
+  2. **Time elapsed**: the interval since the last flush reaches `FlushInterval` (default 1,000 ms);
+  3. **Shutdown signal**: on process exit, a timed drain (Drain & Flush) is triggered.
+- **Retry and connection self-healing**:
+  - After a single batch write fails, exponential backoff retry with random jitter is performed (up to 5 times);
+  - On connection loss or network exceptions, the underlying layer automatically discards the old connection and re-handshakes before the next write.
 
 ---
 
-## 模块 3：`internal/collector`（Binance WebSocket 采集层）
+## Module 2: `internal/rediswin` (Redis Rolling Window, LiveBar, and Cross-Section Notification)
 
-### 3.1 职责与特性
-唯一与币安衍生品 WebSocket 服务直接对接的模块。对下游屏蔽 Binance SDK 结构细节，直接输出标准化 `dispatcher.KlineEvent`。
+This package covers all core logic for the system's interaction with Redis, divided into three sub-functions:
 
-### 3.2 核心机制
-- **确定性分片架构 (`sharding.go`)**：
-  - 币安永续合约不支持全市场聚合流，必须单独订阅 `<symbol>@kline_<interval>`；
-  - 分片算法：`crc32(SYMBOL) % ShardsPerInterval`（默认每个周期 4 个分片连接）；
-  - 固定哈希模数保证币种到分片的映射完全确定，新币上市或旧币下市仅在对应分片触发增量 `SUBSCRIBE` / `UNSUBSCRIBE`，无需重建整条连接。
-- **防风暴与建连错峰**：
-  - 多个分片连接之间引入 `connect_stagger`（默认 300ms）错峰建连，避免并发握手触发交易所 IP 频控。
-- **双重保活与看门狗 (`shard.go`)**：
-  - 底层驱动内置自动 Ping/Pong 与 23 小时主动平滑重建；
-  - 顶层配置 **Staleness 看门狗**（默认 60s）：若某分片超过该时间未收到任何行情帧（即使 TCP 保持 ESTABLISHED），判定为假死连接并强制断开重连。
-- **无限退避重连**：
-  - 断线后按指数退避（1s → 30s）并叠加随机抖动，持续重试直至恢复。
+### 2.1 Closed Rolling Window (`Writer`)
+- **Storage structure**: Redis List, with the key named `kline:{SYMBOL}:1m`. This build only writes the 1m window; coarser intervals have no Redis window, and downstream consumers query the ClickHouse rollup tables instead (see §8.6).
+- **Atomic monotonic push (`PushBarAndTrim`)**:
+  - Uses a built-in Lua script to execute `LPUSH` + `LTRIM 0 199`;
+  - **Monotonicity guard**: before pushing, the timestamp at the head of the list (`LINDEX 0`) is read; the push is only executed when the timestamp of the Bar to be written is strictly greater than the head's timestamp, preventing the rolling window's time from moving backward due to network reordering.
+- **Batch cross-section push (`PushBarsAndTrim`)**:
+  - A single-RTT pipeline batch-writes the closed Bars for hundreds of market-wide symbols, keeping write latency under 5ms.
+- **Compact serialization**:
+  - Uses a keyless 9-element compact JSON array: `[t, o, h, l, c, v, qv, tbv, tbqv]`, greatly reducing memory footprint and parsing/deserialization time on the Python side.
+
+### 2.2 Unclosed Real-Time Snapshot (`LiveBarWriter`)
+- **Storage structure**: Redis Hash, with the key named `livebar:{SYMBOL}:{interval}` (e.g., `livebar:BTCUSDT:1m`).
+- **Dedicated connection pool and workers**:
+  - A dedicated Redis Client is configured (small connection pool by default, a short 200ms timeout, no retries), preventing bursts of real-time market writes from contending with the closed rolling window for connection resources;
+  - Internally it has its own `input chan` (capacity 8192) and a worker goroutine pool (2 workers by default).
+- **Field contract**:
+  - Overwrites 11 Hash fields: `t, o, h, l, c, v, qv, tbv, tbqv, n, x`;
+  - Carries a millisecond-level TTL (default `2 * interval`, e.g. 120s for 1m), automatically expiring if not updated.
+  - Optionally enabling `publish: true` synchronously PUBLISHes the real-time snapshot to the channel `livebar.<interval>`.
+
+### 2.3 Cross-Section Ready Notification (`PublishKlineReady`)
+- **Storage structure**: Redis Stream, with the key `stream:market:kline_ready`.
+- **Notification payload**:
+  - `interval`: the kline interval ("1m", "1h");
+  - `timestamp`: the open-time millisecond timestamp of the closed period (`k.t`);
+  - `symbols_count`: the number of symbols actually complete in the current cross-section.
+- Uses approximate trimming with `MAXLEN ~ 10000` to prevent the Stream from growing unbounded.
 
 ---
 
-## 模块 3b：`internal/universe`（全市场交易对动态发现）
+## Module 3: `internal/collector` (Binance WebSocket Ingestion Layer)
 
-### 3.1 职责与特性
-- **全市场覆盖原则**：严禁人为设置成交量、持仓量或流动性门限。
-- 从币安合约 REST 接口拉取全部处于交易中的 USDT 永续合约：
-  `quoteAsset == "USDT" && contractType == "PERPETUAL" && status == "TRADING"`。
+### 3.1 Responsibilities and Characteristics
+The only module that connects directly to the Binance derivatives WebSocket service. It shields downstream consumers from the structural details of the Binance SDK, outputting standardized `dispatcher.KlineEvent` directly.
 
-### 3.2 刷新与事件广播
-- **每日定时刷新**：
-  - 默认每 24 小时刷新一次，对齐至每日 **UTC 00:00:00 之后偏移 2 分钟**（避开交易所每日结算窗口）；
-- **动态变更广播**：
-  - 探测到币种列表增删时，触发 `OnChange` 回调，热更新 `collector` 订阅集与 `dispatcher` 截面分母。
+### 3.2 Core Mechanisms
+- **Deterministic sharding architecture (`sharding.go`)**:
+  - Binance perpetual contracts do not support a market-wide aggregated stream, so each must be subscribed individually via `<symbol>@kline_<interval>`;
+  - Sharding algorithm: `crc32(SYMBOL) % ShardsPerInterval` (4 shard connections per interval by default);
+  - A fixed hash modulus guarantees that the mapping from symbol to shard is fully deterministic; when a new symbol lists or an old one delists, only the corresponding shard triggers an incremental `SUBSCRIBE` / `UNSUBSCRIBE`, with no need to rebuild the entire connection.
+- **Storm prevention and staggered connection setup**:
+  - A `connect_stagger` (default 300ms) is introduced between multiple shard connections for staggered connection setup, avoiding concurrent handshakes that would trigger the exchange's IP rate limiting.
+- **Dual keepalive and watchdog (`shard.go`)**:
+  - The underlying driver has built-in automatic Ping/Pong and a proactive, smooth 23-hour rebuild;
+  - A top-level **staleness watchdog** is configured (default 60s): if a shard has not received any market data frame for longer than this duration (even if the TCP connection remains ESTABLISHED), it is judged a half-open/stale connection and is forcibly disconnected and reconnected.
+- **Unlimited backoff reconnection**:
+  - After a disconnect, it retries continuously with exponential backoff (1s → 30s) plus random jitter until recovery.
 
 ---
 
-## 模块 4：`internal/dispatcher`（K 线事件编排与截面聚合器）
+## Module 3b: `internal/universe` (Market-Wide Symbol Dynamic Discovery)
 
-### 4.1 事件四路分流
-接收中性 `KlineEvent`（本构建里 `Interval` 恒为 `1m`），根据 `IsFinal` 状态机执行严格路由：
+### 3.1 Responsibilities and Characteristics
+- **Market-wide coverage principle**: manually setting volume, open-interest, or liquidity thresholds is strictly forbidden.
+- Pulls all USDT perpetual contracts currently trading from the Binance futures REST API:
+  `quoteAsset == "USDT" && contractType == "PERPETUAL" && status == "TRADING"`.
 
-| 事件状态 | Live 快照 (Redis) | 收盘滑窗 (Redis) | 历史归档 (ClickHouse) | 截面聚合器 (Aggregator) |
+### 3.2 Refresh and Event Broadcasting
+- **Daily scheduled refresh**:
+  - Refreshes once every 24 hours by default, aligned to **2 minutes after UTC 00:00:00** each day (avoiding the exchange's daily settlement window);
+- **Dynamic change broadcasting**:
+  - When additions or removals in the symbol list are detected, an `OnChange` callback is triggered, hot-updating the `collector` subscription set and the `dispatcher` cross-section denominator.
+
+---
+
+## Module 4: `internal/dispatcher` (Kline Event Orchestration and Cross-Section Aggregator)
+
+### 4.1 Four-Way Event Fan-Out
+Receives the neutral `KlineEvent` (in this build `Interval` is always `1m`), and performs strict routing based on the `IsFinal` state machine:
+
+| Event State | Live Snapshot (Redis) | Closed Rolling Window (Redis) | Historical Archive (ClickHouse) | Cross-Section Aggregator (Aggregator) |
 | :--- | :---: | :---: | :---: | :---: |
-| **未闭合** (`IsFinal=false`) | ✅ `LiveSink.TryEnqueue` | ❌ 忽略 | ❌ 忽略 | ❌ 忽略 |
-| **已闭合** (`IsFinal=true`) | ✅ `LiveSink.TryEnqueue` | ✅ `WindowSink.PushBarAndTrim` | ✅ `ArchiveSink.TryPush` | ✅ `aggregator.mark` |
+| **Unclosed** (`IsFinal=false`) | ✅ `LiveSink.TryEnqueue` | ❌ Ignored | ❌ Ignored | ❌ Ignored |
+| **Closed** (`IsFinal=true`) | ✅ `LiveSink.TryEnqueue` | ✅ `WindowSink.PushBarAndTrim` | ✅ `ArchiveSink.TryPush` | ✅ `aggregator.mark` |
 
-### 4.1b 派生截面信号 (`serve_intervals`)
+### 4.1b Derived Cross-Section Signals (`serve_intervals`)
 
-1m 截面发布成功后，聚合器检查 `serve_intervals`（默认 `5m,15m,1h,4h,1d`）：若这根 1m Bar 的 `openTime` 恰好闭合某个更粗桶（`(openTime + 60000) % D == 0`），就以相同的 `symbols_count` 追加发布一条 `kline_ready`，`interval` 标注为该粗周期、`timestamp` 为粗桶开盘时刻。派生信号也受窗口门控约束——只有基准 1m 截面确实发出（未被 gapfill 压制）时才级联。粗周期的 200 根窗口不进 Redis，下游收到派生信号后直接查 ClickHouse rollup 表。
+After the 1m cross-section is successfully published, the aggregator checks `serve_intervals` (default `5m,15m,1h,4h,1d`): if this 1m Bar's `openTime` happens to close some coarser bucket (`(openTime + 60000) % D == 0`), it additionally publishes a `kline_ready` with the same `symbols_count`, with `interval` labeled as that coarser interval and `timestamp` as the coarse bucket's open time. Derived signals are also constrained by the window gate — cascading only occurs when the base 1m cross-section is actually emitted (i.e., not suppressed by gapfill). The 200-bar window for coarser intervals does not go into Redis; downstream consumers that receive a derived signal query the ClickHouse rollup table directly.
 
-### 4.2 单调性递增防护
-维护 `(symbol, interval) -> lastClosedOpenTime` 状态。若收到 `<= lastClosedOpenTime` 的闭合帧，立即作为乱序/重复帧丢弃，保护下游时序单调性。
+### 4.2 Monotonicity Guard
+Maintains `(symbol, interval) -> lastClosedOpenTime` state. If a closed frame with `<= lastClosedOpenTime` is received, it is immediately dropped as an out-of-order/duplicate frame, protecting downstream time-series monotonicity.
 
-### 4.3 截面聚合对齐器 (`Aggregator`)
-- **双重触发机制**：
-  1. **全员齐备触发 (`onComplete`)**：当周期内已闭合标的数量达到 Universe 标的总数时，立即触发；
-  2. **兜底超时触发 (`onTimeout`)**：首根闭合 Bar 到达后启动 `section_timeout` 定时器（默认 5s）。若个别冷门币种因成交稀疏迟迟未收盘，超时强制发布当前已齐备的截面通知。
-- **截面防重与留存淘汰 (`SectionRetention`)**：
-  - 截面发布后，状态在内存中继续保留一个周期间隔，防止迟到帧重复触发多余的 `kline_ready` 通知。
-
----
-
-## 模块 5：`internal/metrics`（可观测性与监控探针）
-
-- **统一私有注册表**：基于 `prometheus.NewRegistry()` 构建专属注册表，不侵入全局默认 DefaultRegisterer。
-- **HTTP 探针路由**：
-  - `GET /metrics`：Prometheus 标准抓取端点，汇总各模块指标；
-  - `GET /healthz`：Liveness 探针，进程存活返回 200；
-  - `GET /readyz`：Readiness 探针，冷启动历史回补未完成时返回 503，回补完毕且全链路就绪后返回 200。
+### 4.3 Cross-Section Aggregation Aligner (`Aggregator`)
+- **Dual trigger mechanism**:
+  1. **All-complete trigger (`onComplete`)**: fires immediately when the number of closed symbols within the period reaches the total number of symbols in the universe;
+  2. **Fallback timeout trigger (`onTimeout`)**: a `section_timeout` timer (default 5s) starts after the first closed Bar arrives. If a few obscure symbols remain unclosed for a long time due to sparse trading, the timeout forces publication of a cross-section notification with whatever is currently complete.
+- **Cross-section deduplication and retention eviction (`SectionRetention`)**:
+  - After a cross-section is published, its state is retained in memory for one more period interval, preventing late-arriving frames from repeatedly triggering redundant `kline_ready` notifications.
 
 ---
 
-## 模块 6：`internal/app` + `cmd/chomosyncer-go`（装配与生命周期）
+## Module 5: `internal/metrics` (Observability and Monitoring Probes)
 
-- **模块装配**：在 `internal/app` 中执行依赖注入与网络拓扑构建。
-- **优雅关闭顺序**：
-  进程捕获 `SIGINT` / `SIGTERM` 信号后，执行严格的逆序拆解：
-  `collector 停止接入` → `dispatcher 排空并关闭` → `livebar 写入器关闭` → `ClickHouse 强制 Flush 落盘` → `backfill 停止` → `关闭 Redis 客户端` → `metrics 停机`。
+- **Unified private registry**: A dedicated registry is built on `prometheus.NewRegistry()`, without polluting the global default DefaultRegisterer.
+- **HTTP probe routes**:
+  - `GET /metrics`: the standard Prometheus scrape endpoint, aggregating metrics from each module;
+  - `GET /healthz`: liveness probe, returns 200 while the process is alive;
+  - `GET /readyz`: readiness probe, returns 503 while cold-start historical backfill is incomplete, and returns 200 once backfill is complete and the entire pipeline is ready.
 
 ---
 
-## 模块 8：`internal/backfill` + `internal/windowgate`（历史回补与断线补缺设计）
+## Module 6: `internal/app` + `cmd/chomosyncer-go` (Assembling and Lifecycle)
 
-### 8.1 背景与目标
-增量 WebSocket 采集属于 forward-only 流。当发生**空库冷启动**、**历史落档重启**或**分片断线重连**时，数据会出现不同程度的时间缺口。Backfill 模块负责在后台无感完成数据补录，确保 ClickHouse 账本零缺口，并重建 Redis 200 根短期滑窗。
+- **Module assembling**: dependency injection and network topology construction are performed in `internal/app`.
+- **Graceful shutdown order**:
+  After the process catches a `SIGINT` / `SIGTERM` signal, it performs a strict reverse-order teardown:
+  `collector stops ingestion` → `dispatcher drains and closes` → `livebar writer closes` → `ClickHouse force-flushes to storage` → `backfill stops` → `close Redis clients` → `metrics shuts down`.
 
-### 8.2 三大补齐策略
-1. **空库冷启动 (Empty DB Cold Start)**：
-   - 若 ClickHouse 对应表无任何历史记录，读取配置参数 `cold_start_date`（例如 `"2024-01-01"` 或具体时间戳）；
-   - 从该锚点时间开始，按 1500 根分段拉取直至当下，完成历史冷启动同步；若未指定则拉取最近窗口所需数据。
-2. **有历史冷启动 (Existing History Cold Start)**：
-   - 读取 ClickHouse 中该标的的最新时间戳 `max(start_time)`；
-   - 严格从 `max(start_time) + 1 step` 作为起始时间，向前持续同步至当下最新时刻。
-3. **运行中断线重连 (Shard Reconnect Gapfill)**：
-   - 不再受限于人为预设的短窗口上限，直接查询 ClickHouse 记录的最新时间戳；
-   - 以该时间戳为同步起点，流式补齐停机期间的所有缺失 K 线，做到绝对无缺口 (Zero Gap)。
+---
 
-### 8.3 窗口门控机制 (`internal/windowgate`)
-回补与实时采集是并行运作的。为防止历史回补与实时写入产生竞争：
-- **门控拦截 (`gate.Hold(keys)`)**：
-  在某个标的回补期间，对其 Redis 收盘滑窗推入 (`PushBarAndTrim`) 和截面就绪通知 (`PublishKlineReady`) 进行临时挂起；
-- **全速无阻通道**：
-  实时 Live Bar 快照和 ClickHouse 批量写入**不受门控限制**，正常流入（ClickHouse 依赖 `ReplacingMergeTree` 原生去重）；
-- **物化重建与释放 (`gate.Release(keys)`)**：
-  1. 回补数据全部写入 ClickHouse 并执行显式 Flush 屏障；
-  2. 从 ClickHouse 权威读回该标的最新的 200 根 Bar；
-  3. 执行 Lua 脚本 `RebuildWindow` 原子替换 Redis 滑窗；
-  4. 释放门控，被挂起的实时更新无缝恢复写入。
+## Module 8: `internal/backfill` + `internal/windowgate` (Historical Backfill and Gap-Filling Design)
 
-### 8.4 REST 频控保护 (`BinanceFetcher`)
-- 采用 Token Bucket 令牌桶限流算法（参数 `rest_rps`，默认 20 RPS）；
-- 分页拉取（币安单次最大 1500 根），自适应重试网络抖动，杜绝触发交易所 429 / 418 IP 封禁。
+### 8.1 Background and Goals
+Incremental WebSocket ingestion is a forward-only stream. When an **empty-database cold start**, a **restart from an existing historical archive**, or a **shard reconnect** occurs, data develops time gaps of varying degrees. The Backfill module is responsible for completing data recovery transparently in the background, ensuring the ClickHouse ledger has zero gaps, and rebuilding the Redis 200-bar short-term rolling window.
 
-### 8.5 离线回补模式 (`backfill.offline_only`)
+### 8.2 Three Gap-Filling Strategies
+1. **Empty DB Cold Start**:
+   - If the corresponding ClickHouse table has no historical records at all, the configuration parameter `cold_start_date` is read (e.g. `"2024-01-01"` or a specific timestamp);
+   - Starting from that anchor time, data is fetched in segments of 1500 bars until the present, completing the historical cold-start sync; if unspecified, only the data needed for the most recent window is fetched.
+2. **Existing History Cold Start**:
+   - Reads the latest timestamp `max(start_time)` for that symbol from ClickHouse;
+   - Syncs strictly starting from `max(start_time) + 1 step`, continuing forward to the current latest moment.
+3. **Shard Reconnect Gapfill**:
+   - No longer limited by a manually preset short-window cap; it directly queries the latest timestamp recorded in ClickHouse;
+   - Using that timestamp as the sync starting point, it streams in all klines missing during the downtime, achieving absolute Zero Gap.
 
-门控受 `gate_timeout`（默认 `5m`）兜底释放，当 `cold_start_date` 设为很久远时间、全市场历史回补远超该时长时，门控会提前释放、实时业务提前开跑，且深历史缺口会因实时写入污染 `max(start_time)` 而变为粘性缺口。
+### 8.3 Window Gate Mechanism (`internal/windowgate`)
+Backfill and real-time ingestion operate in parallel. To prevent contention between historical backfill and real-time writes:
+- **Gate interception (`gate.Hold(keys)`)**:
+  During backfill for a given symbol, its Redis closed-rolling-window push (`PushBarAndTrim`) and cross-section ready notification (`PublishKlineReady`) are temporarily suspended;
+- **Full-speed unblocked path**:
+  Real-time Live Bar snapshots and ClickHouse batch writes are **not subject to the gate** and flow through normally (ClickHouse relies on `ReplacingMergeTree`'s native deduplication);
+- **Materialized rebuild and release (`gate.Release(keys)`)**:
+  1. All backfilled data is written to ClickHouse and an explicit flush barrier is executed;
+  2. The latest 200 bars for that symbol are read back from ClickHouse as the authoritative source;
+  3. The Lua script `RebuildWindow` is executed to atomically replace the Redis rolling window;
+  4. The gate is released, and the suspended real-time updates resume writing seamlessly.
 
-为此提供 `backfill.offline_only`（配置文件；或 `-backfill-offline-only` / `CHOMOSYNCER_BACKFILL_OFFLINE_ONLY`，默认 `false`）：
+### 8.4 REST Rate-Limit Protection (`BinanceFetcher`)
+- Uses the token bucket rate-limiting algorithm (parameter `rest_rps`, default 20 RPS);
+- Fetches with pagination (Binance's maximum of 1500 bars per call), with adaptive retries for network jitter, avoiding triggering the exchange's 429 / 418 IP bans.
 
-- `true` 时只装配 **universe → REST 拉取 → ClickHouse 落库** 链路，**不启动** collector / dispatcher / rediswin / windowgate；
-- `gate_timeout` 自动失效（`internal/backfill` 内负值哨兵表示"无上限"），历史全量拉取不被中途强制释放；
-- 执行一次 whole-universe 冷启动回补后进程退出（正常完成退出码 `0`，被信号中断则非 `0` 但进度已落盘、重跑从 `max(start_time)` 续上）。
+### 8.5 Offline Backfill Mode (`backfill.offline_only`)
 
-配合"深历史离线灌满 → 校验 → 用最近少量窗口的 `cold_start_date` 启动在线业务"的两阶段流程，可确保历史落库完成后再开启 Redis 业务。详见 `docs/OPERATIONS.md` §A.1 / §B.1（空库首次上线）。
+The gate is released as a fallback/safety-net by `gate_timeout` (default `5m`). When `cold_start_date` is set very far in the past and the market-wide historical backfill takes far longer than that duration, the gate is released prematurely, real-time business starts prematurely, and deep-history gaps turn into sticky gaps because real-time writes pollute `max(start_time)`.
 
-### 8.6 更粗周期的 ClickHouse rollup（`deploy/clickhouse/002` + `003`）
+To address this, `backfill.offline_only` is provided (in the config file; or `-backfill-offline-only` / `CHOMOSYNCER_BACKFILL_OFFLINE_ONLY`, default `false`):
 
-采集端只订阅 1m，避免"同一撮合事件在 1m/1h 两条 WS 链路各跑一遍"的连接与带宽冗余。更粗周期全部由 ClickHouse 从 `fapi_kline_1m` 派生：
+- When `true`, only the **universe → REST fetch → ClickHouse persistence** chain is assembled; collector / dispatcher / rediswin / windowgate are **not started**;
+- `gate_timeout` is automatically disabled (a negative sentinel value inside `internal/backfill` means "no upper bound"), so the full historical fetch is not forcibly released partway through;
+- The process exits after performing one whole-universe cold-start backfill (exit code `0` on normal completion; a non-`0` code if interrupted by a signal, but progress has already been persisted and a rerun resumes from `max(start_time)`).
 
-- **目标表** `fapi_kline_{5m,15m,1h,4h,1d}`：`ReplacingMergeTree(rollup_version)`，schema 与 `fapi_kline_1m` 一致，消费方式也一致（`... FINAL`）。
-- **刷新式物化视图** `*_rmv`：每 60–300s 从 `fapi_kline_1m FINAL` **重算**最近数天的桶并 `APPEND`。桶用 `toStartOfInterval`（epoch 对齐，5m/15m/1h/4h/1d 与币安边界一致）。
-- **幂等硬保证**：聚合是 `sum()/argMin()/argMax()/min()/max()` 的**全量重算**，没有任何累加器；`FINAL` 先折叠 1m 的重复行；每次重算写更新的 `rollup_version`，ReplacingMergeTree 保留最新。因此 1m 重发、回补重叠、`003` 反复重跑都**不会让 volume 翻倍**。严禁改成 `SummingMergeTree` 或非刷新式增量 MV——那会按插入块累加而漂移。
-- **历史折叠** `003_rollup_backfill.sql`：MV 只吃创建之后到达的 1m 行，故 `002` 应用后运行一次 `003`（按月分片或一次性）把已有历史折进 rollup 表。
-- **OHLC 精确、volume 有 ~1e-8 相对漂移**（浮点求和顺序 vs 币安从 trade 累加）——`check_vs_binance.py` 对价用 `1e-9`、对量用 `1e-6` 容差。
+Combined with the two-phase process of "fill deep history offline → validate → start the online business with a `cold_start_date` covering only a small recent window," this ensures the Redis business is only turned on after historical persistence is complete. See `docs/OPERATIONS.md` §A.1 / §B.1 (first-time launch with an empty database) for details.
+
+### 8.6 ClickHouse Rollups for Coarser Intervals (`deploy/clickhouse/002` + `003`)
+
+The ingestion side only subscribes to 1m, avoiding the connection and bandwidth redundancy of "the same matching event running once each on separate 1m/1h WS links." All coarser intervals are derived by ClickHouse from `fapi_kline_1m`:
+
+- **Target tables** `fapi_kline_{5m,15m,1h,4h,1d}`: `ReplacingMergeTree(rollup_version)`, with a schema identical to `fapi_kline_1m` and the same consumption pattern (`... FINAL`).
+- **Refreshable materialized views** `*_rmv`: every 60–300s, **recompute** the buckets for the last few days from `fapi_kline_1m FINAL` and `APPEND` them. Buckets use `toStartOfInterval` (epoch-aligned; 5m/15m/1h/4h/1d boundaries match Binance's).
+- **Hard idempotency guarantee**: the aggregation is a **full recomputation** using `sum()/argMin()/argMax()/min()/max()`, with no accumulator of any kind; `FINAL` first collapses duplicate 1m rows; each recomputation writes an updated `rollup_version`, and ReplacingMergeTree keeps the latest. As a result, 1m redelivery, overlapping backfills, and repeated reruns of `003` will **never double the volume**. Changing this to `SummingMergeTree` or a non-refreshable incremental MV is strictly forbidden — that would accumulate per inserted block and drift.
+- **Historical folding** `003_rollup_backfill.sql`: the MV only consumes 1m rows arriving after its creation, so after `002` is applied, `003` must be run once (sharded by month, or all at once) to fold existing history into the rollup tables.
+- **OHLC is exact; volume has ~1e-8 relative drift** (floating-point summation order vs. Binance accumulating from trades) — `check_vs_binance.py` uses a `1e-9` tolerance for price and `1e-6` for volume.
