@@ -21,6 +21,10 @@ if [ ! -d "$LOG_DIR" ]; then
   mkdir -p "$LOG_DIR"
 fi
 
+# Log timestamps in UTC (host OS tz is Asia/Shanghai; Go's time.Now() defaults
+# to it). UTC matches ClickHouse's DateTime64(3,'UTC') columns 1:1, no mental +8.
+export TZ=UTC
+
 # Process substitution (not a pipe) so this script's exit code == the daemon's.
 exec ./bin/chomosyncer-go -config config.yaml \
   > >(exec rotatelogs -e -n 30 "$LOG_DIR/online.log" 100M) 2>&1
