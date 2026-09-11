@@ -34,15 +34,24 @@ type binanceStreamClient struct {
 	closeOnce sync.Once
 	closed    atomic.Bool
 	errWG     sync.WaitGroup
+	// stopDrain is closed by Close() to unblock the drainConnErrors goroutines
+	// even if the connector never closes the underlying ErrorChan on its own
+	// (observed in practice: CloseWebSocketStreamConnection can close the
+	// socket cleanly without closing the ErrorChan). Without this, errWG.Wait()
+	// in Close() can block forever, and with it so does everything waiting on
+	// this client to close — the shard's run loop, Collector.Close(), and the
+	// whole app's graceful shutdown.
+	stopDrain chan struct{}
 }
 
 func newBinanceStreamClient(shardID, baseURL string, onEvent func(dispatcher.KlineEvent), log *slog.Logger) streamClient {
 	return &binanceStreamClient{
-		shardID: shardID,
-		baseURL: baseURL,
-		onEvent: onEvent,
-		log:     log.With("shard", shardID),
-		errCh:   make(chan error, 4),
+		shardID:   shardID,
+		baseURL:   baseURL,
+		onEvent:   onEvent,
+		log:       log.With("shard", shardID),
+		errCh:     make(chan error, 4),
+		stopDrain: make(chan struct{}),
 	}
 }
 
@@ -104,6 +113,10 @@ func (b *binanceStreamClient) Close() error {
 		if b.fc != nil {
 			_ = b.fc.WsMarket.CloseWebSocketStreamConnection()
 		}
+		// Unblock drainConnErrors even if the connector left an ErrorChan
+		// open; errWG.Wait() below then always returns promptly instead of
+		// depending on the connector's own cleanup.
+		close(b.stopDrain)
 		b.errWG.Wait()
 		close(b.errCh)
 	})
@@ -135,13 +148,21 @@ func (b *binanceStreamClient) drainConnErrors() {
 		b.errWG.Add(1)
 		go func(ec <-chan error) {
 			defer b.errWG.Done()
-			for err := range ec {
-				if b.closed.Load() {
-					return
-				}
+			for {
 				select {
-				case b.errCh <- err:
-				default:
+				case err, ok := <-ec:
+					if !ok {
+						return
+					}
+					if b.closed.Load() {
+						return
+					}
+					select {
+					case b.errCh <- err:
+					default:
+					}
+				case <-b.stopDrain:
+					return
 				}
 			}
 		}(conn.ErrorChan)

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -456,49 +457,87 @@ func (a *App) runBackfillOnly(ctx context.Context) error {
 	return shutErr
 }
 
+// defaultShutdownStepTimeout bounds Shutdown when the caller passes a context
+// with no deadline (e.g. the early-exit paths in Run/runBackfillOnly that call
+// Shutdown(context.Background()) before app.shutdown_timeout would otherwise
+// apply). Chosen to match AppConfig.ShutdownTimeout's documented default.
+const defaultShutdownStepTimeout = 30 * time.Second
+
 // Shutdown closes every component in reverse dependency order. Safe to call more
 // than once and safe on a partially-built App.
+//
+// Every component.Close() below runs behind closeStep, bounded by ctx's
+// deadline (falling back to defaultShutdownStepTimeout if ctx has none): a
+// single misbehaving component — e.g. a WS library that leaves a goroutine
+// blocked on a channel the peer never closes — must not wedge the whole
+// process's graceful shutdown forever. A step that times out is abandoned (its
+// goroutine keeps running in the background until the process exits) and
+// Shutdown moves on to the rest; the remaining steps then race the same,
+// already-expired deadline, so they resolve immediately too.
 func (a *App) Shutdown(ctx context.Context) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultShutdownStepTimeout)
+		defer cancel()
+	}
 	var errs []error
 	a.shutdownOnce.Do(func() {
 		if a.col != nil {
-			errs = append(errs, a.col.Close())
+			closeStep(ctx, a.log, "collector", &errs, a.col.Close)
 		}
 		if a.backfiller != nil {
-			errs = append(errs, a.backfiller.Close())
+			closeStep(ctx, a.log, "backfiller", &errs, a.backfiller.Close)
 		}
 		if a.disp != nil {
-			errs = append(errs, a.disp.Close())
+			closeStep(ctx, a.log, "dispatcher", &errs, a.disp.Close)
 		}
 		if a.live != nil {
-			errs = append(errs, a.live.Close())
+			closeStep(ctx, a.log, "live_writer", &errs, a.live.Close)
 		}
 		for iv, w := range a.chWriters {
 			if w == nil {
 				continue
 			}
-			if err := w.Close(); err != nil {
-				errs = append(errs, fmt.Errorf("clickhouse writer (%s): %w", iv, err))
-			}
+			closeStep(ctx, a.log, "clickhouse_writer_"+iv, &errs, w.Close)
 		}
 		if a.univ != nil {
-			errs = append(errs, a.univ.Close())
+			closeStep(ctx, a.log, "universe", &errs, a.univ.Close)
 		}
 		if a.chStore != nil {
-			errs = append(errs, a.chStore.Close())
+			closeStep(ctx, a.log, "clickhouse_store", &errs, a.chStore.Close)
 		}
 		if a.closedRDB != nil {
-			errs = append(errs, a.closedRDB.Close())
+			closeStep(ctx, a.log, "redis_closed", &errs, a.closedRDB.Close)
 		}
 		if a.liveRDB != nil {
-			errs = append(errs, a.liveRDB.Close())
+			closeStep(ctx, a.log, "redis_live", &errs, a.liveRDB.Close)
 		}
 		if a.metrics != nil {
-			errs = append(errs, a.metrics.Close(ctx))
+			closeStep(ctx, a.log, "metrics", &errs, func() error { return a.metrics.Close(ctx) })
 		}
 		a.log.Info("shutdown complete")
 	})
 	return errors.Join(errs...)
+}
+
+// closeStep runs fn in its own goroutine and waits for it, but never past
+// ctx's deadline. If fn does not finish in time, closeStep logs and appends a
+// timeout error to *errs instead of blocking further; fn's goroutine is left
+// running (it will exit on its own, or die with the process) rather than
+// wedging the rest of Shutdown.
+func closeStep(ctx context.Context, log *slog.Logger, name string, errs *[]error, fn func() error) {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			*errs = append(*errs, fmt.Errorf("%s: %w", name, err))
+		}
+	case <-ctx.Done():
+		log.Error("component close did not finish before shutdown deadline; abandoning wait and continuing shutdown",
+			"component", name, "err", ctx.Err())
+		*errs = append(*errs, fmt.Errorf("%s: close timed out: %w", name, ctx.Err()))
+	}
 }
 
 // --- ClickHouse archive routing ---
