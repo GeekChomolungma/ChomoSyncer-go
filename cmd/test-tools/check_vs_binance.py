@@ -22,7 +22,21 @@ Use it on:
   --intervals 1m         -> validates raw collector ingestion vs Binance
   --intervals 1h,4h,1d   -> validates the ClickHouse rollups (Phase B)
 
+Sampling the whole universe over a recent window (instead of full history, which
+would be slow and REST-heavy): --bars picks the last N *closed* bars ending at
+now (not a date), so e.g. --intervals 1m --bars 720 covers the last 12h; pass
+--limit-symbols with a value >= the active symbol count (sorted alphabetically,
+see common.fetch_active_symbols) to cover every symbol instead of the default
+sample of 8.
+
 Exit code 0 = every checked bar matched within tolerance.
+
+RATE LIMIT NOTE: every /fapi/v1/klines call here uses limit=1500 (weight 10,
+regardless of --bars), and --symbol-delay paces the per-symbol loop (default
+0.35s = ~2.9 req/s -> ~1700 weight/min, under Binance's 2400/min IP cap with
+headroom for the live daemon's own REST use). Do not set it to 0 for a
+--limit-symbols run covering the whole universe -- see docs/OPERATIONS.md's
+backfill.rest_rps notes for the same weight-budget math.
 """
 import os
 import sys
@@ -132,11 +146,19 @@ def rel_close(a: float, b: float, tol: float) -> bool:
 
 def compare_symbol(ch, rest_url: str, table: str, symbol: str, interval: str,
                    bars: int, price_tol: float, vol_tol: float,
-                   http_timeout: int) -> Dict[str, Any]:
+                   http_timeout: int, settle_lag: int = 1) -> Dict[str, Any]:
     iv_ms = parse_interval_to_ms(interval)
     now_ms = int(time.time() * 1000)
-    # Skip the bucket currently forming; compare the `bars` closed ones before it.
-    last_closed_open = ((now_ms // iv_ms) * iv_ms) - iv_ms
+    # Skip the bucket currently forming, AND `settle_lag` more closed ones after
+    # it: the newest closed bar can briefly read as missing/mismatched even on a
+    # perfectly healthy pipeline -- ClickHouse write latency (chwriter batches on
+    # flush_interval, ~1-2s) and Binance's own WS-close-vs-REST-kline settling
+    # (the REST /klines history can pick up a trade or two after the WS "x":true
+    # close frame) both resolve within a few seconds. Comparing hundreds of
+    # symbols one by one (see --symbol-delay) means `now` keeps advancing as the
+    # run progresses, so without this margin every run flags a rotating set of
+    # false positives on whatever was "newest" when each symbol was checked.
+    last_closed_open = ((now_ms // iv_ms) * iv_ms) - iv_ms - settle_lag * iv_ms
     start_ms = last_closed_open - (bars - 1) * iv_ms
     end_ms = last_closed_open + iv_ms  # exclusive upper bound
 
@@ -230,10 +252,19 @@ def main():
     p.add_argument("--symbol", help="Specific symbol (else a sample of the active universe)")
     p.add_argument("--limit-symbols", type=int, default=8, help="Symbols to sample when --symbol is omitted (default 8)")
     p.add_argument("--bars", type=int, default=48, help="Closed bars per (symbol,interval) to compare (default 48)")
+    p.add_argument("--settle-lag", type=int, default=1,
+                   help="Exclude this many of the newest closed bars from the comparison (default 1): "
+                        "ClickHouse write latency and Binance's own WS-vs-REST settling can make the "
+                        "very newest bar briefly read as missing/mismatched on an otherwise healthy "
+                        "pipeline. Set to 0 to compare right up to the edge (noisier).")
     p.add_argument("--price-tol", type=float, default=1e-9, help="Relative tolerance for OHLC (default 1e-9)")
     p.add_argument("--volume-tol", type=float, default=1e-6, help="Relative tolerance for volume fields (default 1e-6)")
     p.add_argument("--table-prefix", default="market.fapi_kline", help="ClickHouse table prefix")
     p.add_argument("--http-timeout", type=int, default=15, help="Binance REST timeout seconds")
+    p.add_argument("--symbol-delay", type=float, default=0.35,
+                   help="Seconds to sleep between symbols (default 0.35 -> ~2.9 req/s, "
+                        "stays under Binance's 2400 weight/min IP cap at weight=10/call). "
+                        "Only lower this for small --limit-symbols runs.")
     p.add_argument("--show-only-failures", action="store_true")
     p.add_argument("--ch-host"); p.add_argument("--ch-port", type=int)
     p.add_argument("--ch-db"); p.add_argument("--ch-user"); p.add_argument("--ch-password")
@@ -255,8 +286,10 @@ def main():
     else:
         symbols = fetch_active_symbols(config, ch_client=ch, limit=args.limit_symbols)
     intervals = [s.strip() for s in args.intervals.split(",") if s.strip()]
+    eta_s = len(symbols) * len(intervals) * args.symbol_delay
     print(f"Symbols: {len(symbols)} | Intervals: {intervals} | Bars/each: {args.bars} | "
-          f"tol price={args.price_tol:g} vol={args.volume_tol:g}\n")
+          f"tol price={args.price_tol:g} vol={args.volume_tol:g} | "
+          f"symbol-delay={args.symbol_delay}s (ETA ~{eta_s:.0f}s)\n")
 
     overall_ok = True
     for interval in intervals:
@@ -265,9 +298,11 @@ def main():
         headers = ["Symbol", "Checked", "Matched", "MissCH", "Px!=", "Vol!=", "Cnt!=", "Status", "Notes"]
         rows = []
         agg = {"PASS": 0, "WARN": 0, "FAIL": 0, "EMPTY": 0, "ERROR": 0}
-        for sym in symbols:
+        for i, sym in enumerate(symbols):
+            if i > 0 and args.symbol_delay > 0:
+                time.sleep(args.symbol_delay)
             r = compare_symbol(ch, rest_url, table, sym, interval, args.bars,
-                               args.price_tol, args.volume_tol, args.http_timeout)
+                               args.price_tol, args.volume_tol, args.http_timeout, args.settle_lag)
             agg[r["status"]] = agg.get(r["status"], 0) + 1
             if r["status"] in ("FAIL", "ERROR"):
                 overall_ok = False

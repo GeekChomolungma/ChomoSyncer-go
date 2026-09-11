@@ -118,6 +118,9 @@ For low-level implementation details of each module, data protocols, and operati
 - 📊 **[End-to-End Data Flow & Storage Structures (`docs/DATA_FLOW_AND_STRUCTURES.md`)](docs/DATA_FLOW_AND_STRUCTURES.md)**
   End-to-end data flow topology diagrams, the concurrency model of each workflow, example query commands against external storage (Redis / ClickHouse), returned JSON formats, and field-level business definitions.
 
+- 📥 **[Data Consumer Guide (`docs/DATA_CONSUMER_GUIDE.md`)](docs/DATA_CONSUMER_GUIDE.md)**
+  The short version for a downstream reader (e.g. a Python strategy/feature layer) that just needs to consume the data: what's in ClickHouse vs. Redis (`livebar` / closed-window `kline` / `kline_ready`), exact key/table and field layouts, and copy-paste Python snippets — no producer-side internals required.
+
 - 🛠️ **[Deployment, Operations, Failure Drills & Hands-On Testing Guide (`docs/OPERATIONS.md`)](docs/OPERATIONS.md)**
   A complete hands-on guide from environment requirements and capacity planning, to Prometheus alert-rule configuration, network-outage drills, and service failover/recovery.
 

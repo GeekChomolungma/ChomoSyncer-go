@@ -114,6 +114,9 @@ curl -i http://localhost:9090/readyz                           # 回补补完后
 - 📊 **[数据流转与存储结构业务全景 (`docs/DATA_FLOW_AND_STRUCTURES.md`)](docs/DATA_FLOW_AND_STRUCTURES.zh-CN.md)**
   端到端数据流拓扑图、各工作流并发模型、外部存储（Redis / ClickHouse）查询命令示例、返回 JSON 格式及各字段业务定义。
 
+- 📥 **[数据消费指南 (`docs/DATA_CONSUMER_GUIDE.md`)](docs/DATA_CONSUMER_GUIDE.zh-CN.md)**
+  给下游读数据的一方（比如 Python 策略/特征层）看的精简版：ClickHouse 和 Redis（`livebar` / 已收盘滑窗 `kline` / `kline_ready`）里分别有什么、准确的 key/表结构与字段布局、以及可以直接抄的 Python 代码片段——不用了解生产端内部实现。
+
 - 🛠️ **[部署运维、故障演练与实操测试手册 (`docs/OPERATIONS.md`)](docs/OPERATIONS.zh-CN.md)**
   从环境要求、容量规划、Prometheus 告警规则配置，到断网演练、服务熔断与恢复的完整实操指南。
 
