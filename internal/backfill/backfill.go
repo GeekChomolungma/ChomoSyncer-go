@@ -600,6 +600,7 @@ func rowToCompact(r chwriter.Row) rediswin.CompactBar {
 		QuoteVolume:         r.QuoteVolume,
 		TakerBuyVolume:      r.TakerBuyVolume,
 		TakerBuyQuoteVolume: r.TakerBuyQuoteVolume,
+		TradesCount:         int64(r.TradesCount),
 	}
 }
 

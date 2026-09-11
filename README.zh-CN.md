@@ -17,7 +17,7 @@
 | **1m 时序事实归档** | **ClickHouse**<br>`market.fapi_kline_1m` | ReplacingMergeTree 物理表<br>以 `(symbol, start_time)` 去重 | **全局权威事实账本**。唯一直接落库的原始表，保证绝对零缺口。 |
 | **派生周期归档** | **ClickHouse**<br>`market.fapi_kline_{5m,15m,1h,4h,1d}` | ReplacingMergeTree + 刷新式物化视图<br>由 `fapi_kline_1m FINAL` 重算聚合 | **多周期回测/特征库**。从 1m 幂等重算（`deploy/clickhouse/002_kline_rollups.sql`），永不累加、不会重复计数。 |
 | **实时未收盘快照** | **Redis Hash**<br>`livebar:{SYMBOL}:1m` | Hash 结构（11 字段）<br>`t, o, h, l, c, v, qv, tbv, tbqv, n, x` | **未收盘瞬态形态读取**。仅 1m。毫秒级刷新当前跳动的这根 K 线，带自动过期 TTL。 |
-| **已收盘滚动滑窗** | **Redis List**<br>`kline:{SYMBOL}:1m` | List 列表（定长 200 根）<br>9 元素紧凑 JSON 数组 (无 Key) | **策略特征极速计算缓存**。仅 1m，最近 200 根已闭合 Bar。更粗周期请直接查 ClickHouse rollup 表。 |
+| **已收盘滚动滑窗** | **Redis List**<br>`kline:{SYMBOL}:1m` | List 列表（定长 200 根）<br>10 元素紧凑 JSON 数组 (无 Key) | **策略特征极速计算缓存**。仅 1m，最近 200 根已闭合 Bar。更粗周期请直接查 ClickHouse rollup 表。 |
 | **截面就绪通知** | **Redis Stream**<br>`stream:market:kline_ready` | Stream 流事件<br>`interval, timestamp, symbols_count` | **跨币种截面策略同步触发器**。1m 截面到齐时发布；`serve_intervals` 中每个周期在其"桶末 1m 截面"就绪时派生转发一条（`interval` 标注为该粗周期）。 |
 
 ---

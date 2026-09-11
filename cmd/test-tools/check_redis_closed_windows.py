@@ -7,7 +7,7 @@ Inspects `kline:{SYMBOL}:{interval}` lists in Redis:
 2. Verifies head bar (index 0) freshness against the most recent closed boundary.
 3. Checks strict monotonic decreasing timestamp ordering (newest first).
 4. Verifies window continuity (no missing bars between adjacent elements in the list).
-5. Validates 9-element compact bar schema and price/volume bounds.
+5. Validates 10-element compact bar schema and price/volume bounds.
 """
 import os
 import sys
@@ -30,15 +30,16 @@ from common import (
 
 def validate_compact_bar(arr: Any) -> Tuple[bool, str]:
     """
-    Validates [t, o, h, l, c, v, qv, tbv, tbqv] compact bar array.
+    Validates [t, o, h, l, c, v, qv, tbv, tbqv, n] compact bar array.
     """
-    if not isinstance(arr, list) or len(arr) != 9:
-        return False, f"Expected 9 elements, got {len(arr) if isinstance(arr, list) else type(arr)}"
+    if not isinstance(arr, list) or len(arr) != 10:
+        return False, f"Expected 10 elements, got {len(arr) if isinstance(arr, list) else type(arr)}"
 
     try:
         t = int(arr[0])
         o, h, l, c = float(arr[1]), float(arr[2]), float(arr[3]), float(arr[4])
         v, qv, tbv, tbqv = float(arr[5]), float(arr[6]), float(arr[7]), float(arr[8])
+        n = int(arr[9])
     except Exception as e:
         return False, f"Number parse error: {e}"
 
@@ -54,6 +55,8 @@ def validate_compact_bar(arr: Any) -> Tuple[bool, str]:
         return False, f"Low ({l}) > min(Open, Close)"
     if v < 0 or qv < 0:
         return False, "Negative volume"
+    if n < 0:
+        return False, f"Negative trades_count {n}"
 
     return True, ""
 

@@ -227,7 +227,7 @@ Dispatcher 是全系统的数据中枢，承担三大核心业务：
       symbol   string               // 交易对大写
       interval string               // 周期
       openTime int64                // 毫秒时间戳 (k.t)
-      bar      rediswin.CompactBar  // 紧凑 9 元素数组，用于 Redis
+      bar      rediswin.CompactBar  // 紧凑 10 元素数组，用于 Redis
       row      chwriter.Row         // 列式行结构，用于 ClickHouse
       hasRow   bool                 // 是否成功解析出 Row
   }
@@ -370,11 +370,11 @@ for sym, raw_bars in zip(universe_symbols, batch_results):
 - **LRANGE 返回值形式**：字符串列表 `List[string]`，至多 200 个元素。
   - 索引 `0`：**最新**收盘的 K 线；
   - 索引 `199`：**最老**收盘的 K 线。
-- **单个 List 元素值结构**：为节省 60%+ 内存，**不使用带 Key 的 JSON 对象**，统一采用 **9 元素紧凑 JSON 数组**：
+- **单个 List 元素值结构**：为节省 60%+ 内存，**不使用带 Key 的 JSON 对象**，统一采用 **10 元素紧凑 JSON 数组**：
   ```json
-  [1719835200000, 60250.5, 60800.0, 60100.2, 60720.0, 12450.85, 75602300.5, 6120.4, 37150000.2]
+  [1719835200000, 60250.5, 60800.0, 60100.2, 60720.0, 12450.85, 75602300.5, 6120.4, 37150000.2, 1420]
   ```
-- **9 个数组位置的精确字段定义**：
+- **10 个数组位置的精确字段定义**：
 
 | 数组索引位置 | 字段名称 | 数据类型 | 示例取值 | 业务含义说明 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -387,6 +387,7 @@ for sym, raw_bars in zip(universe_symbols, batch_results):
 | `[6]` | `quote_volume` | `float64` | `75602300.5` | 成交总金额（Quote Volume，USDT） |
 | `[7]` | `taker_buy_volume` | `float64` | `6120.40` | Taker 主动买入成交量（用于计算 CVD） |
 | `[8]` | `taker_buy_quote_volume` | `float64` | `37150000.20` | Taker 主动买入成交金额（USDT） |
+| `[9]` | `trades_count` | `int64`（`k.n`） | `1420` | 该 bar 内成交笔数。新增此字段是为了让已收盘滑窗也带上 `livebar` 里 `n` 早就有的成交笔数信号——之前滑窗相对 ClickHouse 行缺 `end_time` 和 `trades_count` 两个字段，现在只缺 `end_time` 了。 |
 
 ---
 
@@ -609,7 +610,7 @@ redis-cli LINDEX kline:BTCUSDT:1m 199 # 检查最老 Bar 是否正确填充
 
 #### 3. 返回值形式与数据结构
 - **ClickHouse 查询返回**：执行 SQL `SELECT ... FINAL ORDER BY symbol ASC, start_time DESC LIMIT 200 BY symbol`，返回字段与 [7.1 节](#71-外部存储查询契约-clickhouse-query-contract) 完全一致。
-- **Redis 重建后的 List 返回**：返回 200 根排列好的 9 元素紧凑数组，与 [5.1 节](#51-外部存储查询契约-redis-query-contract) 完全一致。
+- **Redis 重建后的 List 返回**：返回 200 根排列好的 10 元素紧凑数组，与 [5.1 节](#51-外部存储查询契约-redis-query-contract) 完全一致。
 
 ---
 
@@ -701,7 +702,7 @@ curl -s localhost:9090/metrics | grep dispatcher_kline_ready_suppressed_total
 | **WebSocket 采集** | `collector.shard.run` | 多 Goroutine 分片 | 1. 周期；2. `crc32(SYM) % 4` 哈希分桶 | 内存 Dispatcher | Combined Stream: `<sym>@kline_<iv>` | 纯网络流/内部事件 |
 | **Dispatcher 路由分发** | `Dispatcher.HandleKlineEvent` | 多上游 + Worker Pool | 4 个 `ClosedWorkers` 竞争 Channel | 内存 Sinks | `closedJob` + 内存单调 Map (`sym\|iv`) | 纯内存/内部队列 |
 | **Redis Live Bar 快照** | `LiveBarWriter.TryEnqueue` | Worker Pool | 2 个 Worker 竞争 Channel | Redis (专用 Client) | `livebar:{SYM}:{iv}` (Hash, TTL=2x) | Redis Hash 字典 (`t`, `o`, `h`, `l`, `c`, `v`...) |
-| **Redis 收盘滑窗** | `Writer.PushBarAndTrim` | Dispatcher Workers | 由 Dispatcher 分发，经 Gate 仲裁 | Redis (主 Client) | `kline:{SYM}:{iv}` (List 200, Compact JSON) | Redis List（200 根 9 元素紧凑数组，最新在 0） |
+| **Redis 收盘滑窗** | `Writer.PushBarAndTrim` | Dispatcher Workers | 由 Dispatcher 分发，经 Gate 仲裁 | Redis (主 Client) | `kline:{SYM}:{iv}` (List 200, Compact JSON) | Redis List（200 根 10 元素紧凑数组，最新在 0） |
 | **全市场截面聚合** | `aggregator.mark` | Dispatcher Workers | 内存 Mutex + Section 定时器 | Redis Stream | `stream:market:kline_ready` | Redis Stream Entry (`interval`, `timestamp`, `count`) |
 | **ClickHouse 批量归档** | `BatchWriter.loop` | 单 Goroutine / Interval | 每个 Interval 拥有独立 BatchWriter | ClickHouse | `market.fapi_kline_<iv>` (ReplacingMergeTree) | 列式/行式表格结果（12 列 Raw Fact 数据） |
 | **历史 Gapfill 回补** | `Backfiller.run` | 主 Loop + Worker Pool | 主 Loop 串行；Worker Pool 按 Symbol 并发 (4 workers) | CH + Redis | REST `/fapi/v1/klines` + Lua DEL/RPUSH | CH FINAL 表格 + Redis 覆盖后 200 根 List |

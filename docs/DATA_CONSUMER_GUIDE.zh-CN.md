@@ -164,7 +164,7 @@ live = {
 - **Key**：`kline:{SYMBOL}:1m`，币种大写
 - **类型**：Redis `List`，固定长度 200
 - **顺序**：**从新到旧**——index `0` 是最新收盘的那根，index `199` 是最老的。
-- **元素格式**：紧凑、**不带 key** 的 9 元素 JSON 数组（不是对象——省内存也省 Python 解析开销）：
+- **元素格式**：紧凑、**不带 key** 的 10 元素 JSON 数组（不是对象——省内存也省 Python 解析开销）：
 
 | 数组下标 | 字段 | 类型 |
 | :--- | :--- | :--- |
@@ -177,6 +177,7 @@ live = {
 | `[6]` | `quote_volume` | `float` |
 | `[7]` | `taker_buy_volume` | `float` |
 | `[8]` | `taker_buy_quote_volume` | `float` |
+| `[9]` | `trades_count` | `int` |
 
 ```python
 import redis, json
@@ -187,6 +188,7 @@ r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
 raw_bars = r.lrange("kline:BTCUSDT:1m", 0, 199)      # 从新到旧
 bars = [json.loads(b) for b in raw_bars]
 latest_close = bars[0][4]
+latest_trades = bars[0][9]
 
 # 全市场，一个网络往返拿全（推荐用法）
 universe = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]           # 你自己的 universe 来源
@@ -199,6 +201,20 @@ market = {sym: [json.loads(b) for b in raw] for sym, raw in zip(universe, batch)
 ```
 
 刚冷启动的币种（新上市，或者服务刚从一次长时间断线里恢复）滑窗可能暂时不满 200 根——用之前先 `len(bars)` 确认一下，别默认它是满的。
+
+**这跟 ClickHouse 是怎么对上的**：这个数组、`livebar` 的 Hash、还有 ClickHouse 那一行，全部来自**同一个**解析结果（`dispatcher.KlineEvent.toCompactBar` / `.toLiveBar` / `.toRow` 各转一次，不存在各自重新解析——所以只要某个字段在不止一处出现，值必然完全一致）。但**字段集合不是完全一样的**——ClickHouse 是超集：
+
+| 字段 | ClickHouse 行 | 这个数组 | `livebar` Hash |
+| :--- | :---: | :---: | :---: |
+| `start_time` | ✅ | ✅ `[0]` | ✅ `t` |
+| `end_time` | ✅ | ❌ | ❌ |
+| OHLC | ✅ | ✅ `[1..4]` | ✅ `o/h/l/c` |
+| `volume` / `quote_volume` | ✅ | ✅ `[5..6]` | ✅ `v/qv` |
+| `taker_buy_volume` / `_quote_volume` | ✅ | ✅ `[7..8]` | ✅ `tbv/tbqv` |
+| `trades_count` | ✅ | ✅ `[9]` | ✅ `n` |
+| 收盘标志位 | 不适用（CH 只存已收盘的） | 不适用 | ✅ `x` |
+
+ClickHouse 有、两边 Redis 结构都没有的列只剩 `end_time` 一个——故意不带，因为对齐/去重全靠 `start_time` 一个键就够，用不上它。真要 `end_time`，去查 ClickHouse。
 
 ---
 
@@ -214,6 +230,13 @@ market = {sym: [json.loads(b) for b in raw] for sym, raw in zip(universe, batch)
 | `interval` | `string` | 刚收盘的周期：`"1m"`（原生发布，每分钟一条）或 `serve_intervals` 里的更粗周期（`"5m"`、`"15m"`、`"1h"`、`"4h"`、`"1d"`——在其对应的 1m 截面就绪时派生转发一条）。 |
 | `timestamp` | `int64`（字符串形式） | 该截面的开盘时间，epoch 毫秒 UTC——和该 bar 的 `start_time` / 数组 `[0]` / Hash `t` 是同一个值。 |
 | `symbols_count` | `int`（字符串形式） | 这个截面实际到齐了多少个币种。可以拿自己的 universe 大小来对比，评估齐备率。 |
+
+**派生的粗周期事件到底是怎么产生的**——只有你会消费 `"1m"` 以外的事件才需要看这段，但很容易理解错，所以专门讲清楚：
+
+1. 聚合器只按 `1m` 粒度追踪到齐情况。某个 `1m` 截面收齐（或超时）时，先发基准的 `interval="1m"` 事件。
+2. **只有这个基准事件真的发出去了**（没被下面讲的 gate 压住），才会去检查每个配置的粗周期：这根 `1m` bar 的收盘时刻，是不是恰好也是那个粗周期自己桶的边界（`(开盘时间 + 60_000) % 该周期毫秒数 == 0`）。命中的每一个，都会单独发一条 `interval` 标成对应粗周期的 `kline_ready`。
+3. **粗周期事件上的 `symbols_count` 不是独立算出来的**——是直接沿用触发它的那个 `1m` 截面的数值。一条 `"1h"` 事件的 `symbols_count`，反映的是"这一小时最后一分钟有多少币种到齐"，不是"这一小时里有多少币种凑出了完整的 1h bar"。实际中这两个数通常一样，但要当成一个代理值，不是精确的粗周期覆盖率——真要精确的，自己数:`SELECT count() FROM market.fapi_kline_1h FINAL WHERE start_time = <bucket_start>`。
+4. 第 2 步带来一个直接后果：如果某根 `1m` 的基准事件被压住了，**这根 bar 本该触发的所有粗周期事件也会跟着一起被跳过**——被压住的那一分钟如果刚好也是整点，那这一小时的 `kline_ready` 也不会发了，不只是这一分钟的。
 
 ```python
 import redis

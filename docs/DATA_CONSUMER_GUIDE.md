@@ -164,7 +164,7 @@ The last 200 **already-closed** 1m bars, kept in strict order for fast market-wi
 - **Key**: `kline:{SYMBOL}:1m`, symbol uppercase
 - **Type**: Redis `List`, fixed length 200
 - **Order**: **newest first** — index `0` is the most recently closed bar, index `199` is the oldest.
-- **Element format**: a compact, *keyless* 9-element JSON array (not an object — saves memory and Python parse time):
+- **Element format**: a compact, *keyless* 10-element JSON array (not an object — saves memory and Python parse time):
 
 | Array index | Field | Type |
 | :--- | :--- | :--- |
@@ -177,6 +177,7 @@ The last 200 **already-closed** 1m bars, kept in strict order for fast market-wi
 | `[6]` | `quote_volume` | `float` |
 | `[7]` | `taker_buy_volume` | `float` |
 | `[8]` | `taker_buy_quote_volume` | `float` |
+| `[9]` | `trades_count` | `int` |
 
 ```python
 import redis, json
@@ -187,6 +188,7 @@ r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
 raw_bars = r.lrange("kline:BTCUSDT:1m", 0, 199)      # newest -> oldest
 bars = [json.loads(b) for b in raw_bars]
 latest_close = bars[0][4]
+latest_trades = bars[0][9]
 
 # Whole market, one network round trip (the recommended pattern)
 universe = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]           # get this from your own universe source
@@ -199,6 +201,20 @@ market = {sym: [json.loads(b) for b in raw] for sym, raw in zip(universe, batch)
 ```
 
 A symbol that just cold-started (new listing, or the service just came back from a long outage) may briefly have fewer than 200 entries — check `len(bars)` before assuming a full window.
+
+**How this lines up with ClickHouse**: this array, `livebar`'s hash, and the ClickHouse row are all built from the exact same decoded event (`dispatcher.KlineEvent.toCompactBar` / `.toLiveBar` / `.toRow` each parse it once — no independent re-parsing, so values that appear in more than one place are guaranteed identical). But the *field sets* aren't identical — ClickHouse is the superset:
+
+| Field | ClickHouse row | This array | `livebar` hash |
+| :--- | :---: | :---: | :---: |
+| `start_time` | ✅ | ✅ `[0]` | ✅ `t` |
+| `end_time` | ✅ | ❌ | ❌ |
+| OHLC | ✅ | ✅ `[1..4]` | ✅ `o/h/l/c` |
+| `volume` / `quote_volume` | ✅ | ✅ `[5..6]` | ✅ `v/qv` |
+| `taker_buy_volume` / `_quote_volume` | ✅ | ✅ `[7..8]` | ✅ `tbv/tbqv` |
+| `trades_count` | ✅ | ✅ `[9]` | ✅ `n` |
+| is-final flag | n/a (CH only ever stores closed bars) | n/a | ✅ `x` |
+
+The only column ClickHouse has that neither Redis structure carries is `end_time` — it's omitted on purpose (nothing needs it to align or dedupe a bar; `start_time` is the sole key everywhere). If you need `end_time`, go to ClickHouse.
 
 ---
 
@@ -214,6 +230,13 @@ A single Redis Stream that announces "every symbol's bar for this period just cl
 | `interval` | `string` | Which interval just closed: `"1m"` (published natively, every minute) or a coarser one from `serve_intervals` (`"5m"`, `"15m"`, `"1h"`, `"4h"`, `"1d"` — derived and forwarded once that coarser bucket's underlying 1m cross-section is ready). |
 | `timestamp` | `int64` (as string) | The closed bar's open time, epoch ms UTC — same value as `start_time`/array `[0]`/hash `t` for that bar. |
 | `symbols_count` | `int` (as string) | How many symbols actually landed in this cross-section. Compare against your own universe size to gauge coverage. |
+
+**How the derived (coarser-interval) events are actually produced** — this only matters if you consume anything other than `"1m"` off this stream, but it's easy to misread, so spelled out:
+
+1. The aggregator tracks arrivals purely at `1m` granularity. When a `1m` cross-section completes (or times out), it publishes the base `interval="1m"` event first.
+2. **Only if that base publish actually went out** (i.e. it wasn't suppressed — see the gate warning below) does it check every configured coarser interval for whether *this* `1m` bar's close lines up with *that* interval's own bucket boundary (`(open_time + 60_000) % interval_ms == 0`). Each one that lines up gets its own, separate `kline_ready` entry with `interval` set accordingly.
+3. **`symbols_count` on a derived event is not independently computed for that coarser bucket** — it's carried over verbatim from the `1m` section that triggered it. A `"1h"` event's `symbols_count` tells you how many symbols reported in the *last minute* of that hour, not how many symbols have a complete `1h` bar. In practice these numbers usually match, but treat it as a proxy, not an exact coarser-interval coverage count — if you need the real thing, count rows yourself: `SELECT count() FROM market.fapi_kline_1h FINAL WHERE start_time = <bucket_start>`.
+4. A direct consequence of step 2: if the base `1m` publish for a bar is suppressed, **every derived interval that bar would have closed is silently skipped too** — a suppressed `1m` minute that happens to also be an hour boundary means that hour's `kline_ready` never fires either, not just the minute's.
 
 ```python
 import redis

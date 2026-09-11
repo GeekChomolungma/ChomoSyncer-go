@@ -19,6 +19,7 @@ func sampleBar() CompactBar {
 		QuoteVolume:         75602300.5,
 		TakerBuyVolume:      6120.40,
 		TakerBuyQuoteVolume: 37150000.2,
+		TradesCount:         1420,
 	}
 }
 
@@ -54,6 +55,7 @@ func TestCompactBarMarshalMatchesStdlib(t *testing.T) {
 	std, err := json.Marshal([compactBarLen]any{
 		b.StartTime, b.Open, b.High, b.Low, b.Close,
 		b.Volume, b.QuoteVolume, b.TakerBuyVolume, b.TakerBuyQuoteVolume,
+		b.TradesCount,
 	})
 	if err != nil {
 		t.Fatalf("json.Marshal: %v", err)
@@ -76,6 +78,7 @@ func TestCompactBarRoundTrip(t *testing.T) {
 	want := [compactBarLen]float64{
 		float64(b.StartTime), b.Open, b.High, b.Low, b.Close,
 		b.Volume, b.QuoteVolume, b.TakerBuyVolume, b.TakerBuyQuoteVolume,
+		float64(b.TradesCount),
 	}
 	if got != want {
 		t.Fatalf("round trip mismatch:\n got %v\nwant %v", got, want)
@@ -88,6 +91,7 @@ func TestNewCompactBar(t *testing.T) {
 		"60250.5", "60800.0", "60100.2", "60720.0",
 		"12450.85", "75602300.5",
 		"6120.40", "37150000.2",
+		1420,
 	)
 	if err != nil {
 		t.Fatalf("NewCompactBar: %v", err)
@@ -98,7 +102,7 @@ func TestNewCompactBar(t *testing.T) {
 }
 
 func TestNewCompactBarBadNumber(t *testing.T) {
-	_, err := NewCompactBar(1, "1", "not-a-number", "1", "1", "1", "1", "1", "1")
+	_, err := NewCompactBar(1, "1", "not-a-number", "1", "1", "1", "1", "1", "1", 9)
 	if err == nil {
 		t.Fatal("expected parse error for malformed high price")
 	}

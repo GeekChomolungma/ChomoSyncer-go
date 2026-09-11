@@ -343,7 +343,7 @@ To verify high availability, the following drills are recommended in a test envi
 
 ### 7.2 Redis Resources and Policy
 - **Memory footprint**:
-  - Each closed sliding window is approximately 200 bars × 9 elements ≈ 30 KB;
+  - Each closed sliding window is approximately 200 bars × 10 elements ≈ 33 KB;
   - 400 symbols × 2 periods (1m, 1h) ≈ 25 MB;
   - Live Bar snapshots for 400 symbols × 2 periods ≈ 2 MB;
   - Total steady-state Redis memory usage is typically under **100 MB**.
