@@ -32,6 +32,25 @@
 --   `start_time` stays unambiguous); the outer query only renames it to
 --   `start_time` for the target-table match.
 --
+-- LOOKBACK MUST BE BUCKET-ALIGNED AND UTC-ANCHORED
+--   Each refresh recomputes only 1m rows newer than a lookback bound. If that bound
+--   falls in the MIDDLE of a bucket, the oldest bucket is aggregated from a partial
+--   slice and — stamped with the newest rollup_version — REPLACES the correct row;
+--   as the bound slides forward, every bucket it passes ends up holding only its
+--   last few minutes. So every WHERE below snaps the bound down to a bucket start:
+--       start_time >= toStartOfInterval(toTimeZone(now(), 'UTC') - INTERVAL 3 DAY, INTERVAL 1 HOUR)
+--   The toTimeZone(now(), 'UTC') anchor matters: now() carries the SERVER timezone,
+--   and toStartOfInterval(.., INTERVAL 1 DAY) would snap to the server's local
+--   midnight (Asia/Shanghai = 16:00 UTC), cutting a UTC day bucket in half.
+--   Older versions of this file used a raw `now() - INTERVAL 3 DAY` and corrupted
+--   rollup rows outside the lookback window; repair with
+--   deploy/clickhouse-fixes/001_fix_kline_rollup_lookback.sh.
+--
+-- REBUILD, NOT MIGRATE: this file is a full rebuild of the rollup layer. Re-running
+-- it drops and recreates all derived tables empty (fapi_kline_1m is untouched), so
+-- it must always be followed by 003. That is deliberate: a rollup layer that is
+-- wrong is cheaper to recompute from 1m than to patch.
+--
 -- NOT auto-run by docker-compose (only 001 is). Apply it by hand — see below.
 --
 -- APPLY ORDER (two-phase cold start — see docs/OPERATIONS.md §A.1 / §B.1)
@@ -62,10 +81,27 @@
 
 SET allow_experimental_refreshable_materialized_view = 1;
 
--- Drop the legacy physical 1h table from older 001_fapi_kline.sql, if present,
--- so the rollup table below can take its place. (No-op on fresh installs.)
+-- >>> REBUILD-DROPS (start)
+-- REBUILD SEMANTICS: applying this file DROPS every derived rollup view and table
+-- (5m / 15m / 1h / 4h / 1d) and recreates them EMPTY. fapi_kline_1m is never
+-- touched. Run 003_rollup_backfill.sql afterwards to refill the history.
+-- Views go first (they write into the tables); this also covers the legacy
+-- physical 1h table of older 001_fapi_kline.sql. On a fresh install every
+-- statement is a no-op.
+-- (deploy/clickhouse-fixes/001_fix_kline_rollup_lookback.sh strips exactly this
+-- block, between the two REBUILD-DROPS markers, for its partial-range mode —
+-- keep the markers.)
+DROP VIEW  IF EXISTS market.fapi_kline_5m_rmv;
+DROP VIEW  IF EXISTS market.fapi_kline_15m_rmv;
 DROP VIEW  IF EXISTS market.fapi_kline_1h_rmv;
+DROP VIEW  IF EXISTS market.fapi_kline_4h_rmv;
+DROP VIEW  IF EXISTS market.fapi_kline_1d_rmv;
+DROP TABLE IF EXISTS market.fapi_kline_5m;
+DROP TABLE IF EXISTS market.fapi_kline_15m;
 DROP TABLE IF EXISTS market.fapi_kline_1h;
+DROP TABLE IF EXISTS market.fapi_kline_4h;
+DROP TABLE IF EXISTS market.fapi_kline_1d;
+-- <<< REBUILD-DROPS (end)
 
 -- ---------------------------------------------------------------------------
 -- 5m
@@ -117,7 +153,7 @@ FROM
         toUInt32(sum(trades_count))                       AS trades_count,
         now64(3)                                          AS rollup_version
     FROM market.fapi_kline_1m FINAL
-    WHERE start_time >= now() - INTERVAL 3 DAY
+    WHERE start_time >= toStartOfInterval(toTimeZone(now(), 'UTC') - INTERVAL 3 DAY, INTERVAL 5 MINUTE)
     GROUP BY symbol, bucket_start
 );
 
@@ -171,7 +207,7 @@ FROM
         toUInt32(sum(trades_count))                       AS trades_count,
         now64(3)                                          AS rollup_version
     FROM market.fapi_kline_1m FINAL
-    WHERE start_time >= now() - INTERVAL 3 DAY
+    WHERE start_time >= toStartOfInterval(toTimeZone(now(), 'UTC') - INTERVAL 3 DAY, INTERVAL 15 MINUTE)
     GROUP BY symbol, bucket_start
 );
 
@@ -225,7 +261,7 @@ FROM
         toUInt32(sum(trades_count))                       AS trades_count,
         now64(3)                                          AS rollup_version
     FROM market.fapi_kline_1m FINAL
-    WHERE start_time >= now() - INTERVAL 3 DAY
+    WHERE start_time >= toStartOfInterval(toTimeZone(now(), 'UTC') - INTERVAL 3 DAY, INTERVAL 1 HOUR)
     GROUP BY symbol, bucket_start
 );
 
@@ -279,7 +315,7 @@ FROM
         toUInt32(sum(trades_count))                       AS trades_count,
         now64(3)                                          AS rollup_version
     FROM market.fapi_kline_1m FINAL
-    WHERE start_time >= now() - INTERVAL 7 DAY
+    WHERE start_time >= toStartOfInterval(toTimeZone(now(), 'UTC') - INTERVAL 7 DAY, INTERVAL 4 HOUR)
     GROUP BY symbol, bucket_start
 );
 
@@ -333,7 +369,7 @@ FROM
         toUInt32(sum(trades_count))                       AS trades_count,
         now64(3)                                          AS rollup_version
     FROM market.fapi_kline_1m FINAL
-    WHERE start_time >= now() - INTERVAL 10 DAY
+    WHERE start_time >= toStartOfInterval(toTimeZone(now(), 'UTC') - INTERVAL 10 DAY, INTERVAL 1 DAY)
     GROUP BY symbol, bucket_start
 );
 
@@ -342,7 +378,8 @@ FROM
 --   * the table name          fapi_kline_<IV>
 --   * the MV name             fapi_kline_<IV>_rmv
 --   * both INTERVAL <N UNIT>  expressions in the inner query (they must match)
---   * the REFRESH EVERY / WHERE lookback (>= a few target buckets wide)
+--   * the REFRESH EVERY / WHERE lookback (>= a few target buckets wide, and keep the
+--     bound snapped to a bucket start in UTC as shown above)
 -- Then add "<IV>" to collector.serve_intervals (so the derived kline_ready
 -- fires) and to 003_rollup_backfill.sql (for the historical fold).
 -- Only Xs/Xm/Xh multiples of 1m, or 1d, are supported — see config.Validate.

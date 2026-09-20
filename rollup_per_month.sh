@@ -1,5 +1,5 @@
 m="2000-01-01"
-while [ "$m" \< "2026-10-01" ]; do
+while [ "$m" \< "2029-10-01" ]; do
   nxt=$(date -u -d "$m +1 month" +%F)
   echo ">>> $m .. $nxt"
   clickhouse-client --host 127.0.0.1 --port 9000 --user default --password alex \
