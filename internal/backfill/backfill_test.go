@@ -401,8 +401,14 @@ func TestColdStartWithInitialDate(t *testing.T) {
 }
 
 func TestGapDebounce(t *testing.T) {
+	// The backfiller goroutine reads the clock while the test advances it, so guard it.
+	var clockMu sync.Mutex
 	now := fixedNow
-	h := newHarness(t, Config{Clock: func() time.Time { return now }, GapDebounce: time.Minute})
+	h := newHarness(t, Config{Clock: func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return now
+	}, GapDebounce: time.Minute})
 
 	ev := GapEvent{ShardID: "s0", Streams: []string{"ethusdt@kline_1m"}, LastMsgAt: fixedNow.Add(-2 * time.Hour), ReconnectAt: fixedNow}
 	h.b.HandleGap(ev)
@@ -413,7 +419,9 @@ func TestGapDebounce(t *testing.T) {
 		t.Fatalf("fetch calls = %d, want 1 (second gap debounced)", h.fetch.callCount())
 	}
 
+	clockMu.Lock()
 	now = now.Add(2 * time.Minute) // past debounce
+	clockMu.Unlock()
 	h.b.HandleGap(ev)
 	eventually(t, 2*time.Second, func() bool { return h.fetch.callCount() == 2 })
 }

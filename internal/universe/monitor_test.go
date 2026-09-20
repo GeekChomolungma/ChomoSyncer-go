@@ -11,6 +11,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/HarvestStars/chomosyncer-go/internal/weightgate"
 )
 
 const exchangeInfoJSON = `{"symbols":[
@@ -225,4 +227,93 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// promValue returns the value of the (counter or gauge) series in reg with the
+// given name and label pairs (k1, v1, k2, v2, ...).
+func promValue(t *testing.T, reg *prometheus.Registry, name string, labels ...string) float64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+	metric:
+		for _, m := range mf.GetMetric() {
+			for i := 0; i+1 < len(labels); i += 2 {
+				found := false
+				for _, lp := range m.GetLabel() {
+					if lp.GetName() == labels[i] && lp.GetValue() == labels[i+1] {
+						found = true
+					}
+				}
+				if !found {
+					continue metric
+				}
+			}
+			if m.GetCounter() != nil {
+				return m.GetCounter().GetValue()
+			}
+			return m.GetGauge().GetValue()
+		}
+	}
+	t.Fatalf("metric %s%v not found", name, labels)
+	return 0
+}
+
+func TestRefreshGoesThroughWeightGate(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-MBX-USED-WEIGHT-1M", "7")
+		_, _ = w.Write([]byte(exchangeInfoJSON))
+	}))
+	defer srv.Close()
+
+	gateReg := prometheus.NewRegistry()
+	m := New(Config{
+		BaseURL: srv.URL, HTTPClient: srv.Client(), Registerer: prometheus.NewRegistry(),
+		Gate: weightgate.New(weightgate.Config{Registerer: gateReg}),
+	})
+	if _, err := m.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if v := promValue(t, gateReg, "weightgate_weight_acquired_total", "class", "misc"); v != 1 {
+		t.Fatalf("acquired{misc} = %v, want 1 (exchangeInfo has weight 1)", v)
+	}
+	if v := promValue(t, gateReg, "weightgate_used_weight_1m"); v != 7 {
+		t.Fatalf("weightgate_used_weight_1m = %v, want 7 (from the response header)", v)
+	}
+}
+
+func TestRefresh429PausesGate(t *testing.T) {
+	var reqs atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reqs.Add(1)
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	// fixed clock + a sleep that only ends with the ctx: any wait shows up as a ctx error
+	fixed := time.Date(2026, 9, 21, 12, 0, 20, 0, time.UTC)
+	gate := weightgate.New(weightgate.Config{
+		Registerer: prometheus.NewRegistry(),
+		Clock:      func() time.Time { return fixed },
+		Sleep:      func(ctx context.Context, _ time.Duration) error { <-ctx.Done(); return ctx.Err() },
+	})
+	m := New(Config{BaseURL: srv.URL, HTTPClient: srv.Client(), Registerer: prometheus.NewRegistry(), Gate: gate})
+
+	if _, err := m.Refresh(context.Background()); err == nil {
+		t.Fatal("expected an error on 429")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	if _, err := m.Refresh(ctx); err == nil {
+		t.Fatal("second refresh should be held at the paused gate")
+	}
+	if reqs.Load() != 1 {
+		t.Fatalf("server saw %d requests, want 1", reqs.Load())
+	}
 }

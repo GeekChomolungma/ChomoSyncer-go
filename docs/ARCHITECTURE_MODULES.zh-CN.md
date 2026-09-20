@@ -213,7 +213,15 @@
   4. 释放门控，被挂起的实时更新无缝恢复写入。
 
 ### 8.4 REST 频控保护 (`BinanceFetcher`)
-- 采用 Token Bucket 令牌桶限流算法（参数 `rest_rps`，默认 20 RPS）；
+- 每个请求先经过按请求速率的令牌桶（参数 `rest_rps`，默认 20 RPS），再经过**共享的 `/fapi` 权重闸门**（`internal/weightgate`，配置段 `weight_gate`），见下；
+- **单次请求的 `limit` 按缺口长度取值**（`pageLimitFor`）：币安按请求里的 `limit` 参数而不是返回条数来计 `/fapi/v1/klines` 的权重（实测：`limit` 100 → 权重 1，500 → 2，1000 → 5，1500 → 10），所以 3 分钟的缺口现在只花权重 1，而不是 10；
+- 收到 429 / 418 时调用闸门的 `PauseFor(Retry-After)`，暂停的是**所有** `/fapi` 调用方，而不只是遇到错误的那个 worker。
+
+**共享的 `/fapi` 权重闸门（`internal/weightgate`）。** `/fapi` 的限额（每分钟 2400 权重）按 IP 计，所以所有 `/fapi` REST 调用方——K 线回补（`bulk`）、universe 的 `exchangeInfo`（`misc`），以及之后的 OI 快照（`live`）——都在同一个进程级闸门前排队：
+- 每个类别有自己的每分钟权重预算（默认 live 600 / bulk 1200 / misc 100，合计 1900，其余留给闸门看不到的流量），所以批量回补永远不会饿死时间敏感的 `live` 请求；
+- 每个响应都会把 `X-MBX-USED-WEIGHT-1M` 报给闸门（导出为 `weightgate_used_weight_1m`）；最近一次读数 ≥ `soft_limit`（默认 1800）时批量调用方等到这一分钟结束，≥ `hard_limit`（默认 2300）时 live/misc 也等——这一条覆盖同 IP 上其他进程的流量；
+- 其他指标：`weightgate_weight_acquired_total{class}`、`weightgate_wait_seconds{class}`、`weightgate_backpressure_waits_total{class}`、`weightgate_pauses_total`、`weightgate_paused_until_timestamp_seconds`。
+- `/futures/data/*`（OI 历史、多空比）是另一个额度池（每 IP 每 5 分钟 1000 次），不经过这个闸门。
 - 分页拉取（币安单次最大 1500 根），自适应重试网络抖动，杜绝触发交易所 429 / 418 IP 封禁。
 
 ### 8.5 离线回补模式 (`backfill.offline_only`)

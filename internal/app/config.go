@@ -204,6 +204,22 @@ func (c Config) withDefaults() Config {
 		c.Backfill.FlushWait = def.Backfill.FlushWait
 	}
 
+	if c.WeightGate.LiveBudget <= 0 {
+		c.WeightGate.LiveBudget = def.WeightGate.LiveBudget
+	}
+	if c.WeightGate.BulkBudget <= 0 {
+		c.WeightGate.BulkBudget = def.WeightGate.BulkBudget
+	}
+	if c.WeightGate.MiscBudget <= 0 {
+		c.WeightGate.MiscBudget = def.WeightGate.MiscBudget
+	}
+	if c.WeightGate.SoftLimit <= 0 {
+		c.WeightGate.SoftLimit = def.WeightGate.SoftLimit
+	}
+	if c.WeightGate.HardLimit <= 0 {
+		c.WeightGate.HardLimit = def.WeightGate.HardLimit
+	}
+
 	if c.App.MetricsAddr == "" {
 		c.App.MetricsAddr = def.App.MetricsAddr
 	}

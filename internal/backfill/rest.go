@@ -13,6 +13,7 @@ import (
 	"github.com/bytedance/sonic"
 
 	"github.com/HarvestStars/chomosyncer-go/internal/chwriter"
+	"github.com/HarvestStars/chomosyncer-go/internal/weightgate"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"golang.org/x/time/rate"
@@ -27,7 +28,13 @@ type FetcherConfig struct {
 	Registerer  prometheus.Registerer
 	Logger      *slog.Logger
 	Clock       func() time.Time
-	MaxPageSpan int // /klines limit param, default 1500
+	MaxPageSpan int // upper bound of the /klines limit param, default 1500
+
+	// Gate is the shared /fapi request-weight gate. Every page waits at it (as
+	// weightgate.ClassBulk) before being sent and reports the response's
+	// X-MBX-USED-WEIGHT-1M back. nil = a private gate with default budgets, so a
+	// fetcher built without one (tests) is still weight-aware, just not shared.
+	Gate *weightgate.Gate
 }
 
 // BinanceFetcher pulls closed klines from GET /fapi/v1/klines, rate-limited,
@@ -35,12 +42,12 @@ type FetcherConfig struct {
 type BinanceFetcher struct {
 	base    string
 	http    *http.Client
-	lim     *rate.Limiter
+	lim     *rate.Limiter // request-rate cap; the weight budget is enforced by gate
+	gate    *weightgate.Gate
 	pageLim int
 	now     func() time.Time
 	log     *slog.Logger
 
-	weight  prometheus.Gauge
 	httpErr *prometheus.CounterVec // {code}
 }
 
@@ -78,18 +85,19 @@ func NewBinanceFetcher(cfg FetcherConfig) *BinanceFetcher {
 	if reg == nil {
 		reg = prometheus.NewRegistry()
 	}
+	gate := cfg.Gate
+	if gate == nil {
+		gate = weightgate.New(weightgate.Config{Registerer: reg, Logger: log})
+	}
 	f := promauto.With(reg)
 	return &BinanceFetcher{
 		base:    base,
 		http:    hc,
 		lim:     rate.NewLimiter(rate.Limit(rps), burst),
+		gate:    gate,
 		pageLim: pageLim,
 		now:     nowFn,
 		log:     log.With("component", "backfill_rest"),
-		weight: f.NewGauge(prometheus.GaugeOpts{
-			Name: "backfill_rest_weight_used",
-			Help: "Most recent X-MBX-USED-WEIGHT-1M response header value.",
-		}),
 		httpErr: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "backfill_rest_http_errors_total",
 			Help: "Binance REST errors by HTTP status (429 rate-limit, 418 ban, 5xx, other).",
@@ -107,7 +115,8 @@ func (f *BinanceFetcher) FetchStream(ctx context.Context, symbol, interval strin
 
 	cursor := sinceMs
 	for cursor < untilMs {
-		rows, lastOpen, err := f.page(ctx, symbol, interval, cursor, untilMs)
+		limit := f.pageLimitFor(interval, cursor, untilMs)
+		rows, lastOpen, err := f.page(ctx, symbol, interval, cursor, untilMs, limit)
 		if err != nil {
 			return err
 		}
@@ -136,8 +145,8 @@ func (f *BinanceFetcher) FetchStream(ctx context.Context, symbol, interval strin
 			break
 		}
 		cursor = next
-		if len(rows) < f.pageLim {
-			break // last page
+		if len(rows) < limit {
+			break // last page: the exchange had fewer bars than we allowed for
 		}
 	}
 	return nil
@@ -164,8 +173,13 @@ type rawKline struct {
 	trades              int64
 }
 
-func (f *BinanceFetcher) page(ctx context.Context, symbol, interval string, startMs, endMs int64) ([]rawKline, int64, error) {
+func (f *BinanceFetcher) page(ctx context.Context, symbol, interval string, startMs, endMs int64, limit int) ([]rawKline, int64, error) {
 	if err := f.lim.Wait(ctx); err != nil {
+		return nil, 0, err
+	}
+	// Admission against the shared /fapi weight pool. The weight is fixed by the
+	// `limit` we send, not by how many bars come back.
+	if err := f.gate.Wait(ctx, weightgate.ClassBulk, klineWeight(limit)); err != nil {
 		return nil, 0, err
 	}
 	q := url.Values{}
@@ -173,7 +187,7 @@ func (f *BinanceFetcher) page(ctx context.Context, symbol, interval string, star
 	q.Set("interval", interval)
 	q.Set("startTime", strconv.FormatInt(startMs, 10))
 	q.Set("endTime", strconv.FormatInt(endMs, 10))
-	q.Set("limit", strconv.Itoa(f.pageLim))
+	q.Set("limit", strconv.Itoa(limit))
 	u := f.base + "/fapi/v1/klines?" + q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -187,21 +201,17 @@ func (f *BinanceFetcher) page(ctx context.Context, symbol, interval string, star
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 
-	if w := resp.Header.Get("X-MBX-USED-WEIGHT-1M"); w != "" {
-		if v, e := strconv.ParseFloat(w, 64); e == nil {
-			f.weight.Set(v)
-		}
-	}
+	f.gate.ObserveHeader(resp.Header)
 
 	switch {
 	case resp.StatusCode == http.StatusOK:
 	case resp.StatusCode == http.StatusTooManyRequests:
 		f.httpErr.WithLabelValues("429").Inc()
-		f.backoff(ctx, resp.Header.Get("Retry-After"), 5*time.Second)
+		f.gate.PauseFor(weightgate.RetryAfter(resp.Header, 5*time.Second))
 		return nil, 0, fmt.Errorf("binance 429 rate limited: %.120s", body)
 	case resp.StatusCode == http.StatusTeapot: // 418 IP ban
 		f.httpErr.WithLabelValues("418").Inc()
-		f.backoff(ctx, resp.Header.Get("Retry-After"), 60*time.Second)
+		f.gate.PauseFor(weightgate.RetryAfter(resp.Header, 60*time.Second))
 		return nil, 0, fmt.Errorf("binance 418 banned: %.120s", body)
 	case resp.StatusCode >= 500:
 		f.httpErr.WithLabelValues("5xx").Inc()
@@ -240,18 +250,42 @@ func (f *BinanceFetcher) page(ctx context.Context, symbol, interval string, star
 	return rows, lastOpen, nil
 }
 
-func (f *BinanceFetcher) backoff(ctx context.Context, retryAfter string, fallback time.Duration) {
-	d := fallback
-	if retryAfter != "" {
-		if secs, err := strconv.Atoi(retryAfter); err == nil && secs > 0 {
-			d = time.Duration(secs) * time.Second
-		}
+// pageLimitFor sizes one request's `limit` to the bars still needed in
+// [cursorMs, untilMs], capped at the configured page span.
+//
+// This matters because Binance weights /fapi/v1/klines by the `limit` we send,
+// not by the number of bars returned: a 3-minute gap asked for with limit=1500
+// returns ~3 bars yet costs weight 10, while limit=100 returns the same bars for
+// weight 1. The +2 covers an unaligned first bar and one bar of slack, so a
+// response shorter than `limit` reliably means "no more bars in range".
+func (f *BinanceFetcher) pageLimitFor(interval string, cursorMs, untilMs int64) int {
+	dur, ok := parseIntervalDuration(interval)
+	if !ok || dur <= 0 || untilMs <= cursorMs {
+		return f.pageLim
 	}
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-t.C:
-	case <-ctx.Done():
+	need := (untilMs-cursorMs)/dur.Milliseconds() + 2
+	if need > int64(f.pageLim) {
+		return f.pageLim
+	}
+	return int(need)
+}
+
+// klineWeight is the request weight of GET /fapi/v1/klines for a given limit.
+// Binance documents [1,100)->1, [100,500)->2, [500,1000]->5, >1000->10. A probe
+// in 2026-09 measured 100->1, 500->2, 1000->5, 1500->10 (never above the
+// documented table), so the documented table is a safe upper bound. The
+// exchange's own X-MBX-USED-WEIGHT-1M header, reported to the gate on every
+// response, remains the source of truth.
+func klineWeight(limit int) int {
+	switch {
+	case limit < 100:
+		return 1
+	case limit < 500:
+		return 2
+	case limit <= 1000:
+		return 5
+	default:
+		return 10
 	}
 }
 

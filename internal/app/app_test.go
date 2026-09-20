@@ -50,6 +50,9 @@ func TestNewAndShutdownNoExternalDeps(t *testing.T) {
 	if a.win == nil || a.live == nil || a.disp == nil || a.col == nil || a.univ == nil || a.metrics == nil {
 		t.Fatal("a component was not wired")
 	}
+	if a.wgate == nil {
+		t.Fatal("the shared /fapi weight gate was not created")
+	}
 
 	done := make(chan error, 1)
 	go func() { done <- a.Shutdown(context.Background()) }()

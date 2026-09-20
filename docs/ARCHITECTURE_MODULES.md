@@ -212,8 +212,15 @@ Backfill and real-time ingestion operate in parallel. To prevent contention betw
   4. The gate is released, and the suspended real-time updates resume writing seamlessly.
 
 ### 8.4 REST Rate-Limit Protection (`BinanceFetcher`)
-- Uses the token bucket rate-limiting algorithm (parameter `rest_rps`, default 20 RPS);
-- Fetches with pagination (Binance's maximum of 1500 bars per call), with adaptive retries for network jitter, avoiding triggering the exchange's 429 / 418 IP bans.
+- Every request first passes a token bucket on request rate (parameter `rest_rps`, default 20 RPS) and then the **shared `/fapi` weight gate** (`internal/weightgate`, config section `weight_gate`), see below;
+- Fetches with pagination (Binance's maximum of 1500 bars per call). **The per-request `limit` is sized to the gap** (`pageLimitFor`): Binance weights `/fapi/v1/klines` by the `limit` it is sent, not by the bars returned (measured: limit 100 → weight 1, 500 → 2, 1000 → 5, 1500 → 10), so a 3-minute gap costs weight 1 instead of 10;
+- On 429 / 418 the fetcher calls `PauseFor(Retry-After)` on the gate, which holds back **every** `/fapi` caller, not only the worker that saw the error.
+
+**Shared `/fapi` weight gate (`internal/weightgate`).** The `/fapi` limit (2400 weight per minute) is per IP, so every `/fapi` REST caller — kline backfill (`bulk`), universe `exchangeInfo` (`misc`), and later the open-interest snapshots (`live`) — waits at one process-wide gate:
+- each class has its own per-minute weight budget (default live 600 / bulk 1200 / misc 100, total 1900; the rest is headroom for traffic the gate cannot see), so a bulk backfill can never starve time-critical `live` requests;
+- every response reports `X-MBX-USED-WEIGHT-1M` back (exported as `weightgate_used_weight_1m`); while the last reading is ≥ `soft_limit` (default 1800) bulk callers wait for the minute to end, and at ≥ `hard_limit` (default 2300) so do live/misc — this covers other processes on the same IP;
+- other metrics: `weightgate_weight_acquired_total{class}`, `weightgate_wait_seconds{class}`, `weightgate_backpressure_waits_total{class}`, `weightgate_pauses_total`, `weightgate_paused_until_timestamp_seconds`.
+- `/futures/data/*` (open-interest history, ratios) is a different pool (1000 requests / 5 min per IP) and does not go through this gate.
 
 ### 8.5 Offline Backfill Mode (`backfill.offline_only`)
 

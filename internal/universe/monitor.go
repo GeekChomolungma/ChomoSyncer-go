@@ -27,6 +27,8 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/HarvestStars/chomosyncer-go/internal/weightgate"
 )
 
 // Defaults.
@@ -60,6 +62,11 @@ type Config struct {
 	// Status filters contracts by trading status. Defaults to "TRADING".
 	Status string
 
+	// Gate is the shared /fapi request-weight gate. When set, exchangeInfo waits
+	// at it (as weightgate.ClassMisc, weight 1), reports X-MBX-USED-WEIGHT-1M back,
+	// and a 429/418 pauses every /fapi caller. nil = ungated (tests).
+	Gate *weightgate.Gate
+
 	Registerer prometheus.Registerer
 	Logger     *slog.Logger
 }
@@ -74,6 +81,7 @@ type Snapshot struct {
 type Monitor struct {
 	cfg     resolvedConfig
 	http    *http.Client
+	gate    *weightgate.Gate // optional; see Config.Gate
 	log     *slog.Logger
 	metrics *metrics
 
@@ -150,6 +158,7 @@ func New(cfg Config) *Monitor {
 	return &Monitor{
 		cfg:     rc,
 		http:    hc,
+		gate:    cfg.Gate,
 		log:     log.With("component", "universe_monitor"),
 		metrics: newMetrics(cfg.Registerer),
 		set:     map[string]struct{}{},
@@ -310,7 +319,15 @@ func (m *Monitor) fetch(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
+// exchangeInfoWeight is the request weight of GET /fapi/v1/exchangeInfo.
+const exchangeInfoWeight = 1
+
 func (m *Monitor) getJSON(ctx context.Context, path string, v any) error {
+	if m.gate != nil {
+		if err := m.gate.Wait(ctx, weightgate.ClassMisc, exchangeInfoWeight); err != nil {
+			return err
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.cfg.baseURL+path, nil)
 	if err != nil {
 		return err
@@ -323,6 +340,15 @@ func (m *Monitor) getJSON(ctx context.Context, path string, v any) error {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
 		return err
+	}
+	if m.gate != nil {
+		m.gate.ObserveHeader(resp.Header)
+		switch resp.StatusCode {
+		case http.StatusTooManyRequests:
+			m.gate.PauseFor(weightgate.RetryAfter(resp.Header, 5*time.Second))
+		case http.StatusTeapot: // 418: IP ban
+			m.gate.PauseFor(weightgate.RetryAfter(resp.Header, 60*time.Second))
+		}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("status %d: %s", resp.StatusCode, truncate(body, 200))

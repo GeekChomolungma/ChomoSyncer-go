@@ -68,6 +68,14 @@ func (f *fakeClient) Unsubscribe(_ context.Context, streams []string) error {
 	return nil
 }
 
+// connects returns how many times Connect was called. Tests must use it rather
+// than reading connectN directly: Connect increments it on the shard goroutine.
+func (f *fakeClient) connects() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.connectN
+}
+
 func (f *fakeClient) LastMessageAt() time.Time { return time.Unix(0, f.lastMsg.Load()) }
 func (f *fakeClient) Errors() <-chan error     { return f.errCh }
 
@@ -213,7 +221,7 @@ func TestSetSymbolsCreatesShards(t *testing.T) {
 
 	eventually(t, time.Second, func() bool {
 		return f.latest("kline_1m_0") != nil && f.latest("kline_1h_0") != nil &&
-			f.latest("kline_1m_0").connectN >= 1 && f.latest("kline_1h_0").connectN >= 1
+			f.latest("kline_1m_0").connects() >= 1 && f.latest("kline_1h_0").connects() >= 1
 	})
 
 	got := f.latest("kline_1m_0").streamSet()
@@ -231,7 +239,7 @@ func TestSetSymbolsCreatesShards(t *testing.T) {
 func TestForwardsEventsToSink(t *testing.T) {
 	c, f, sink := newTestCollector(t, Config{Intervals: []string{"1m"}, ShardsPerInterval: 1})
 	c.SetSymbols([]string{"BTCUSDT"})
-	eventually(t, time.Second, func() bool { return f.latest("kline_1m_0") != nil && f.latest("kline_1m_0").connectN >= 1 })
+	eventually(t, time.Second, func() bool { return f.latest("kline_1m_0") != nil && f.latest("kline_1m_0").connects() >= 1 })
 
 	fc := f.latest("kline_1m_0")
 	fc.push(closedEvent("BTCUSDT", "1m", 1000))
@@ -249,12 +257,12 @@ func TestForwardsEventsToSink(t *testing.T) {
 func TestReconnectOnError(t *testing.T) {
 	c, f, _ := newTestCollector(t, Config{Intervals: []string{"1m"}, ShardsPerInterval: 1})
 	c.SetSymbols([]string{"BTCUSDT"})
-	eventually(t, time.Second, func() bool { return f.countCreated("kline_1m_0") == 1 && f.latest("kline_1m_0").connectN == 1 })
+	eventually(t, time.Second, func() bool { return f.countCreated("kline_1m_0") == 1 && f.latest("kline_1m_0").connects() == 1 })
 
 	f.latest("kline_1m_0").errCh <- errors.New("stream blew up")
 
 	eventually(t, 2*time.Second, func() bool {
-		return f.countCreated("kline_1m_0") >= 2 && f.latest("kline_1m_0").connectN >= 1
+		return f.countCreated("kline_1m_0") >= 2 && f.latest("kline_1m_0").connects() >= 1
 	})
 	if v := testutil.ToFloat64(c.metrics.wsReconnects.WithLabelValues("kline_1m_0")); v < 1 {
 		t.Fatalf("ws_reconnects_total = %v, want >= 1", v)
@@ -282,7 +290,7 @@ func TestSubscriptionDeltaOnSymbolChange(t *testing.T) {
 		Intervals: []string{"1m"}, ShardsPerInterval: 1, WatchdogInterval: 5 * time.Millisecond,
 	})
 	c.SetSymbols([]string{"BTCUSDT", "ETHUSDT"})
-	eventually(t, time.Second, func() bool { return f.latest("kline_1m_0") != nil && f.latest("kline_1m_0").connectN >= 1 })
+	eventually(t, time.Second, func() bool { return f.latest("kline_1m_0") != nil && f.latest("kline_1m_0").connects() >= 1 })
 	fc := f.latest("kline_1m_0")
 
 	c.SetSymbols([]string{"BTCUSDT", "SOLUSDT"})
@@ -422,7 +430,7 @@ func TestOnGapReportedAfterReconnect(t *testing.T) {
 	t.Cleanup(func() { _ = c.Close() })
 
 	c.SetSymbols([]string{"BTCUSDT"})
-	eventually(t, time.Second, func() bool { return f.latest("kline_1m_0") != nil && f.latest("kline_1m_0").connectN == 1 })
+	eventually(t, time.Second, func() bool { return f.latest("kline_1m_0") != nil && f.latest("kline_1m_0").connects() == 1 })
 
 	fc1 := f.latest("kline_1m_0")
 	fc1.push(closedEvent("BTCUSDT", "1m", 1000)) // set LastMessageAt to ~now

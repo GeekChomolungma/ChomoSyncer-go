@@ -153,3 +153,48 @@ func TestValidateCatchesInvalid(t *testing.T) {
 		t.Fatalf("expected valid for offline_only + enabled, got %v", err)
 	}
 }
+
+func TestWeightGateDefaultsAndYAMLOverride(t *testing.T) {
+	def := DefaultConfig().WeightGate
+	if def.LiveBudget != 600 || def.BulkBudget != 1200 || def.MiscBudget != 100 || def.SoftLimit != 1800 || def.HardLimit != 2300 {
+		t.Fatalf("unexpected default weight_gate: %+v", def)
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("weight_gate:\n  bulk_budget: 900\n  soft_limit: 1500\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadYAML(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+	if cfg.WeightGate.BulkBudget != 900 || cfg.WeightGate.SoftLimit != 1500 {
+		t.Errorf("overrides not applied: %+v", cfg.WeightGate)
+	}
+	if cfg.WeightGate.LiveBudget != 600 || cfg.WeightGate.HardLimit != 2300 {
+		t.Errorf("non-overridden fields should keep defaults: %+v", cfg.WeightGate)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("a valid override must pass Validate: %v", err)
+	}
+}
+
+func TestValidateRejectsBadWeightGate(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WeightGate.BulkBudget = 2000 // 600 + 2000 + 100 > 2400
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error: budgets exceed the 2400/min exchange cap")
+	}
+
+	cfg = DefaultConfig()
+	cfg.WeightGate.SoftLimit, cfg.WeightGate.HardLimit = 2200, 2000
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error: soft_limit above hard_limit")
+	}
+
+	cfg = DefaultConfig()
+	cfg.WeightGate.LiveBudget = -1
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error: negative budget")
+	}
+}

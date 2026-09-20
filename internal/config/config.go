@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/HarvestStars/chomosyncer-go/internal/weightgate"
 )
 
 // Config represents the complete configuration for ChomoSyncer-go.
@@ -17,6 +19,7 @@ type Config struct {
 	ClickHouse ClickHouseConfig `yaml:"clickhouse"`
 	Universe   UniverseConfig   `yaml:"universe"`
 	Backfill   BackfillConfig   `yaml:"backfill"`
+	WeightGate WeightGateConfig `yaml:"weight_gate"`
 }
 
 // AppConfig contains process-level settings.
@@ -149,6 +152,20 @@ type BackfillConfig struct {
 	FlushWait     time.Duration `yaml:"flush_wait"`
 }
 
+// WeightGateConfig sizes the shared /fapi request-weight gate
+// (internal/weightgate). All /fapi REST callers (kline gap backfill, universe
+// refresh, and later the open-interest snapshots) spend one per-IP pool of 2400
+// weight per minute; the gate splits it into per-class budgets and backs off on
+// the exchange's own X-MBX-USED-WEIGHT-1M reading. Values are weight per minute;
+// 0 = the built-in default.
+type WeightGateConfig struct {
+	LiveBudget int `yaml:"live_budget"` // time-critical snapshots (open interest); reserved so bulk work cannot starve them
+	BulkBudget int `yaml:"bulk_budget"` // elastic bulk work (kline gap backfill)
+	MiscBudget int `yaml:"misc_budget"` // housekeeping (universe exchangeInfo)
+	SoftLimit  int `yaml:"soft_limit"`  // bulk work backs off while Binance reports used weight >= this
+	HardLimit  int `yaml:"hard_limit"`  // live/misc back off while Binance reports used weight >= this
+}
+
 // ParseColdStartTime parses ColdStartDate into time.Time (UTC). Supports "2006-01-02",
 // "2006-01-02 15:04:05", and RFC3339. Returns zero time if ColdStartDate is empty.
 func (b BackfillConfig) ParseColdStartTime() (time.Time, error) {
@@ -261,6 +278,13 @@ func DefaultConfig() Config {
 			GateTimeout:   5 * time.Minute,
 			FlushWait:     2 * time.Second,
 		},
+		WeightGate: WeightGateConfig{
+			LiveBudget: weightgate.DefaultLiveBudget,
+			BulkBudget: weightgate.DefaultBulkBudget,
+			MiscBudget: weightgate.DefaultMiscBudget,
+			SoftLimit:  weightgate.DefaultSoftLimit,
+			HardLimit:  weightgate.DefaultHardLimit,
+		},
 	}
 }
 
@@ -371,6 +395,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Backfill.OfflineOnly && !c.Backfill.Enabled {
 		return fmt.Errorf("backfill.offline_only requires backfill.enabled = true")
+	}
+	if err := (weightgate.Config{
+		LiveBudget: c.WeightGate.LiveBudget, BulkBudget: c.WeightGate.BulkBudget, MiscBudget: c.WeightGate.MiscBudget,
+		SoftLimit: c.WeightGate.SoftLimit, HardLimit: c.WeightGate.HardLimit,
+	}).Validate(); err != nil {
+		return err
 	}
 	return nil
 }

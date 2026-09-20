@@ -99,9 +99,15 @@ backfill:
                                  #   false = 完整在线业务。此模式下 gate_timeout 自动失效（历史全量拉取必须跑完）。
   cold_start_date: ""            # 空库冷启动同步起点 (例如 "2024-01-01" 或 RFC3339)，留空则回退至最近窗口
   workers: 8                     # 回补时并发 REST 请求抓取的协程数
-  rest_rps: 20                   # 币安 REST API 令牌桶限流速率 (RPS)
+  rest_rps: 20                   # K 线回补的请求速率上限 (次/秒)。权重预算由下面的 weight_gate 统一管理，二者同时生效
   queue_size: 512                # 回补任务请求队列容量
   gap_debounce: 30s              # 断线重连重复缺口事件合并防抖时长
   gate_timeout: 10m               # 窗口门控最长持有超时（防止回补卡死导致实时数据一直被压制）
   flush_wait: 2s                 # 回补数据 Push 完毕后，若无 writer 时的回退等待时长
 
+weight_gate:                     # /fapi 请求权重闸门：所有 /fapi REST 调用（K 线回补、universe 刷新，之后还有 OI 快照）共用同一个按 IP 计的 2400 权重/分钟
+  live_budget: 600               # 时间敏感的快照（OI）预留的权重/分钟；独立预算，不会被回补饿死
+  bulk_budget: 1200              # 批量任务（K 线缺口回补）的权重/分钟
+  misc_budget: 100               # 杂项（universe 的 exchangeInfo）的权重/分钟。三项之和不得超过 2400，余量留给闸门看不到的同 IP 流量
+  soft_limit: 1800               # 币安响应头 X-MBX-USED-WEIGHT-1M 达到此值时，批量任务等到下一分钟再继续
+  hard_limit: 2300               # 达到此值时，连 live 与杂项也等到下一分钟

@@ -25,7 +25,7 @@
 
 | 池 | 本设计用到的端点 | 额度 | 备注 |
 |---|---|---|---|
-| `/fapi/*` 权重池 | `/fapi/v1/openInterest`（权重 1） | **2400 权重 / 分钟 / IP**（`exchangeInfo.rateLimits`）**[实测]** | 响应带 `x-mbx-used-weight-1m`，connector 的 `resp.RateLimits` 可读。**现有 K 线 REST 回补也在这个池里，两者同时高峰要留余量。** |
+| `/fapi/*` 权重池 | `/fapi/v1/openInterest`（权重 1） | **2400 权重 / 分钟 / IP**（`exchangeInfo.rateLimits`）**[实测]** | 响应带 `x-mbx-used-weight-1m`（手写客户端直接读这个头）。**现有 K 线 REST 回补也在这个池里，见本节末尾的说明。** |
 | `/futures/data/*` | `/futures/data/openInterestHist` | **1000 次 / 5 分钟 / IP** **[官方文档]** | **不占**上面的 2400：先调 `/fapi/v1/openInterest`（已用权重 2），再连调 6 次 hist，再调一次，已用权重只变成 3 **[实测]**。**响应没有用量头**（且走了 CDN），必须自己计数。多个 `/futures/data` 端点是否共用 1000，文档没写，**按共用设计 [假设]** |
 
 其他事实：
@@ -50,6 +50,26 @@
 3. `/futures/data` 另加**滑动 5 分钟窗口计数器**，达到 900 就停止发出新请求；对账匀速发出，不要突发。
 4. 收到 429：立即暂停该池全部请求至少 300 秒并告警；收到 418：停止该池请求直到封禁结束并触发高优先级告警。
 5. 重试也计入额度：每个请求最多重试 2 次，指数退避。
+
+**`/fapi` 池由所有 `/fapi` 调用方共用，已统一记账（已实现）：**
+
+改动之前的问题（代码与实测）：
+
+- 令牌桶只有一个（`internal/backfill/rest.go`，参数 `backfill.rest_rps` 默认 20），只限制 `/fapi/v1/klines`，按“请求数”而不是“权重”限流；universe 的 `exchangeInfo` 和 `cmd/test-tools` 里的 Python 脚本不经过任何限流器，但和它们在同一个出口 IP 上。
+- **K 线请求的权重由 `limit` 参数决定，与实际返回条数无关 [实测]：** `limit` 100 → 1、500 → 2、1000 → 5、1500 → 10。回补默认 `limit=1500`（权重 10），默认 20 次/秒 = 12000 权重/分钟，是 2400 上限的 5 倍；整个 universe 的冷启动或大面积断线（528 个标的 × 10 = 5280）会超限。旧进程运行约 9 天未见 429，只是因为回补量一直很小。
+
+已完成的两项改动：
+
+1. **`limit` 按缺口长度取值**（`backfill/rest.go` 的 `pageLimitFor`）：`limit = min(页上限, 缺口/周期 + 2)`。对真实币安的验证：3 分钟缺口 `limit=5`、权重 1（原来 10）；1 小时缺口 `limit=62`、权重 1；8 小时缺口 `limit=482`、权重 2。
+2. **共享权重闸门 `internal/weightgate`**，所有 `/fapi` 请求都经过它（目前是 K 线回补与 universe 的 `exchangeInfo`，OI live 之后接入）：
+   - 令牌按**权重**计，调用方声明权重（K 线按 `limit` 查表，`exchangeInfo` 与 `openInterest` 为 1）。
+   - **每类一个每分钟预算：** `live` 600（OI 快照，一轮 528 可以一次发完）、`bulk` 1200（回补）、`misc` 100（universe），合计 1900，其余 500 留给闸门看不到的同 IP 流量。配置段是 `weight_gate`。
+   - **响应头反馈：** 每个 `/fapi` 响应把 `X-MBX-USED-WEIGHT-1M` 报给闸门并导出为 Prometheus 指标 `weightgate_used_weight_1m`；最近读数 ≥ `soft_limit`（1800）时 `bulk` 等到这一分钟结束，≥ `hard_limit`（2300）时 `live`/`misc` 也等。
+   - **429/418：** 调用 `PauseFor(Retry-After)`，暂停**所有** `/fapi` 调用方。
+   - 其他指标：`weightgate_weight_acquired_total{class}`、`weightgate_wait_seconds{class}`、`weightgate_backpressure_waits_total{class}`、`weightgate_pauses_total`、`weightgate_paused_until_timestamp_seconds`。
+   - 原来的 `backfill_rest_weight_used` 指标由 `weightgate_used_weight_1m` 取代（后者覆盖所有 `/fapi` 调用方，不只是回补）。
+
+`/futures/data` 是另一个池，**不放进这个闸门**，由 OI 自己的限流器管理。
 
 ---
 
@@ -221,7 +241,8 @@ LEFT JOIN market.fapi_oi_5m AS o FINAL
 ### 5.1 位置与复用
 
 - 新模块 `internal/openinterest`，独立 goroutine，在 `internal/app` 里与 `universe`、`backfill` 并列装配。**不进 dispatcher，不参与 windowgate，不涉及 Redis。**
-- 复用：`internal/universe`（标的列表与变更回调）、`internal/config`（新增 `open_interest:` 配置段）、`internal/metrics` 风格的 Prometheus 指标、connector 的 `restapi` 类型化客户端。
+- 复用：`internal/universe`（标的列表）、`internal/config`（新增 `open_interest:` 配置段）、`internal/metrics` 风格的 Prometheus 指标（`promauto` + `Registerer`）。
+- **REST 客户端手写**，照 `internal/backfill/rest.go` 的写法（`net/http`、`sonic`、`x/time/rate`、429/418 的 `Retry-After` 退避、`X-MBX-USED-WEIGHT-1M` gauge）。仓库里 connector 只用在 WebSocket 上，REST 一律手写；OI 只有两个端点，手写比引入 connector 的 REST 客户端更一致，也更容易用 `httptest` 测试。connector 源码只作为请求/响应格式的规格参考（§2.1）。`/fapi` 池的调用（live）经过 §1 的共享权重闸门（`internal/weightgate`，已实现，用 `weightgate.ClassLive`），`/futures/data` 池（hist）用自己的限流器。
 - **落盘不复用 `internal/chwriter`：** 它的 `BatchWriter` 和 `Flusher` 是写死的 K 线 `Row` 类型（且 `insertColumns` 写死）。第一版建议在 `internal/openinterest` 里放一个**小的独立批量写入器**，照抄它的“攒批、超时刷盘、重试退避、优雅停机”逻辑，避免改动线上跑着的 K 线写入路径。等稳定后再考虑把 `BatchWriter` 泛型化。
 
 ### 5.2 文件划分
@@ -229,11 +250,13 @@ LEFT JOIN market.fapi_oi_5m AS o FINAL
 | 文件 | 职责 |
 |---|---|
 | `config.go` | 配置结构与默认值（见 §5.3） |
-| `client.go` | 封装 connector：`OpenInterest(ctx, symbol)`、`OpenInterestStatistics(ctx, symbol, limit, start, end)`、把 connector 的类型化错误（429、418）映射成本包的错误 |
-| `limiter.go` | 两个池的限流器：`/fapi` 令牌桶（25 rps）；`/futures/data` 令牌桶加 5 分钟滑动窗口计数器 |
+| `client.go` | 手写 REST：`GetOpenInterest(ctx, symbol)`、`GetOpenInterestHist(ctx, symbol, limit, start, end)`；解析（数值是字符串）、429/418 识别与 `Retry-After`、`/fapi` 响应头的 `X-MBX-USED-WEIGHT-1M` 回报给闸门 |
+| `limiter.go` | `/futures/data` 池的限流器：令牌桶加 5 分钟滑动窗口计数器加全局 `Pause(until)`。`/fapi` 池使用 §1 的共享权重闸门（`internal/weightgate`，已实现，`ClassLive`），本包只负责在 live 里按 25 rps 匀速发出 |
 | `align.go` | 纯函数：`liveBarStart(time) (start, ok)` 与 `histBarStart(ts) start`（§3.2、§3.3）；**最需要单元测试** |
 | `live.go` | 边界调度：每个 5 分钟边界在 `B-30s` 启动一轮；对 universe 里每个标的取快照，产出 `Row`（`src_rank=1`） |
-| `hist.go` | 对账与回补：① 启动时对每个标的从 `max(start_time)` 补到现在；② 每小时对账（`limit=24`）；产出 `Row`（`src_rank=2`） |
+| `store.go` | 启动时读一次 ClickHouse：每个标的最新的 `src_rank ≥ 2` 的 `start_time`（`maxIf … GROUP BY symbol`），类似 `backfill.CHStore.MaxStartTime` |
+| `hist.go` | 启动补缺与每小时校准，**同一段代码**（见 §5.8）；产出 `Row`（`src_rank=2`） |
+| `syncer.go` | 门面：`New(deps)` / `Start(ctx)` / `Close()`，供 `internal/app` 装配 |
 | `writer.go` | 独立批量写入器，写 `market.fapi_oi_5m` |
 | `row.go` | `Row` 结构与校验 |
 | `metrics.go` | 指标（见 §5.5） |
@@ -254,27 +277,30 @@ type Row struct {
 
 ```yaml
 open_interest:
-  enabled: false
-  live_lead: 30s              # 在 K 线收盘前多久开始一轮
-  live_accept_window: 60s     # 快照 time 距最近 5m 边界的最大偏差
-  fapi_rps: 25                # /fapi 池：live 快照
+  hist_enabled: false          # 先开这个：启动补缺 + 每小时校准
+  live_enabled: false          # 观察一天校准指标（§5.5）后再开
+  live_lead: 30s               # 在 K 线收盘前多久开始一轮
+  live_accept_window: 60s      # 快照 time 距最近 5m 边界的最大偏差
+  fapi_rps: 25                 # live 一轮的发出节奏；同时受共享权重闸门约束（§1）
   hist_reconcile_interval: 1h
-  hist_reconcile_limit: 24    # 每次取最近多少根
-  data_window_cap: 900        # /futures/data 5 分钟滑动窗口硬上限
-  data_rps: 2                 # /futures/data 令牌桶
-  catch_up_on_start: true     # 启动时先用 hist 补到现在
+  hist_reconcile_offset: 5m    # 每小时 hh:05 开始（标签 hh:00 最晚约 3 分钟可读）
+  hist_reconcile_spread: 20m   # 一轮 528 次请求在这段时间内匀速铺开
+  hist_limit_margin: 3         # limit = ceil((now - 该标的最新 hist 行) / 5m) + margin
+  hist_max_limit: 500          # 需要更多时改用 startTime/endTime 分页
+  data_window_cap: 900         # /futures/data 5 分钟滑动窗口硬上限
+  data_rps: 2                  # 启动补缺时的上限；每小时校准用 spread 算出的更低速率
 ```
 
 ### 5.4 启动与停机顺序
 
 1. 加载 universe。
-2. **先跑 hist 补缺（`catch_up_on_start`）**，等它完成，再启动 live 调度；补缺期间 live 不启动，避免额度冲突。
+2. `hist_enabled` 时**立刻跑一轮 hist**（这就是启动补缺，与每小时校准是同一段代码），等它完成，再启动 live 调度；补缺期间 live 不启动，避免额度冲突。
 3. 启动 live 调度、启动 hist 定时对账。
 4. 停机：停止调度 → 等在途请求 → `writer.Close()` 排空并落盘。
 
 ### 5.5 指标（Prometheus）
 
-`oi_live_snapshots_total{result="ok|dropped|error"}`、`oi_live_cycle_seconds`、`oi_hist_requests_total{result}`、`oi_data_window_used`（`/futures/data` 5 分钟窗口已用次数）、`oi_rate_limited_total{code="429|418"}`、`oi_rows_written_total{src_rank}`、`oi_last_start_time_lag_seconds{symbol}`。
+`oi_live_snapshots_total{result="ok|dropped|error"}`、`oi_live_cycle_seconds`、`oi_hist_requests_total{result}`、`oi_data_window_used`（`/futures/data` 5 分钟窗口已用次数）、`oi_rate_limited_total{code="429|418"}`、`oi_rows_written_total{src_rank}`、`oi_last_start_time_lag_seconds{symbol}`、`oi_live_vs_hist_rel_diff`（校准时 live 与 hist 的相对偏差直方图）、`oi_live_gap_bars_total`（校准时发现 live 缺失的根数）、`oi_cross_section_complete_ratio`（每轮结束后，拿到最近一根已收盘 bar 的标的数 ÷ universe 大小）。
 
 ### 5.6 冷启动（归档导入器）
 
@@ -289,4 +315,34 @@ open_interest:
 - `align.go`：`liveBarStart` 覆盖“略早、略迟、恰好在边界、超过 60 秒被丢弃”；`histBarStart` 覆盖日边界。
 - 归档对账：把某个标的一天的归档与同时刻 hist 的结果逐行比较，验证平移后 `start_time` 一致。
 - 限流器：突发不超过上限、429 后暂停、窗口计数正确。
+- `hist.go`：每个标的的动态 `limit`（含 30 小时缺口、超过 500 分页、新上市标的）；一轮的请求按 `spread` 匀速铺开；缺口优先的排序。
 - 写入器：沿用 `chwriter` 的测试用例结构（fake flusher）。
+
+### 5.8 每小时校准的高效设计
+
+hist 没有批量，一轮 = N（528）次请求，这个数省不掉。能优化的是节奏和写入：
+
+1. **匀速铺开，不突发。** 每小时 `hh:05` 开始，在 `hist_reconcile_spread`（20 分钟）内铺开，约 0.44 次/秒；每个 5 分钟窗口约 132 次，占 1000 的 13%。一口气按 2 次/秒发完，一个窗口就占 53%。
+2. **每个标的的 `limit` 动态计算：** `limit = ceil((now − 该标的最新 hist 行) / 5m) + hist_limit_margin`，限制在 `[6, hist_max_limit]`。正常每小时约 16；停机 30 小时约 360，一页拿完；超过 500 才用 `startTime/endTime` 分页。因此**启动补缺与每小时校准是同一段代码**；新上市标的没有 hist 行，自然按最大值取；超过 30 天的缺口只能等归档，日志里标明。
+3. **稳态不读 ClickHouse：** 启动时用 `store.go` 查一次每个标的最新 hist 行，放在内存里，每次成功写入后更新。稳态每轮约 528 × 13 ≈ 7000 行写入，`ReplacingMergeTree` 直接吸收，不需要先读再比较。
+4. **缺口优先：** 一轮里 live 行缺失或只有 live 值的标的排前面；若中途被 429 暂停，最重要的先覆盖。每轮起点轮转，避免总是同一批标的排在最后。
+5. **失败处理：** 单个标的失败，轮末重试一次；仍失败就留给下一轮（下一轮的 `limit` 会自动变大补上）。
+6. **顺带的监控，几乎零成本：** live 行写入时在内存里保留每个标的最近约 24 根，校准时直接与 hist 对比（不用查库），得到 `oi_live_vs_hist_rel_diff` 与 `oi_live_gap_bars_total`；每轮结束后计算 `oi_cross_section_complete_ratio`，低于 99% 告警。这能提早发现 live 平移错误或系统性偏移。
+7. **附带收益：** live 快照的时刻分散在 `B-30s` 到 `B-9s` 之间，hist 是恰好 `B`。校准之后，每个 `t` 的整个截面才是**同一时刻**，做横截面因子时用校准后的数据更干净。
+
+成本与间隔成反比，间隔就是“多久后值才被封存”：每小时 528 次，每 30 分钟 1056 次（占 1000 的 8.8%），每 4 小时 132 次。默认每小时。
+
+### 5.9 实现步骤
+
+每步都可以独立验证：
+
+1. **配置：** `internal/config` 加 `OpenInterestConfig`（默认值、`Validate`）与 `config.example.yaml`；`hist_enabled` 与 `live_enabled` 分开。
+2. **`align.go` 加测试：** `liveBarStart`（略早、略迟、恰在边界、超过 60 秒丢弃）、`histBarStart`（含日边界）。
+3. **`row.go` + `writer.go`：** 写 `DateTime64` 一律用 `time.Time`，不要用裸 epoch 数字（会被解析成乱值）。用 fake flusher 测试。
+4. **`client.go`：** 用已抓到的真实响应做 `httptest` 样例。
+5. **限流：** `/futures/data` 的 `limiter.go`。`/fapi` 的共享权重闸门（§1）已完成。
+6. **`store.go` + `hist.go`：** 动态 `limit`、内存状态、`spread` 铺开。
+7. **`live.go`：** 假时钟 + fake client，验证归属和丢弃规则、一轮耗时。
+8. **`syncer.go` + `internal/app` 接线：** `New()` 构造，`Run()` 在 `univ.Start()` 之后启动，`Shutdown()` 里 `closeStep(…, "openinterest", …)` 放在 collector 之后；live 每轮直接取当时的 `univ.Snapshot().Symbols`，不订阅 `OnChange`。
+9. **归档导入器**（照 `import_fapi_kline.py` 风格）与完整性检查脚本（每个 `(symbol, 日)` 288 行）。
+10. **上线顺序：** 执行 004 → 只开 `hist_enabled` 跑一天 → 看 §5.5 的指标 → 再开 `live_enabled`。

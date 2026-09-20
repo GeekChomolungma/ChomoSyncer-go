@@ -20,6 +20,7 @@ import (
 	"github.com/HarvestStars/chomosyncer-go/internal/metrics"
 	"github.com/HarvestStars/chomosyncer-go/internal/rediswin"
 	"github.com/HarvestStars/chomosyncer-go/internal/universe"
+	"github.com/HarvestStars/chomosyncer-go/internal/weightgate"
 	"github.com/HarvestStars/chomosyncer-go/internal/windowgate"
 )
 
@@ -36,6 +37,7 @@ type App struct {
 	win       *rediswin.Writer
 	live      *rediswin.LiveBarWriter
 	univ      *universe.Monitor
+	wgate     *weightgate.Gate // shared /fapi request-weight gate: every /fapi REST caller goes through it
 	disp      *dispatcher.Dispatcher
 	col       *collector.Collector
 
@@ -83,6 +85,18 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	}
 	a.metrics = mx
 	reg := mx.Registerer()
+
+	// One gate for the whole process: the /fapi weight limit (2400/min) is per IP,
+	// so the kline gap backfill and the universe refresh must spend it together.
+	a.wgate = weightgate.New(weightgate.Config{
+		LiveBudget: cfg.WeightGate.LiveBudget,
+		BulkBudget: cfg.WeightGate.BulkBudget,
+		MiscBudget: cfg.WeightGate.MiscBudget,
+		SoftLimit:  cfg.WeightGate.SoftLimit,
+		HardLimit:  cfg.WeightGate.HardLimit,
+		Registerer: reg,
+		Logger:     cfg.Logger,
+	})
 
 	a.closedRDB = redis.NewClient(&redis.Options{
 		Addr:         cfg.Redis.Addr,
@@ -140,12 +154,12 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	// phase one of a two-phase cold start: load deep history offline, verify it,
 	// then start the live service with a small cold_start_date.
 	if cfg.Backfill.OfflineOnly {
-		a.univ = newUniverse(cfg, reg)
+		a.univ = newUniverse(cfg, reg, a.wgate)
 		a.chStore, err = newColdStore(cfg)
 		if err != nil {
 			return fail("clickhouse read store: %w", err)
 		}
-		a.backfiller, err = newBackfiller(cfg, reg, a.chWriters, a.chStore, nil, nil)
+		a.backfiller, err = newBackfiller(cfg, reg, a.wgate, a.chWriters, a.chStore, nil, nil)
 		if err != nil {
 			return fail("backfiller: %w", err)
 		}
@@ -182,7 +196,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		return fail("redis live bar writer: %w", err)
 	}
 
-	a.univ = newUniverse(cfg, reg)
+	a.univ = newUniverse(cfg, reg, a.wgate)
 
 	router := &archiveRouter{
 		writers: archiveWritersOf(a.chWriters),
@@ -221,7 +235,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		if err != nil {
 			return fail("clickhouse read store: %w", err)
 		}
-		a.backfiller, err = newBackfiller(cfg, reg, a.chWriters, a.chStore, a.win, gateAdapter{a.gate})
+		a.backfiller, err = newBackfiller(cfg, reg, a.wgate, a.chWriters, a.chStore, a.win, gateAdapter{a.gate})
 		if err != nil {
 			return fail("backfiller: %w", err)
 		}
@@ -262,7 +276,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 }
 
 // newUniverse builds the market-discovery monitor.
-func newUniverse(cfg Config, reg prometheus.Registerer) *universe.Monitor {
+func newUniverse(cfg Config, reg prometheus.Registerer, wgate *weightgate.Gate) *universe.Monitor {
 	return universe.New(universe.Config{
 		BaseURL:         cfg.Universe.RESTURL,
 		RefreshInterval: cfg.Universe.RefreshInterval,
@@ -271,6 +285,7 @@ func newUniverse(cfg Config, reg prometheus.Registerer) *universe.Monitor {
 		QuoteAssets:     cfg.Universe.QuoteAssets,
 		ContractType:    cfg.Universe.ContractType,
 		Status:          cfg.Universe.Status,
+		Gate:            wgate,
 		Registerer:      reg,
 		Logger:          cfg.Logger,
 	})
@@ -297,6 +312,7 @@ func newColdStore(cfg Config) (*backfill.CHStore, error) {
 func newBackfiller(
 	cfg Config,
 	reg prometheus.Registerer,
+	wgate *weightgate.Gate,
 	chWriters map[string]*chwriter.BatchWriter,
 	store *backfill.CHStore,
 	rebuild backfill.WindowRebuilder,
@@ -305,6 +321,7 @@ func newBackfiller(
 	fetcher := backfill.NewBinanceFetcher(backfill.FetcherConfig{
 		BaseURL:    cfg.Universe.RESTURL,
 		RPS:        cfg.Backfill.RestRPS,
+		Gate:       wgate,
 		Registerer: reg,
 		Logger:     cfg.Logger,
 	})
