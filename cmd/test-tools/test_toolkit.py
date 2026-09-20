@@ -15,6 +15,7 @@ from check_redis_closed_windows import validate_compact_bar, inspect_symbol_wind
 from monitor_redis_kline_ready import parse_stream_entry
 from e2e_reconciliation import compare_bars
 from check_vs_binance import rel_close
+from check_oi_consistency import bar_window, evaluate_symbol, compare_with_binance, coverage_status, BAR_MS
 
 
 class TestCommon(unittest.TestCase):
@@ -82,7 +83,7 @@ class TestLiveBarValidation(unittest.TestCase):
 
 class TestClosedWindowValidation(unittest.TestCase):
     def test_validate_compact_bar_valid(self):
-        bar = [1719835200000, 60000.0, 60100.0, 59900.0, 60050.0, 10.5, 630000.0, 5.0, 300000.0]
+        bar = [1719835200000, 60000.0, 60100.0, 59900.0, 60050.0, 10.5, 630000.0, 5.0, 300000.0, 42]
         ok, msg = validate_compact_bar(bar)
         self.assertTrue(ok)
         self.assertEqual(msg, "")
@@ -91,7 +92,7 @@ class TestClosedWindowValidation(unittest.TestCase):
         bar = [1719835200000, 60000.0]
         ok, msg = validate_compact_bar(bar)
         self.assertFalse(ok)
-        self.assertIn("Expected 9 elements", msg)
+        self.assertIn("Expected 10 elements", msg)
 
     def test_inspect_symbol_window_continuous(self):
         interval_ms = 60000
@@ -100,7 +101,7 @@ class TestClosedWindowValidation(unittest.TestCase):
         raw_bars = []
         for i in range(5):
             t = base_t - (i * interval_ms)
-            bar = [t, 60000.0, 60100.0, 59900.0, 60050.0, 10.0, 600000.0, 5.0, 300000.0]
+            bar = [t, 60000.0, 60100.0, 59900.0, 60050.0, 10.0, 600000.0, 5.0, 300000.0, 42]
             raw_bars.append(json.dumps(bar))
 
         # current time is within next bar
@@ -116,8 +117,8 @@ class TestClosedWindowValidation(unittest.TestCase):
         base_t = 1719835200000
         # Missing bar between idx 0 and idx 1: base_t -> base_t - 2*interval_ms
         bars = [
-            [base_t, 60000.0, 60100.0, 59900.0, 60050.0, 10.0, 600000.0, 5.0, 300000.0],
-            [base_t - 2 * interval_ms, 59900.0, 60000.0, 59800.0, 59950.0, 8.0, 480000.0, 4.0, 240000.0],
+            [base_t, 60000.0, 60100.0, 59900.0, 60050.0, 10.0, 600000.0, 5.0, 300000.0, 42],
+            [base_t - 2 * interval_ms, 59900.0, 60000.0, 59800.0, 59950.0, 8.0, 480000.0, 4.0, 240000.0, 31],
         ]
         raw_bars = [json.dumps(b) for b in bars]
         now_ms = base_t + interval_ms + 10000
@@ -190,6 +191,108 @@ class TestStreamParser(unittest.TestCase):
         self.assertEqual(res["coverage_pct"], 98.0)
         # close_ms = 1719835260000, event_ms = 1719835262000 -> latency = 2000ms = 2.0s
         self.assertAlmostEqual(res["latency_s"], 2.0, places=2)
+
+
+class TestOIBarWindow(unittest.TestCase):
+    def test_window_is_aligned_settled_and_the_right_size(self):
+        # 2026-09-21 12:07:30 UTC
+        now_ms = 1789992450000
+        lo, hi = bar_window(now_ms, hours=1, settle_minutes=10)
+        self.assertEqual(hi % BAR_MS, 0)
+        self.assertEqual(lo % BAR_MS, 0)
+        # 12:07:30 - 10m = 11:57:30 -> floor 11:55 -> the newest settled bar OPENS at 11:50
+        self.assertEqual(format_ms_to_utc(hi), "2026-09-21 11:50:00")
+        self.assertEqual((hi - lo) // BAR_MS + 1, 12)          # an hour of 5m bars
+        self.assertLessEqual(hi + BAR_MS, now_ms - 10 * 60_000)  # its close is at least 10 minutes old
+
+    def test_zero_settle_takes_the_last_closed_bar(self):
+        now_ms = 1789992450000  # 12:07:30
+        _, hi = bar_window(now_ms, hours=1, settle_minutes=0)
+        self.assertEqual(format_ms_to_utc(hi), "2026-09-21 12:00:00")  # the 12:05 bar is still forming
+
+
+def _oi_row(**over):
+    row = {"symbol": "BTCUSDT", "n": 288, "min_ms": 0, "max_ms": 287 * BAR_MS, "off_grid": 0, "bad_value": 0,
+           "zero_value": 0, "n_live": 0, "n_hist": 288, "n_archive": 0, "bad_rank": 0, "stale_live": 0,
+           "bad_snap_live": 0, "bad_snap_cal": 0}
+    row.update(over)
+    return row
+
+
+class TestOIEvaluateSymbol(unittest.TestCase):
+    LO, HI = 0, 287 * BAR_MS
+
+    def test_clean_series_passes(self):
+        r = evaluate_symbol(_oi_row(), self.LO, self.HI)
+        self.assertEqual((r["status"], r["missing"], r["lag_bars"]), ("PASS", 0, 0))
+
+    def test_missing_bars_fail(self):
+        r = evaluate_symbol(_oi_row(n=285), self.LO, self.HI)
+        self.assertEqual(r["status"], "FAIL")
+        self.assertEqual(r["missing"], 3)
+
+    def test_off_grid_rows_fail_and_are_not_counted_as_bars(self):
+        # 289 rows, 1 of them off the grid -> 288 on-grid rows: nothing missing, but still a FAIL
+        r = evaluate_symbol(_oi_row(n=289, off_grid=1), self.LO, self.HI)
+        self.assertEqual(r["status"], "FAIL")
+        self.assertEqual(r["missing"], 0)
+
+    def test_snap_time_violations_fail(self):
+        self.assertEqual(evaluate_symbol(_oi_row(bad_snap_cal=2), self.LO, self.HI)["status"], "FAIL")
+        self.assertEqual(evaluate_symbol(_oi_row(bad_snap_live=1), self.LO, self.HI)["status"], "FAIL")
+
+    def test_stale_series_fails(self):
+        r = evaluate_symbol(_oi_row(max_ms=287 * BAR_MS - 10 * BAR_MS), self.LO, self.HI, max_lag_bars=2)
+        self.assertEqual(r["status"], "FAIL")
+        self.assertEqual(r["lag_bars"], 10)
+
+    def test_zero_value_is_only_a_warning(self):
+        self.assertEqual(evaluate_symbol(_oi_row(zero_value=1), self.LO, self.HI)["status"], "WARN")
+
+    def test_uncalibrated_live_rows_warn_unless_calibration_is_required(self):
+        self.assertEqual(evaluate_symbol(_oi_row(stale_live=5), self.LO, self.HI)["status"], "WARN")
+        self.assertEqual(evaluate_symbol(_oi_row(stale_live=5), self.LO, self.HI, require_calibration=True)["status"], "FAIL")
+
+    def test_series_starting_late_warns(self):
+        r = evaluate_symbol(_oi_row(n=248, min_ms=40 * BAR_MS), self.LO, self.HI)
+        self.assertEqual(r["status"], "WARN")
+
+    def test_bad_value_and_bad_rank_fail(self):
+        self.assertEqual(evaluate_symbol(_oi_row(bad_value=1), self.LO, self.HI)["status"], "FAIL")
+        self.assertEqual(evaluate_symbol(_oi_row(bad_rank=1), self.LO, self.HI)["status"], "FAIL")
+
+
+class TestOICompareWithBinance(unittest.TestCase):
+    LO, HI = 0, 100 * BAR_MS
+
+    def test_a_label_is_stored_one_bar_earlier(self):
+        rows = {10 * BAR_MS: {"oi": 100.0, "rank": 2}}
+        # label T = 11 bars -> bar start = 10 bars
+        r = compare_with_binance(rows, [(11 * BAR_MS, 100.0)], self.LO, self.HI)
+        self.assertEqual((r["compared"], r["ok_cal"], r["missing"], r["mismatch"]), (1, 1, [], []))
+        # the same value at the un-shifted position is reported missing, not silently accepted
+        r = compare_with_binance(rows, [(10 * BAR_MS, 100.0)], self.LO, self.HI)
+        self.assertEqual(r["missing"], [9 * BAR_MS])
+
+    def test_calibrated_rows_must_match_exactly_live_rows_within_tolerance(self):
+        rows = {10 * BAR_MS: {"oi": 100.0, "rank": 2}, 11 * BAR_MS: {"oi": 100.2, "rank": 1}}
+        pts = [(11 * BAR_MS, 100.0001), (12 * BAR_MS, 100.0)]
+        r = compare_with_binance(rows, pts, self.LO, self.HI, live_tol=0.005)
+        self.assertEqual(r["ok_live"], 1)                      # 0.2% off but live -> within 0.5%
+        self.assertEqual(len(r["mismatch"]), 1)                # hist row 1e-6 off -> must be exact
+        self.assertEqual(r["mismatch"][0]["rank"], 2)
+
+    def test_labels_outside_the_window_are_skipped(self):
+        r = compare_with_binance({}, [(500 * BAR_MS, 1.0)], self.LO, self.HI)
+        self.assertEqual((r["skipped"], r["compared"], r["missing"]), (1, 0, []))
+
+
+class TestOICoverage(unittest.TestCase):
+    def test_coverage_thresholds(self):
+        self.assertEqual(coverage_status(288, 288, 0.995), (1.0, "PASS"))
+        self.assertEqual(coverage_status(288, 287, 0.995)[1], "PASS")   # one bar of 288 is tolerated
+        self.assertEqual(coverage_status(288, 285, 0.995)[1], "FAIL")
+        self.assertEqual(coverage_status(0, 0, 0.995), (1.0, "PASS"))   # nothing to cover
 
 
 if __name__ == "__main__":

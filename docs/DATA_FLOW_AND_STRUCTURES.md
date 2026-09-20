@@ -4,9 +4,11 @@
 
 > **Document Purpose**: This document provides an in-depth analysis of the business workflows, data flow pipelines, core concurrency/threading model, and data structure design of each storage/cache layer in the `ChomoSyncer-go` market-wide market-data collector. It focuses on clarifying **the key naming conventions, query command examples, return formats, and per-field business definitions for querying Redis / ClickHouse content from external callers**.  
 > **Applicable Version**: `ChomoSyncer-go` v1.0+  
-> **Core Packages Involved**: `cmd/chomosyncer-go`, `internal/app`, `internal/universe`, `internal/collector`, `internal/dispatcher`, `internal/rediswin`, `internal/windowgate`, `internal/chwriter`, `internal/backfill`  
+> **Core Packages Involved**: `cmd/chomosyncer-go`, `internal/app`, `internal/universe`, `internal/collector`, `internal/dispatcher`, `internal/rediswin`, `internal/windowgate`, `internal/chwriter`, `internal/backfill`, `internal/weightgate`, `internal/openinterest`  
 >
 > **Important (1m baseline + derived timeframes)**: This build **subscribes only to 1-minute klines**, persists only a single raw table `market.fapi_kline_1m`, and Redis maintains only the 1m `livebar:{SYM}:1m` and `kline:{SYM}:1m`. Wherever the text below refers to a `{interval}` Redis key, a `fapi_kline_<interval>` table, or phrases such as "each configured interval", the actual value is always `1m`. Coarser timeframes (`serve_intervals`, defaulting to `5m/15m/1h/4h/1d`) are derived in two places: (1) on the ClickHouse side, rollup tables `fapi_kline_{5m,15m,1h,4h,1d}` idempotently recomputed from `fapi_kline_1m FINAL` (`deploy/clickhouse/002_kline_rollups.sql`); (2) on `stream:market:kline_ready`, a cross-section signal derived and forwarded from the "end-of-bucket 1m cross-section". Coarser timeframes have no Redis window/livebar — downstream consumers query ClickHouse directly.
+>
+> **Open interest (optional side module)**: separately from the kline pipeline above, `internal/openinterest` can maintain a 5-minute open-interest table `market.fapi_oi_5m` (and rollups) from Binance REST; it is described in §10 and is off by default. All `/fapi` REST callers (kline backfill, universe refresh, open-interest live snapshots) share one request-weight gate, `internal/weightgate` (§8.3).
 
 ---
 
@@ -93,7 +95,7 @@ This set serves as:
   - Startup entry point: [`internal/universe/monitor.go:141`](../internal/universe/monitor.go#L141) (`Monitor.Start`)
   - Background loop: [`internal/universe/monitor.go:160`](../internal/universe/monitor.go#L160) (`Monitor.loop`)
   - Refresh logic: [`internal/universe/monitor.go:199`](../internal/universe/monitor.go#L199) (`Monitor.Refresh`)
-  - Business consumption and dispatch: [`internal/app/app.go:217`](../internal/app/app.go#L217) (`App.onUniverseChange`)
+  - Business consumption and dispatch: [`internal/app/app.go:386`](../internal/app/app.go#L386) (`App.onUniverseChange`)
 
 ### 1.3 Data Structures & Schema Design
 #### Network Layer (Binance REST API)
@@ -583,7 +585,7 @@ ClickHouse is the system's **sole authoritative source of record** for underlyin
     - The underlying [`clickHouseFlusher.Flush`](../internal/chwriter/clickhouse.go#L93) automatically pings and reconnects when the connection becomes invalid.
     - On write failure it enters [`flushWithRetry`](../internal/chwriter/writer.go#L217), retrying up to 3 times with half-jitter, and alerts if that is exceeded.
 - **Code Entry Points**:
-  - Routing and dispatch: [`internal/app/app.go:348`](../internal/app/app.go#L348) (`archiveRouter.TryPush`)
+  - Routing and dispatch: [`internal/app/app.go:620`](../internal/app/app.go#L620) (`archiveRouter.TryPush`)
   - Batch loop: [`internal/chwriter/writer.go:142`](../internal/chwriter/writer.go#L142) (`BatchWriter.loop`)
   - Columnar send: [`internal/chwriter/clickhouse.go:93`](../internal/chwriter/clickhouse.go#L93) (`clickHouseFlusher.Flush`)
 
@@ -625,9 +627,9 @@ Gapfill runs **in parallel** with incremental ingestion: in the background it pu
 ### 8.3 Core Caller, Concurrency Model & Code Entry Points
 - **Core Caller**: [`backfill.Backfiller`](../internal/backfill/backfill.go#L182)
 - **Three trigger sources**:
-  1. **Cold start**: in [`App.Run`](../internal/app/app.go#L268), `SubmitColdStart` is called after the Universe is first fetched. If ClickHouse is an empty database, history is pulled starting from `cold_start_date`; if history already exists, it continues syncing from ClickHouse `max(start_time) + 1 step` through to the current latest moment. During this period the HTTP probe `/readyz` returns 503, switching to 200 once backfill completes.
-  2. **Shard reconnect**: after a shard successfully reconnects, it calls back [`collector.OnGap`](../internal/app/app.go#L196) -> [`Backfiller.HandleGap`](../internal/backfill/backfill.go#L328). With 30s debouncing and no bounded window limit, it queries ClickHouse's latest record time directly as the starting point, guaranteeing zero-gap backfill.
-  3. **Universe symbol addition**: [`App.onUniverseChange`](../internal/app/app.go#L242) detects an increment in the Universe and submits a full-window backfill for the new symbol to the queue.
+  1. **Cold start**: in [`App.Run`](../internal/app/app.go#L428), `SubmitColdStart` is called after the Universe is first fetched. If ClickHouse is an empty database, history is pulled starting from `cold_start_date`; if history already exists, it continues syncing from ClickHouse `max(start_time) + 1 step` through to the current latest moment. During this period the HTTP probe `/readyz` returns 503, switching to 200 once backfill completes.
+  2. **Shard reconnect**: after a shard successfully reconnects, it calls back [`collector.OnGap`](../internal/app/app.go#L261) -> [`Backfiller.HandleGap`](../internal/backfill/backfill.go#L328). With 30s debouncing and no bounded window limit, it queries ClickHouse's latest record time directly as the starting point, guaranteeing zero-gap backfill.
+  3. **Universe symbol addition**: [`App.onUniverseChange`](../internal/app/app.go#L386) detects an increment in the Universe and submits a full-window backfill for the new symbol to the queue.
 - **Offline backfill mode (`backfill.offline_only`)**: when this switch is enabled, `App.Run` takes the `runBackfillOnly` branch — only wiring up universe/fetcher/chwriter/backfiller, skipping collector, dispatcher, rediswin, and windowgate; after submitting a single whole-universe cold start, it blocks via `Backfiller.WaitColdStart` until backfill completes and then exits (`gate_timeout` has no effect, and it will not be forcibly released midway). This is used for a two-phase cold start of "fully backfilling deep history offline first, then bringing real-time business online after verification" — see `docs/OPERATIONS.md` §A.1 / §B.1 (first-time launch of an empty database) for details.
 - **Concurrency & Goroutine Model**:
   - **Main request scheduling loop (single goroutine)**:
@@ -636,7 +638,7 @@ Gapfill runs **in parallel** with incremental ingestion: in the background it pu
   - **REST fetch worker pool (multiple concurrent goroutines)**:
     - When processing a single request, [`processInterval`](../internal/backfill/backfill.go#L413) internally limits the maximum concurrent worker count (4 by default) via a semaphore channel `sem := make(chan struct{}, b.cfg.workers)`.
     - **Partitioning approach**: **concurrency is partitioned by symbol**. A temporary goroutine is started per symbol to concurrently execute `fetchAndArchive`.
-    - **Rate-limit control**: all workers share a single global token-bucket rate limiter [`rate.Limiter`](../internal/backfill/rest.go#L38) (20 RPS by default), preventing triggering Binance's 429 / 418 IP bans.
+    - **Rate-limit control**: every request first passes a token bucket on request rate (`rest_rps`, 20 RPS by default, [`rate.Limiter`](../internal/backfill/rest.go#L38)) and then the **shared `/fapi` weight gate** [`weightgate.Gate`](../internal/weightgate/gate.go#L239) as `ClassBulk`. Binance weights `/fapi/v1/klines` by the `limit` it is sent (measured: 100 → 1, 500 → 2, 1000 → 5, 1500 → 10), so each page's `limit` is sized to the gap (`pageLimitFor`): a 3-minute gap costs weight 1, not 10. The gate splits the 2400/min per-IP pool into per-class budgets (live 600 / bulk 1200 / misc 100), reads `X-MBX-USED-WEIGHT-1M` from every response (exported as `weightgate_used_weight_1m`) and makes bulk work wait when it is ≥ 1800 (live/misc at ≥ 2300); a 429/418 pauses every `/fapi` caller. This prevents triggering Binance's 429 / 418 IP bans.
   - **Explicit flush synchronization barrier and tail read-back**:
     - Data pulled via REST is written row-by-row into the ClickHouse buffer queue via `chwriter.Push`.
     - After all workers finish, the main loop proactively calls `aw.Flush(ctx)` to trigger an explicit persistence barrier; the BatchWriter immediately drains all rows accumulated in the channel and blocks waiting for the ClickHouse TCP batch physical write to complete (falling back to `FlushWait` if there is no writer).
@@ -698,7 +700,92 @@ While the Gapfill backfill pipeline is re-materializing 200 bars from ClickHouse
 
 ---
 
-## 10. Business Workflow Comparison Matrix
+## 10. Open-Interest Sync Flow (Open Interest Sync Flow)
+
+> A pull-model **side module**: it does not touch the dispatcher, the window gate or Redis, and it is **off by default** (`open_interest.hist_enabled` / `live_enabled`). Binance has no open-interest WebSocket stream (verified against the official connector and by live subscription), so everything here is REST. Design, measurements and the reasoning behind every rule: [`../new_requirements/oi.md`](../new_requirements/oi.md).
+
+### 10.1 External Storage Query Contract (ClickHouse Query Contract)
+
+#### 1. Tables
+- **Raw table**: `market.fapi_oi_5m` (`deploy/clickhouse/004_fapi_oi.sql`) — written by `internal/openinterest`, **not** by `chwriter`. Engine `ReplacingMergeTree(src_rank)`, key `(symbol, start_time)`, monthly partitions. It holds live snapshots that cannot be replayed, so it is never dropped.
+- **Rollups**: `market.fapi_oi_{15m,1h,4h,1d,1mo}` + refreshable MVs `*_rmv` (`005`), history fold `006`. Same recompute-from-`FINAL`, bucket-aligned, UTC-anchored design as the kline rollups (§8.6 of `ARCHITECTURE_MODULES.md`).
+- **Query convention**: `... FROM market.fapi_oi_5m FINAL ...`, joined to `fapi_kline_5m` on `(symbol, start_time)`; use `SETTINGS join_use_nulls = 1` on a LEFT JOIN, otherwise a missing OI row reads as `0`.
+
+#### 2. External Query Commands & Code Examples
+```bash
+# Newest open-interest rows of one symbol, with who wrote them
+clickhouse-client --query "
+SELECT symbol, start_time, sum_open_interest, snap_time, src_rank
+FROM market.fapi_oi_5m FINAL WHERE symbol = 'BTCUSDT' ORDER BY start_time DESC LIMIT 5 FORMAT PrettyCompact"
+
+# How much of the last 6h is still an uncalibrated live snapshot (1) vs Binance history (2) vs archive (3)
+clickhouse-client --query "
+SELECT src_rank, count() AS rows, max(start_time) AS newest
+FROM market.fapi_oi_5m FINAL WHERE start_time >= now() - INTERVAL 6 HOUR GROUP BY src_rank ORDER BY src_rank"
+
+# Runtime state of the module and the shared /fapi weight gate
+curl -s localhost:9090/metrics | grep -E '^(oi_|weightgate_)'
+```
+
+Full consumer-side guidance (alignment, revisions, rollups): [`DATA_CONSUMER_GUIDE.md` §1b](DATA_CONSUMER_GUIDE.md). Consistency check: `cmd/test-tools/check_oi_consistency.py`.
+
+#### 3. `market.fapi_oi_5m` Schema
+
+| Column | ClickHouse Type | Example | Business Meaning |
+| :--- | :--- | :--- | :--- |
+| `symbol` | `LowCardinality(String)` | `'BTCUSDT'` | Symbol. |
+| `start_time` | `DateTime64(3, 'UTC')` | `'2026-09-21 12:05:00.000'` | **Key.** Open time of the 5m kline whose **close** the value belongs to; identical to `fapi_kline_5m.start_time`. |
+| `sum_open_interest` | `Float64` | `109049.48` | Open interest in contracts (base-asset units) at `start_time + 5m`. |
+| `snap_time` | `DateTime64(3, 'UTC')` | `'2026-09-21 12:09:27.000'` | When the value was actually observed: live = the exchange response's `time`; hist / archive = `start_time + 5m`. |
+| `src_rank` | `UInt8` | `2` | `1` live, `2` hist (`openInterestHist`), `3` archive. Highest rank wins on merge. |
+| `created_at` | `DateTime` | `'2026-09-21 12:10:04'` | Persist time; internal. |
+
+---
+
+### 10.2 Purpose & Goals
+Give strategies an open-interest series that aligns with the kline they already read, available **at the bar's close** and later made exactly equal to Binance's own history.
+
+- **Two sources, one row.** *Live* (`GET /fapi/v1/openInterest`, snapshotted shortly before each 5-minute kline closes) gives the value in time; *hist* (`GET /futures/data/openInterestHist`) is Binance's authoritative series, so it overwrites the live row later. A hist label `T` is a snapshot *at* `T` and belongs to the kline that closes at `T`, i.e. it is stored at `start_time = T − 5m`; a live snapshot is attributed the same way from the response's own `time`, not from when it was requested.
+- **Start-up decision from the database.** On every start the module reads, per symbol, how far the table is already calibrated and fetches only what is missing (nothing at all for a symbol that is already current) — see 10.3.
+- **Two independent rate-limit pools.** Live spends the `/fapi` weight budget through the shared `internal/weightgate`; hist spends the `/futures/data` pool (1000 requests / 5 minutes per IP) through its own counter. They never compete, so a long catch-up never delays a live snapshot.
+
+### 10.3 Core Caller, Concurrency Model & Code Entry Points
+- **Core Caller**: [`openinterest.Syncer`](../internal/openinterest/syncer.go#L144) (`Build`), started by `App.Run` **after the first universe refresh** (it needs the symbol list) and closed by `App.Shutdown`.
+
+```text
+                       Universe (symbol list)
+                                │
+        ┌───────────────────────┴───────────────────────┐
+        ▼                                               ▼
+  Live loop (1 goroutine + 8 workers)            Hist reconciler (1 goroutine + 4 workers)
+  every 5m boundary B, from B-30s:               LoadState: read newest calibrated row per symbol
+  GET /fapi/v1/openInterest                      startup pass, then hh:05 hourly (spread 20 min)
+  via weightgate.ClassLive (weight 1)            GET /futures/data/openInterestHist via DataPool
+        │ Row{src_rank=1}                              │ Row{src_rank=2}, label T -> start T-5m
+        └───────────────────────┬──────────────────────┘
+                                ▼
+                    openinterest.Writer (batches, retries)
+                                ▼
+                     market.fapi_oi_5m  (ReplacingMergeTree(src_rank))
+                                ▼
+                  refreshable MVs -> fapi_oi_{15m,1h,4h,1d,1mo}
+```
+
+- **Concurrency & Goroutine Model**:
+  - **Live loop** ([`Live.Run`](../internal/openinterest/live.go#L111)): one scheduler goroutine. For each boundary `B` it waits until `B − live_lead` (30s) and runs [`Cycle`](../internal/openinterest/live.go#L132): 8 workers pull symbols from a channel, paced at `fapi_rps` (25/s) and admitted by the weight gate. The round is abandoned at `B + live_accept_window` (60s). A snapshot's row is derived from the response's `time` (nearest boundary, rejected if farther than the accept window), never from the call time; the response's `time` was measured to be ~3 seconds *earlier* than the request.
+  - **Hist reconciler** ([`Reconciler.Run`](../internal/openinterest/hist.go#L164)): one scheduler goroutine + 4 workers. [`LoadState`](../internal/openinterest/hist.go#L128) reads from ClickHouse, per symbol, the newest row with `src_rank >= 2` (retrying until the database answers). [`plan`](../internal/openinterest/hist.go#L220) then decides per symbol: already current → **skip, no request**; behind → refetch from that bar (one bar of overlap); no calibrated row → the cold-start window (48h); never further back than `hist_max_backfill` (7 days). Requests are sized to the gap (`limit = gap + margin`) and, because `startTime` alone cannot page forward, long gaps are paged **backwards** by moving `endTime` ([`fetchSymbol`](../internal/openinterest/hist.go#L375)). The start-up pass runs unspread; the hourly pass starts at `hh:05` and spreads its requests over 20 minutes, biggest gaps first, failed symbols retried once. The in-memory "calibrated up to" state advances only after the rows were flushed ([`Pass`](../internal/openinterest/hist.go#L262)).
+  - **Writer** ([`Writer.loop`](../internal/openinterest/writer.go#L160)): one goroutine batching by size or interval with retries; a small independent counterpart of `chwriter.BatchWriter` (the kline writer is untouched).
+  - **Live-vs-hist diagnostics** are free: live values are kept in memory for the last ~24 bars per symbol, so a calibration pass compares them with hist without querying ClickHouse (`oi_live_vs_hist_rel_diff`, `oi_live_gap_bars_total`).
+- **Rate-limit control**: live → [`weightgate.Gate.Wait`](../internal/weightgate/gate.go#L239) as `ClassLive`; hist → [`DataPool.Wait`](../internal/openinterest/limiter.go#L87) (sliding 5-minute window capped at 900, token bucket 2/s, global pause on 429/418).
+- **Code Entry Points**:
+  - Wiring: [`internal/app/app.go:275`](../internal/app/app.go#L275) (`newOpenInterest`), start at [`app.go:455`](../internal/app/app.go#L455), close at [`app.go:546`](../internal/app/app.go#L546)
+  - Alignment rules: [`align.go:38`](../internal/openinterest/align.go#L38) (`liveBarStart`), [`align.go:54`](../internal/openinterest/align.go#L54) (`histBarStart`)
+  - REST client: [`client.go:132`](../internal/openinterest/client.go#L132) (`Snapshot`), [`client.go:162`](../internal/openinterest/client.go#L162) (`History`)
+  - Start-up state read: [`clickhouse.go:185`](../internal/openinterest/clickhouse.go#L185) (`CHStore.LastStarts`)
+
+---
+
+## 11. Business Workflow Comparison Matrix
 
 | Workflow Name | Core Call Entry Point | Concurrency/Threading Model | Goroutine Partitioning Strategy | Write Storage Target | Core Data Structure / Key Design | External Query Return Format |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -710,4 +797,6 @@ While the Gapfill backfill pipeline is re-materializing 200 bars from ClickHouse
 | **Market-wide cross-section aggregation** | `aggregator.mark` | Dispatcher workers | In-memory mutex + per-section timer | Redis Stream | `stream:market:kline_ready` | Redis Stream entry (`interval`, `timestamp`, `count`) |
 | **ClickHouse batch archiving** | `BatchWriter.loop` | Single goroutine / interval | Each interval has its own dedicated BatchWriter | ClickHouse | `market.fapi_kline_<iv>` (ReplacingMergeTree) | Columnar/row table result (12-column raw fact data) |
 | **Historical Gapfill backfill** | `Backfiller.run` | Main loop + worker pool | Main loop serial; worker pool concurrent by symbol (4 workers) | CH + Redis | REST `/fapi/v1/klines` + Lua DEL/RPUSH | CH FINAL table + Redis 200-element List after overwrite |
+| **Open-interest live snapshot** | `Live.Run` | 1 scheduler goroutine + 8 workers | Per symbol, competing on a channel, once per 5-minute boundary | ClickHouse (own `openinterest.Writer`) | `market.fapi_oi_5m` (`src_rank=1`, `start_time` = closing bar's open) | Row of a 5m table: `sum_open_interest`, `snap_time`, `src_rank` |
+| **Open-interest hist backfill / calibration** | `Reconciler.Run` | 1 scheduler goroutine + 4 workers | Per symbol; gap-sized `limit`, paged backwards via `endTime` | ClickHouse (own `openinterest.Writer`) | `market.fapi_oi_5m` (`src_rank=2`, label `T` stored at `T-5m`) | Same row, replacing the live one |
 | **Window gate arbitration** | `Gate.Hold / Release` | Invoked from the main loop and workers | In-memory concurrent RWMutex | In-memory reference count | `Key{Symbol, Interval}` reference counter | Controls freezing of `kline:*` and `stream:market:kline_ready` |

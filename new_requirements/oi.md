@@ -1,6 +1,6 @@
 # Binance U 本位合约持仓量（OI）落盘设计（第一版）
 
-> 状态：设计稿。新表 SQL（`deploy/clickhouse/004~006`）已实现并在 ClickHouse 26.8 的临时库里验证过；Go 代码尚未实现。
+> 状态：**已实现。** 新表 SQL（`deploy/clickhouse/004~006`）与 Go 模块 `internal/openinterest`（live 快照 + hist 冷启动补缺/每小时校准，接入共享权重闸门）均已完成，并在真实币安与本机 ClickHouse 上做过端到端验证。归档导入器与完整性检查脚本尚未做。
 > 标注约定：**[实测]** 是我对线上接口/归档做的实际请求；**[官方文档]** 来自币安官方文档（通过网页抓取工具读到的摘要，不是逐字原文）；**[假设]** 是没有证实、为安全起见按保守值设计的。
 
 ---
@@ -31,6 +31,7 @@
 其他事实：
 
 - hist 只保留最近约 30 天（`startTime` 更早返回 `-1130`）**[官方文档 + 实测]**；`limit` 默认 30，文档最大 500，实测 1000 也可用（未文档化，不要依赖）。
+- **`limit` 取的是区间里最新的那几根 [实测]：** 区间 `[startTime, endTime]` 里的数据多于 `limit` 时，接口返回的是**最新**的 `limit` 根（`startTime` 只是下界），所以**只传 `startTime` 无法向前翻页**。回补长缺口必须从新往旧翻：先取 `endTime=现在` 的一页，再把 `endTime` 设成该页最早标签减 1 毫秒，直到覆盖 `startTime`。为避免边界行为不一致，代码里**总是同时传 `startTime` 和 `endTime`**。
 - hist 没有批量：`symbol`、`period` 必填，一次一个标的。无效 `symbol` 返回 HTTP 200 和空数组；缺 `period` 返回 400（`-1130`）**[实测]**。`/fapi/v1/openInterest` 无效 `symbol` 返回 400（`-1121`）**[实测]**。
 - 超限返回 429；持续违规会被封 IP（418），封禁 2 分钟起、最长 3 天 **[官方文档]**。封的是 IP，不是端点。
 - 两个 OI 端点是公共接口，**不需要 API Key**。
@@ -128,7 +129,7 @@ K 线 t                                                     K 线 t+5m（下一�
    start_time = b − 5m                  // → 14:05:00，即 K 线 14:05 这一行
    ```
    `time = 14:10:04`（略迟）同样归属 `14:05` 这一行；`time = 14:07:00` 距任何边界都超过 60 秒，丢弃。
-3. `snap_time` 记录 `time`，用于审计快照实际发生的时刻。
+3. `snap_time` 记录 `time`，用于审计快照实际发生的时刻。**实测响应里的 `time` 比发出请求的时刻早约 2~3 秒**（真实币安上，请求发出于 20:14:30，返回的 `time` 是 20:14:26.978），所以一轮 `B-30s` 起的快照，其 `time` 大约落在 `B-33s ~ B-12s`；这远在 `live_accept_window`（60 秒）以内，但意味着 live 值比“收盘前 20 秒”再早几秒。
 
 ### 3.3 hist 与归档：标签 `T` 写到 `T-5m` 这一行
 
@@ -273,30 +274,38 @@ type Row struct {
 }
 ```
 
-### 5.3 配置（`config.example.yaml` 新增）
+### 5.3 配置（`open_interest:`，已写入 `config.example.yaml`，两项开关默认关）
 
 ```yaml
 open_interest:
-  hist_enabled: false          # 先开这个：启动补缺 + 每小时校准
-  live_enabled: false          # 观察一天校准指标（§5.5）后再开
+  hist_enabled: false          # 启动时读库中每个标的已校准到哪根，据此补缺；之后每小时校准。建议先只开这个
+  live_enabled: false          # 每根 5m K 线收盘前 live_lead 打一轮快照。观察校准指标后再开
+  table: "market.fapi_oi_5m"
   live_lead: 30s               # 在 K 线收盘前多久开始一轮
-  live_accept_window: 60s      # 快照 time 距最近 5m 边界的最大偏差
-  fapi_rps: 25                 # live 一轮的发出节奏；同时受共享权重闸门约束（§1）
+  live_accept_window: 60s      # 快照时间距最近 5m 边界超过此值则丢弃（必须 < 2m30s）
+  live_workers: 8
+  fapi_rps: 25                 # 一轮的请求节奏；/fapi 池的硬限制由 weight_gate 负责
   hist_reconcile_interval: 1h
-  hist_reconcile_offset: 5m    # 每小时 hh:05 开始（标签 hh:00 最晚约 3 分钟可读）
-  hist_reconcile_spread: 20m   # 一轮 528 次请求在这段时间内匀速铺开
-  hist_limit_margin: 3         # limit = ceil((now - 该标的最新 hist 行) / 5m) + margin
-  hist_max_limit: 500          # 需要更多时改用 startTime/endTime 分页
-  data_window_cap: 900         # /futures/data 5 分钟滑动窗口硬上限
-  data_rps: 2                  # 启动补缺时的上限；每小时校准用 spread 算出的更低速率
+  hist_reconcile_offset: 5m    # 每小时 hh:05 开始
+  hist_reconcile_spread: 20m   # 一轮的请求在这段时间内匀速铺开（启动补缺不铺开）
+  hist_publish_lag: 4m         # 标签 T 预计在 T 之后多久可读，用来判断“已是最新则跳过”
+  hist_limit_margin: 3         # 每次请求比缺口多要几根
+  hist_max_limit: 500          # 单次 limit 上限；更长的缺口从新往旧分页
+  hist_cold_start_window: 48h  # 库里没有任何已校准行的标的，补回多远
+  hist_max_backfill: 168h      # 补缺最远回溯多久（币安只保留约 30 天）；更早的缺口需要归档
+  hist_workers: 4
+  data_rps: 2                  # /futures/data 池的请求速率
+  data_window_cap: 900         # 该池 5 分钟滑动窗口的硬上限
 ```
+
+`config.Validate` 会拒绝：`live_lead ≥ 5m`、`live_accept_window ≥ 2m30s`、`hist_reconcile_offset ≥ interval`、`hist_max_limit > 500`、`hist_max_backfill > 30 天`、`hist_cold_start_window > hist_max_backfill` 等。写入使用与 K 线相同的 ClickHouse 连接与批量参数。
 
 ### 5.4 启动与停机顺序
 
-1. 加载 universe。
-2. `hist_enabled` 时**立刻跑一轮 hist**（这就是启动补缺，与每小时校准是同一段代码），等它完成，再启动 live 调度；补缺期间 live 不启动，避免额度冲突。
-3. 启动 live 调度、启动 hist 定时对账。
-4. 停机：停止调度 → 等在途请求 → `writer.Close()` 排空并落盘。
+1. `internal/app` 在 universe 首次刷新成功之后启动（`Run()` 里 `univ.Start()` 之后）；未启用任何一项时不构造。
+2. **hist 与 live 同时启动。** 之前的设计要求先补缺、后启动 live，理由是“避免额度冲突”；但两者用的是**不同的池**（live 走 `/fapi` 权重闸门，hist 走 `/futures/data` 池），互不占用额度，所以补缺期间 live 照常快照，不会因为补缺跑得久而漏掉快照。同一个 `(symbol, start_time)` 上 hist（`src_rank=2`）总是覆盖 live（`1`），与谁先写入无关。
+3. **hist 先做冷启动决策（见 §5.8）**：读库、逐个标的判断是否需要补，再跑一轮不铺开的补缺（启动补缺只受 `/futures/data` 池限制），之后每小时 `hh:05` 校准一次。
+4. 停机：取消两个循环并等待，再依次关闭写入器（排空并落盘）与存储连接。
 
 ### 5.5 指标（Prometheus）
 
@@ -318,31 +327,53 @@ open_interest:
 - `hist.go`：每个标的的动态 `limit`（含 30 小时缺口、超过 500 分页、新上市标的）；一轮的请求按 `spread` 匀速铺开；缺口优先的排序。
 - 写入器：沿用 `chwriter` 的测试用例结构（fake flusher）。
 
-### 5.8 每小时校准的高效设计
+### 5.8 冷启动决策与每小时校准（hist.go，已实现）
 
-hist 没有批量，一轮 = N（528）次请求，这个数省不掉。能优化的是节奏和写入：
+**冷启动决策：读库里每个标的的最大开盘时间，再决定要不要调 hist。** 启动时 `store.LastStarts` 用一条查询取每个标的的两个值：
 
-1. **匀速铺开，不突发。** 每小时 `hh:05` 开始，在 `hist_reconcile_spread`（20 分钟）内铺开，约 0.44 次/秒；每个 5 分钟窗口约 132 次，占 1000 的 13%。一口气按 2 次/秒发完，一个窗口就占 53%。
-2. **每个标的的 `limit` 动态计算：** `limit = ceil((now − 该标的最新 hist 行) / 5m) + hist_limit_margin`，限制在 `[6, hist_max_limit]`。正常每小时约 16；停机 30 小时约 360，一页拿完；超过 500 才用 `startTime/endTime` 分页。因此**启动补缺与每小时校准是同一段代码**；新上市标的没有 hist 行，自然按最大值取；超过 30 天的缺口只能等归档，日志里标明。
-3. **稳态不读 ClickHouse：** 启动时用 `store.go` 查一次每个标的最新 hist 行，放在内存里，每次成功写入后更新。稳态每轮约 528 × 13 ≈ 7000 行写入，`ReplacingMergeTree` 直接吸收，不需要先读再比较。
-4. **缺口优先：** 一轮里 live 行缺失或只有 live 值的标的排前面；若中途被 429 暂停，最重要的先覆盖。每轮起点轮转，避免总是同一批标的排在最后。
-5. **失败处理：** 单个标的失败，轮末重试一次；仍失败就留给下一轮（下一轮的 `limit` 会自动变大补上）。
-6. **顺带的监控，几乎零成本：** live 行写入时在内存里保留每个标的最近约 24 根，校准时直接与 hist 对比（不用查库），得到 `oi_live_vs_hist_rel_diff` 与 `oi_live_gap_bars_total`；每轮结束后计算 `oi_cross_section_complete_ratio`，低于 99% 告警。这能提早发现 live 平移错误或系统性偏移。
-7. **附带收益：** live 快照的时刻分散在 `B-30s` 到 `B-9s` 之间，hist 是恰好 `B`。校准之后，每个 `t` 的整个截面才是**同一时刻**，做横截面因子时用校准后的数据更干净。
+```sql
+SELECT symbol, max(start_time), maxIf(start_time, src_rank >= 2) FROM market.fapi_oi_5m WHERE symbol IN (?) GROUP BY symbol
+```
 
-成本与间隔成反比，间隔就是“多久后值才被封存”：每小时 528 次，每 30 分钟 1056 次（占 1000 的 8.8%），每 4 小时 132 次。默认每小时。
+- `Any`：所有来源里最新的一根（含 live）。
+- `Hist`：`src_rank ≥ 2` 里最新的一根，即**校准到了哪里**。之后每个标的的决策以它为准：Hist 之后的 live 行还没被校准，所以也要重新取。只有 live 行、没有任何校准行的标的按“无校准行”处理。
+- 库不可用时 `LoadState` 会一直重试（5 秒起翻倍，最长 1 分钟），因为没有它无法决定跳过什么。
 
-### 5.9 实现步骤
+设 `target` 为“预计已发布的最新一根”的开盘时间（`floor5(now − hist_publish_lag) − 5m`），逐个标的：
 
-每步都可以独立验证：
+| 情况 | 动作 |
+|---|---|
+| 已校准到 `≥ target` | **跳过，不发请求** |
+| 已校准到 `lh < target` | 从 `lh` 起重取（多取 `lh` 这一根做重叠），一直到现在 |
+| 没有任何校准行（新库、新上市） | 取 `hist_cold_start_window`（默认 48 小时） |
+| 缺口早于 `hist_max_backfill`（默认 7 天） | 截断到该范围，并计入 `oi_hist_gap_beyond_cap_total`；更早的部分需要归档 |
 
-1. **配置：** `internal/config` 加 `OpenInterestConfig`（默认值、`Validate`）与 `config.example.yaml`；`hist_enabled` 与 `live_enabled` 分开。
-2. **`align.go` 加测试：** `liveBarStart`（略早、略迟、恰在边界、超过 60 秒丢弃）、`histBarStart`（含日边界）。
-3. **`row.go` + `writer.go`：** 写 `DateTime64` 一律用 `time.Time`，不要用裸 epoch 数字（会被解析成乱值）。用 fake flusher 测试。
-4. **`client.go`：** 用已抓到的真实响应做 `httptest` 样例。
-5. **限流：** `/futures/data` 的 `limiter.go`。`/fapi` 的共享权重闸门（§1）已完成。
-6. **`store.go` + `hist.go`：** 动态 `limit`、内存状态、`spread` 铺开。
-7. **`live.go`：** 假时钟 + fake client，验证归属和丢弃规则、一轮耗时。
-8. **`syncer.go` + `internal/app` 接线：** `New()` 构造，`Run()` 在 `univ.Start()` 之后启动，`Shutdown()` 里 `closeStep(…, "openinterest", …)` 放在 collector 之后；live 每轮直接取当时的 `univ.Snapshot().Symbols`，不订阅 `OnChange`。
-9. **归档导入器**（照 `import_fapi_kline.py` 风格）与完整性检查脚本（每个 `(symbol, 日)` 288 行）。
-10. **上线顺序：** 执行 004 → 只开 `hist_enabled` 跑一天 → 看 §5.5 的指标 → 再开 `live_enabled`。
+**每个请求的 `limit`** = `min(缺口根数 + hist_limit_margin, hist_max_limit)`。正常每小时约 17；停机 3 小时约 39；缺口超过 500 根时**从新往旧翻页**（§2.4：先取最新一页，再把 `endTime` 设成该页最早标签减 1 毫秒，直到覆盖起点）。因此启动补缺和每小时校准是**同一段代码**。
+
+**其余的设计点：**
+
+1. **匀速铺开：** 定时校准每小时 `hh:05` 开始，一轮的请求在 `hist_reconcile_spread`（20 分钟）内均匀排开（约 0.44 次/秒），启动补缺不铺开。
+2. **缺口大的优先：** 一轮里按缺口从大到小取；中途被 429 暂停，最重要的已经取完。
+3. **失败处理：** 单个标的失败，轮末重试一次；仍失败则状态不前进，下一轮的缺口会自动变大补上。`ErrInvalidSymbol`（标的刚下架）和空数组（刚上市）不算失败。
+4. **状态只在落盘后才前进：** 一轮结束时先对写入器做一次 `Flush` 屏障，成功才更新内存里的“校准到哪里”。否则一次被丢弃的批次会让内存状态永远领先数据库。
+5. **稳态不读 ClickHouse：** 状态放在内存里，每轮约 528 × 13 ≈ 7000 行直接写入，`ReplacingMergeTree` 吸收。
+6. **live 与 hist 的对比几乎零成本：** live 行写入时在内存里保留每个标的最近 24 根；校准时直接对比，得到 `oi_live_vs_hist_rel_diff`（偏差直方图）与 `oi_live_gap_bars_total`（live 缺失的根数）；每轮结束后计算 `oi_cross_section_complete_ratio`。
+7. **校准之后整个截面才是同一时刻：** live 快照分散在 `B-30s` 到 `B-9s` 之间，hist 是恰好 `B`。
+
+成本与间隔成反比：每小时 528 次请求，每 30 分钟 1056 次（占 1000 的 8.8%），每 4 小时 132 次。
+
+### 5.9 实现状态
+
+| 步骤 | 状态 |
+|---|---|
+| 配置（`open_interest:`、校验、示例） | 已完成 |
+| `align.go`（`liveBarStart` / `histBarStart` / `newestPublishedStart`）与测试 | 已完成 |
+| `row.go`、`writer.go`（独立批量写入器）、`clickhouse.go`（写入与 `LastStarts` 读取） | 已完成 |
+| `client.go`（手写 REST）、`limiter.go`（`/futures/data` 池） | 已完成 |
+| `hist.go`（冷启动决策、分页、校准）、`live.go`（边界调度）、`syncer.go` | 已完成 |
+| `internal/app` 接线 | 已完成 |
+| 归档导入器与完整性检查脚本 | **未做** |
+
+测试：`internal/openinterest` 下的单元测试全部用假时钟与一个**忠实模拟真实接口语义**的假 API（返回区间内最新的 `limit` 根）；另有两个默认跳过的测试：`TestIntegrationClickHouse`（真实 ClickHouse 的临时库：时间无偏移、hist 覆盖 live、`LastStarts` 语义）与 `TestE2ERealBinance`（真实币安：冷启动、二次运行、重启、3 小时停机、一轮真实 live、被 hist 校准）。
+
+**上线顺序：** 执行 004 → 只开 `hist_enabled` 跑一天 → 看指标（`oi_hist_pass_seconds`、`oi_cross_section_complete_ratio`、`oi_data_window_used`、`weightgate_used_weight_1m`）→ 再开 `live_enabled`。

@@ -17,6 +17,7 @@
 | **A —— 在线服务启动前**（离线灌历史 + `002`/`003` rollup 建完之后） | 只需要 ClickHouse，不需要 Redis、不需要在跑的 daemon | 1) `check_clickhouse_integrity.py` → 2) `check_vs_binance.py` |
 | **B —— 在线服务启动后** | 需要 daemon 正在往 Redis 写数据 | 3) `check_redis_livebars.py` → 4) `check_redis_closed_windows.py` → 5) `monitor_redis_kline_ready.py` → 6) `e2e_reconciliation.py` |
 | **C —— 任意时刻，一把打包 A2 + 全部 B** | 一条命令，给出 go/no-go 结论 | 7) `run_all_checks.py` |
+| **D —— `open_interest` 模块启用之后** | 只需要 ClickHouse（加 `--vs-binance` 才会打币安） | 8) `check_oi_consistency.py`（也可用 7 的 `--oi` 一并跑） |
 
 这和 `docs/OPERATIONS.md` §3（B.1/B.2）的顺序是一致的：先校验 ClickHouse 自身历史的完整性、再对回币安真值确认没有系统性偏差（该文档里两阶段冷启动的设计初衷正是为此），**都做完之后再打开在线链路**；在线链路起来之后，再校验面向 Redis 的实时通路。
 
@@ -33,6 +34,7 @@
 | `monitor_redis_kline_ready.py` | **[阶段 B·3] Redis 截面通知 Stream 监控器**：监控 `stream:market:kline_ready`（含派生的粗周期信号），评估就绪时延、标的收盘覆盖率与聚合原因 |
 | `e2e_reconciliation.py` | **[阶段 B·4] 缓存与存储对账工具**：对比 Redis `kline:{SYM}:1m` 滑窗与 ClickHouse `fapi_kline_1m`，逐根对比时间戳与 OHLCV 一致性 |
 | `run_all_checks.py` | **[阶段 C] 一键全量预检调度器**：一键执行所有检查项，输出可视化红绿灯健康计分卡 (Scorecard) |
+| `check_oi_consistency.py` | **[阶段 D] 持仓量一致性检查器**：只读检查 `market.fapi_oi_5m`——缺口、5 分钟网格、`snap_time` 语义、新鲜度、hist 校准情况、与 K 线表的覆盖率、逐根截面完整度，以及（可选）与币安逐值对账 |
 | `common.py` | 基础公用库：配置文件加载、ClickHouse/Redis 客户端、交易标的探测、时间工具、表格格式化等。本身不是一项检查。 |
 | `test_toolkit.py` | 工具包内置单元测试与 Mock 验证套件（`python -m pytest cmd/test-tools/test_toolkit.py`，或直接运行） |
 | `requirements.txt` | Python 依赖包清单 |
@@ -50,7 +52,7 @@ pip install -r cmd/test-tools/requirements.txt
 > **提示**：
 > - 脚本优先连接 `config.yaml` 中的配置地址（找不到则退回 `config.example.yaml`）；用 `--config /path/to/config.yaml` 指向别处，或用各工具自带的 `--ch-*` / `--redis-*` 参数单独覆盖某个字段，不用改配置文件本身。
 > - ClickHouse 支持双协议接入：优先通过 `clickhouse-connect`；若未安装 C 扩展，自动无缝降级为 ClickHouse 原生 HTTP 接口（8123 端口），无需担心跨平台编译依赖。
-> - 会打币安 REST 的工具（`check_vs_binance.py`）和在线 daemon 自己的回补流量共用同一个 IP 的限流预算——跑全市场之前先看它那一节的限速说明。
+> - 会打币安 REST 的工具（`check_vs_binance.py`，以及 `check_oi_consistency.py --vs-binance`）和在线 daemon 自己的流量共用同一个 IP 的限流预算——跑全市场之前先看它们各自那一节的限速说明。
 
 ---
 
@@ -299,7 +301,7 @@ python cmd/test-tools/e2e_reconciliation.py --symbol BTCUSDT --window-size 200
 
 ### 7. 一键全量预检计分卡 (`run_all_checks.py`)
 
-**阶段 C —— 最终门禁，也是外部用户最常直接运行的一个。** 内部按顺序跑第 1、3、4、5、6 项（第 2 项即 `check_vs_binance`，因为慢、又要打外部 REST，默认不跑，加 `--vs-binance` 才跑），汇总成一张红绿灯计分卡并给出发布结论（`READY FOR PRODUCTION DEPLOYMENT` 或 `DEPLOYMENT BLOCKED`）。
+**阶段 C —— 最终门禁，也是外部用户最常直接运行的一个。** 内部按顺序跑第 1、3、4、5、6 项（第 2 项即 `check_vs_binance`，因为慢、又要打外部 REST，默认不跑，加 `--vs-binance` 才跑；第 8 项持仓量检查因为该模块默认关闭，加 `--oi` 才跑），汇总成一张红绿灯计分卡并给出发布结论（`READY FOR PRODUCTION DEPLOYMENT` 或 `DEPLOYMENT BLOCKED`）。
 
 #### 参数：
 | 参数 | 默认值 | 说明 |
@@ -313,6 +315,7 @@ python cmd/test-tools/e2e_reconciliation.py --symbol BTCUSDT --window-size 200
 | `--skip-redis` | 关 | 跳过 Redis 检查（live bar + 已收盘滑窗） |
 | `--skip-e2e` | 关 | 跳过端到端对账 |
 | `--vs-binance` | 关 | 附带跑 `check_vs_binance.py` 对回 ClickHouse rollup（慢，会打外部交易所——见第 2 项的限速说明） |
+| `--oi` | 关 | 附带跑 `check_oi_consistency.py`（最近 6 小时；需要 `open_interest` 模块正在运行）。与 `--vs-binance` 同用时还会抽样对回币安 |
 | `--verbose` | 关 | 打印每个子检查的完整输出，而不只是摘要 |
 
 #### 运行示例：
@@ -331,6 +334,67 @@ python cmd/test-tools/run_all_checks.py --verbose
 ```
 
 退出码：`0` = 跑过的子检查全部通过；`1` = 至少一项子检查失败。
+
+---
+
+### 8. 持仓量（OI）表一致性检查 (`check_oi_consistency.py`)
+
+**阶段 D —— 在 `open_interest` 模块启用之后**（设计见 [`new_requirements/oi.md`](../../new_requirements/oi.md)，消费侧说明见 [`docs/DATA_CONSUMER_GUIDE.zh-CN.md`](../../docs/DATA_CONSUMER_GUIDE.zh-CN.md)）。**只读。** 它检查 `market.fapi_oi_5m` 在最近 `--hours` 小时内“此刻应该已经存在”的那些 bar，回答“策略能不能信这条序列”。只检查收盘已超过 `--settle-minutes` 分钟的 bar，所以 hist 还没发布的 bar 不会被误报为缺失。
+
+| 检查项 | 看什么 | 判定 |
+| :--- | :--- | :--- |
+| **A. 序列完整性**（逐标的） | 第一根到最后一根之间有没有缺 bar；每个 `start_time` 是否落在 5 分钟网格上；值是否有限且非负；**`snap_time` 与 `start_time` 的关系**（hist/归档行必须恰好等于 `start_time + 5m`；live 行在 `--live-accept` 之内）；最新一根最多落后 `--max-lag-bars` 根 | 缺 bar / 偏离网格 / snap 错误 / 陈旧 → **FAIL**；零值 → WARN |
+| **B. 新鲜度与来源健康** | 全表最新一根与最新的“已校准”（`src_rank >= 2`）一根；超过 `--max-uncalibrated-hours` 仍没被 hist 替换的 live 行 | 表陈旧 → **FAIL**；校准停滞或有未校准的 live 行 → WARN（加 `--require-calibration` 则 **FAIL**） |
+| **C. 消费视角** | 窗口内每一根 `fapi_kline_5m`，有没有对应的 OI 行；逐标的覆盖率 | 低于 `--min-coverage`（默认 99.5%）→ **FAIL**；有 K 线但完全没有 OI 行的标的会被单独点名 |
+| **D. 截面完整度** | 逐根 bar，有 OI 行的标的占比 | 任何一根低于 `--min-cross-section`（默认 99%）→ **FAIL** |
+| **E. 对回币安**（`--vs-binance`） | 抽样标的与币安自己的 `openInterestHist` 逐值对比：标签 `T` 必须存在 `start_time = T-5m` 这一行；rank ≥ 2 的行必须与币安的值完全相等；live 行在 `--live-tol` 之内 | 不一致或缺行 → **FAIL** |
+
+这些检查为什么存在：
+- **`snap_time` 和 “`T-5m`” 规则**证明了 live 快照被归到了正在收盘的那根 K 线、hist 标签被存到了早一根的位置。相邻两根 OI 只差约 0.02%，整体平移一根是**肉眼看不出来**的，只能靠这些规则抓。
+- **偏离网格的行**是导入时时区或单位出错的典型特征。
+- **未校准的 live 行**意味着每小时的 hist 校准没有在跑；live 值永远不会被币安自己的序列替换。
+
+#### 参数：
+| 参数 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `--config` | 自动探测 | `config.yaml` 路径（若设置了 `open_interest.table` 则采用） |
+| `--table` | `market.fapi_oi_5m` | 要检查的 OI 表 |
+| `--kline-table` | `market.fapi_kline_5m` | C、D 两项用的 5m K 线表 |
+| `--hours` | `24` | 窗口长度 |
+| `--settle-minutes` | `10` | 只检查收盘已超过这个时长的 bar |
+| `--symbol` | 全市场 | 逗号分隔的币种，例如 `BTCUSDT,ETHUSDT` |
+| `--limit-symbols` | 全部 | 只检查前 N 个币种 |
+| `--max-lag-bars` | `2` | 最新一根最多落后这么多根 |
+| `--live-accept` | `60` | live 行的 `snap_time` 与 bar 收盘时刻的最大差（秒） |
+| `--max-uncalibrated-hours` | `2` | 早于这个时长的 live 行本应已被 hist 替换 |
+| `--require-calibration` | 关 | 把未校准的 live 行从 WARN 升级为 FAIL |
+| `--min-coverage` / `--min-cross-section` | `0.995` / `0.99` | C / D 两项的阈值 |
+| `--skip-coverage` | 关 | 跳过与 K 线表的拼接（C 和 D） |
+| `--vs-binance` | 关 | 加跑 E 项（会打外部交易所） |
+| `--binance-symbols` / `--binance-bars` | `5` / `48` | 抽样几个标的 / 每个标的取最新几个 hist 点 |
+| `--live-tol` | `0.005` | live 行与币安的相对容差 |
+| `--symbol-delay` | `0.5` | 两次币安请求之间的间隔（秒） |
+| `--show-all` / `--max-rows` | 关 / `30` | 列出所有标的 / 每节最多列几行 |
+| `--ch-host/-port/-db/-user/-password` | 取自配置 | ClickHouse 覆盖参数 |
+
+> **限速说明：** `--vs-binance` 调用的是 `/futures/data/openInterestHist`，它和 `/fapi` 的权重预算是**两个不同的池**（每 IP 每 5 分钟 1000 次，按请求计，与在线服务自己的 hist 校准共用）。每个抽样标的只发一次请求，间隔由 `--symbol-delay` 控制；默认一次运行是 5 个请求。
+
+#### 运行示例：
+```bash
+# 全市场、最近 24 小时，只查 ClickHouse
+python cmd/test-tools/check_oi_consistency.py
+
+# 几个标的、最近 6 小时，并对回外部真值
+python cmd/test-tools/check_oi_consistency.py --symbol BTCUSDT,ETHUSDT --hours 6 --vs-binance
+
+# 首次 `hist_enabled` 跑完后、打开 live 之前：要求必须已校准
+python cmd/test-tools/check_oi_consistency.py --require-calibration --max-uncalibrated-hours 1
+
+# 针对演练库
+python cmd/test-tools/check_oi_consistency.py --table oi_rehearsal.fapi_oi_5m --kline-table market.fapi_kline_5m
+```
+
+退出码：`0` = 没有 FAIL（允许 WARN）；`1` = 至少一项 FAIL、表为空或不存在（提示信息会说明先执行 `deploy/clickhouse/004_fapi_oi.sql`）、或连不上 ClickHouse。
 
 ---
 

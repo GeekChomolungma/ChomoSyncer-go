@@ -15,6 +15,7 @@
 | # | 存储 | 里面是什么 | 结构 | 覆盖的币种 | 历史深度 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | 1 | **ClickHouse**（`market` 库） | 1m 原始归档 + 5m/15m/1h/4h/1d rollup | SQL 表 | 全周期、全市场 | 完整历史（以年计） |
+| 1b | **ClickHouse** —— `market.fapi_oi_5m` + 汇总表 *(可选)* | 每根 5m bar 收盘时刻的持仓量 | SQL 表 | 全市场 | 从模块启用起算（从币安补回至多约 30 天） |
 | 2a | **Redis** —— `livebar:{SYM}:1m` | 还在形成中、未收盘的当前 bar | Hash | 仅 1m | 1 根（每次更新原地覆盖） |
 | 2b | **Redis** —— `kline:{SYM}:1m` | 最近 200 根**已收盘**的 1m bar | List | 仅 1m | 200 根（约 3 小时 20 分） |
 | 2c | **Redis** —— `stream:market:kline_ready` | "全市场某个截面刚收盘"的通知 | Stream | 全周期（见下方说明） | 最近 `stream_maxlen` 条（默认 10000） |
@@ -24,6 +25,7 @@
 - 要最近 ~3 小时的已收盘 `1m` 滚动特征窗口，全市场、一个网络往返拿全？→ **已收盘滑窗**。
 - 要知道全市场某个周期的截面**恰好**收齐的那一刻，用来触发计算？→ **kline_ready**，拿到通知后再去 Redis（`1m`）或 ClickHouse（更粗周期）取真正的数据。
 - 要 3 小时之前的数据，或者 `1m` 以外的任何周期？→ **一律去 ClickHouse**。
+- 要**持仓量**？→ **ClickHouse 的 `fapi_oi_5m`**（§1b），按 `(symbol, start_time)` 与 `fapi_kline_5m` 拼接。Redis 里没有 OI。
 
 ---
 
@@ -111,6 +113,107 @@ FROM market.fapi_kline_1m FINAL
 WHERE symbol = 'BTCUSDT' ORDER BY start_time DESC LIMIT 5
 FORMAT PrettyCompact"
 ```
+
+---
+
+## 1b. ClickHouse —— 持仓量（`fapi_oi_*`）
+
+持仓量（OI）是某个币种未平仓合约的总张数。本节是**可选数据**：只有生产者以 `open_interest.hist_enabled` / `live_enabled` 运行、且已建好 `deploy/clickhouse/004`–`006` 的表，才会存在。先确认：
+
+```sql
+EXISTS TABLE market.fapi_oi_5m
+```
+
+背后的设计与实测依据见 [`../new_requirements/oi.md`](../new_requirements/oi.md)。
+
+### 表
+
+| 表 | 周期 |
+| :--- | :--- |
+| `market.fapi_oi_5m` | 5 分钟 —— 生产者直接写入的原始表 |
+| `market.fapi_oi_15m`、`_1h`、`_4h`、`_1d`、`_1mo` | 汇总表，由 5m 表重算得到，不要手工改 |
+
+`market.fapi_oi_5m` 的列：
+
+| 列 | 类型 | 含义 |
+| :--- | :--- | :--- |
+| `symbol` | `LowCardinality(String)` | 例如 `"BTCUSDT"` |
+| `start_time` | `DateTime64(3, 'UTC')` | **5 分钟 K 线**的开盘时间——与 `fapi_kline_5m` 的 `start_time` 是同一个。**拼接键。** |
+| `sum_open_interest` | `Float64` | 持仓量，单位是合约张数（标的资产计）。 |
+| `snap_time` | `DateTime64(3, 'UTC')` | 这个值实际被观测到的时刻（见“一行数据是什么意思”）。 |
+| `src_rank` | `UInt8` | 谁写的这一行：`1` live 快照，`2` 币安历史序列（`openInterestHist`），`3` 币安每日归档。合并时最高的胜出。 |
+| `created_at` | `DateTime` | 内部字段，除非排查问题否则忽略。 |
+
+> ⚠️ **一律带 `FINAL` 查询**，和 K 线表一样：`ReplacingMergeTree` 在后台按 `(symbol, start_time)` 去重，一行 live 数据和它后来的 hist 替换行在合并之前可能同时存在。
+
+### 一行数据是什么意思（拼接之前务必读一遍）
+
+- **`start_time` 是 bar 的开盘时间，但数值是该 bar 收盘那一刻（`start_time + 5 分钟`）的持仓量**，与这根 K 线的 `close` 平行。所以同一个 `start_time` 的 OI 行和 K 线，是在**同一时刻** `start_time + 5m` 才一起变得可知——在这个时刻或之后用它们做决策，没有前视。
+- **没有名义价值列。** 币安自己的名义价值是 `持仓量 × 标记价格`；用同一根 5m K 线的 `sum_open_interest * close` 就能近似（与币安的值实测平均偏差：BTCUSDT 0.35 bp、ETHUSDT 0.51 bp、SOLUSDT 0.90 bp）。
+- **一行数据会被修正一次。** 它先以 live 快照（`src_rank = 1`）写入，快照发生在 bar 收盘**之前**约 10–35 秒；通常一小时内会被币安自己在同一时刻的历史点替换（`src_rank = 2`；从每日归档导入的是 `3`）。在真实币安上的测试里两者平均相差 0.04%。所以实盘策略在收盘时看到的是 live 值，回测读到的是修正后的值——这是一个很小的、有意接受的差异。带 `FINAL` 读取时永远返回最高级别的那一版。
+- **校准之后整个截面是同一时刻的。** 各个标的的 live 快照分散在约 20 秒之内，而 hist 的值全部恰好落在 bar 收盘那一刻。
+
+### 怎么读
+
+```python
+import clickhouse_connect
+
+client = clickhouse_connect.get_client(host="localhost", port=8123, username="default", password="", database="market")
+
+# 把 OI 拼到同一根 5m K 线上 -> t, o, h, l, c, v, oi
+df = client.query_df("""
+    SELECT k.symbol, k.start_time, k.open, k.high, k.low, k.close, k.volume,
+           o.sum_open_interest,
+           o.sum_open_interest * k.close AS oi_value_approx
+    FROM market.fapi_kline_5m AS k FINAL
+    LEFT JOIN market.fapi_oi_5m AS o FINAL
+           ON o.symbol = k.symbol AND o.start_time = k.start_time
+    WHERE k.symbol = 'BTCUSDT' AND k.start_time >= now() - INTERVAL 1 DAY
+    ORDER BY k.start_time
+    SETTINGS join_use_nulls = 1
+""")
+```
+
+> ⚠️ **LEFT JOIN 要加 `SETTINGS join_use_nulls = 1`。** ClickHouse 默认会把右表**缺失**的行补成 `0`，于是没有 OI 行的 bar 会被悄悄读成“持仓量为 0”，而不是 `NULL`。（已验证：默认返回 `0`，加了这个设置返回 `NULL`。）
+
+```sql
+-- 每根 bar 的持仓量变化
+SELECT start_time, sum_open_interest,
+       sum_open_interest - lagInFrame(sum_open_interest) OVER (PARTITION BY symbol ORDER BY start_time) AS d_oi
+FROM market.fapi_oi_5m FINAL
+WHERE symbol = 'BTCUSDT' AND start_time >= now() - INTERVAL 1 DAY
+ORDER BY start_time
+
+-- 全市场在某根已收盘 bar 上的持仓量
+SELECT symbol, sum_open_interest FROM market.fapi_oi_5m FINAL
+WHERE start_time = '2026-09-21 12:00:00' ORDER BY symbol
+```
+
+### 汇总表
+
+`fapi_oi_{15m,1h,4h,1d,1mo}` 每个桶存的是**桶收盘时刻**的持仓量及其区间：
+
+| 列 | 含义 |
+| :--- | :--- |
+| `symbol`、`start_time` | 桶起点（UTC；`1mo` 用日历月）。 |
+| `samples` | 桶内 5m 行数。完整的桶是 3 / 12 / 48 / 288（15m / 1h / 4h / 1d），月桶是 `当月天数 × 288`。**务必按它过滤**——最新的那个桶通常是不完整的。 |
+| `sum_open_interest_close` | 桶收盘时刻的持仓量（桶内最后一个 5m 行）。 |
+| `sum_open_interest_high` / `_low` | 桶内各收盘快照的最大 / 最小值。 |
+| `rollup_version` | 内部字段。 |
+
+没有 `open`：一个桶开盘时刻的持仓量就是上一个桶的 close——用 `lagInFrame(sum_open_interest_close) OVER (PARTITION BY symbol ORDER BY start_time)` 取。
+
+```sql
+SELECT start_time, samples, sum_open_interest_close, sum_open_interest_high, sum_open_interest_low
+FROM market.fapi_oi_1h FINAL
+WHERE symbol = 'BTCUSDT' AND samples = 12
+ORDER BY start_time DESC LIMIT 24
+```
+
+### 能回溯多远，怎么确认可信
+
+- **历史从模块启用那一刻开始。** 首次启动时，生产者会把库里缺的部分从币安补回来（默认 48 小时，最多 7 天）；币安本身只保留约 30 天。更早的数据需要归档导入，这一块还不在模块里。
+- 依赖它之前先验证：[`../cmd/test-tools/check_oi_consistency.py`](../cmd/test-tools/README.zh-CN.md) 会检查缺口、5 分钟网格、`snap_time`、新鲜度、hist 校准、与 `fapi_kline_5m` 的覆盖率，加 `--vs-binance` 还会与币安逐值对账。
 
 ---
 
@@ -273,6 +376,7 @@ while True:
 - **Redis 永远不返回数值类型。** Hash 字段、Stream 字段、紧凑 JSON 数组里的数字，在 Python 里都要显式转型（`float()`/`int()`）——`redis-py` 的 `decode_responses=True` 给你的是字符串，只有数组本身经过 `json.loads` 解析出来的才是真正的 `int`/`float`。
 - **Redis 只认识 `1m` 这一个周期。** `livebar:*` 和 `kline:*` 永远只有 `...:1m` 这种 key——不存在 `livebar:BTCUSDT:5m`。更粗的周期一律在 ClickHouse 里。
 - **ClickHouse 查询模式永远是 `... FROM market.fapi_kline_<interval> FINAL WHERE ...`。** 忘记带 `FINAL` 是最常见的坑——你偶尔会看到同一个 `(symbol, start_time)` 出现重复行。
+- **持仓量打破了“`start_time` 就是这个值所属时间”的习惯。** 在 `fapi_oi_*` 里，`start_time` 是 K 线的**开盘**时间，但数值属于它的**收盘**时刻（`start_time + 5m`）——见 §1b。它仍然按 `start_time` 与 `fapi_kline_5m` 拼接。
 - **`start_time` 是全局统一的对齐键**——ClickHouse、Redis List 的 `[0]`、Redis Hash 的 `t`，同一根 bar 在三处的这个值完全一致。用它来对齐全市场截面。
 
 ---
@@ -283,5 +387,6 @@ while True:
 | :--- | :--- |
 | 这些数据内部到底是怎么生产出来的（goroutine、并发、Go 结构体） | [`DATA_FLOW_AND_STRUCTURES.zh-CN.md`](DATA_FLOW_AND_STRUCTURES.zh-CN.md) |
 | 部署 / 运维这个生产者本身 | [`OPERATIONS.md`](OPERATIONS.zh-CN.md) |
-| 在信任这些数据源之前，先验证它们健康、完整 | [`../cmd/test-tools/README.zh-CN.md`](../cmd/test-tools/README.zh-CN.md)——尤其是 `check_redis_livebars.py`、`check_redis_closed_windows.py`、`check_vs_binance.py`，验证的正是本文档讲的这几条读取路径 |
+| 在信任这些数据源之前，先验证它们健康、完整 | [`../cmd/test-tools/README.zh-CN.md`](../cmd/test-tools/README.zh-CN.md)——尤其是 `check_redis_livebars.py`、`check_redis_closed_windows.py`、`check_vs_binance.py`，验证的正是本文档讲的这几条读取路径；`check_oi_consistency.py` 覆盖 §1b |
 | 逐模块的架构设计 | [`ARCHITECTURE_MODULES.md`](ARCHITECTURE_MODULES.zh-CN.md) |
+| 持仓量为什么这样对齐、这样修正（实测与设计） | [`../new_requirements/oi.md`](../new_requirements/oi.md) |

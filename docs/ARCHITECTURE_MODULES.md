@@ -243,3 +243,15 @@ The ingestion side only subscribes to 1m, avoiding the connection and bandwidth 
 - **Hard idempotency guarantee**: the aggregation is a **full recomputation** using `sum()/argMin()/argMax()/min()/max()`, with no accumulator of any kind; `FINAL` first collapses duplicate 1m rows; each recomputation writes an updated `rollup_version`, and ReplacingMergeTree keeps the latest. As a result, 1m redelivery, overlapping backfills, and repeated reruns of `003` will **never double the volume**. Changing this to `SummingMergeTree` or a non-refreshable incremental MV is strictly forbidden — that would accumulate per inserted block and drift.
 - **Historical folding** `003_rollup_backfill.sql`: the MV only consumes 1m rows arriving after its creation, so after `002` is applied, `003` must be run once (sharded by month, or all at once) to fold existing history into the rollup tables.
 - **OHLC is exact; volume has ~1e-8 relative drift** (floating-point summation order vs. Binance accumulating from trades) — `check_vs_binance.py` uses a `1e-9` tolerance for price and `1e-6` for volume.
+
+
+## Module 9: `internal/openinterest` (5-Minute Open-Interest Sync)
+
+Design and measurements: [`new_requirements/oi.md`](../new_requirements/oi.md). Off by default (`open_interest.hist_enabled` / `live_enabled`). It writes `market.fapi_oi_5m` (`deploy/clickhouse/004_fapi_oi.sql`); the rollups are `005` + `006`. It is a pull-model side module: it does not touch the dispatcher, the window gate or Redis.
+
+- **Row semantics.** `start_time` is the OPEN time of the 5-minute kline whose CLOSE the value belongs to, so the table joins `fapi_kline_5m` on `(symbol, start_time)`. `src_rank` (1 live, 2 hist, 3 archive) decides who wins on merge (`ReplacingMergeTree(src_rank)`).
+- **Live** (`live.go`): every 5-minute boundary `B`, from `B − live_lead` (30s), snapshot every symbol with `GET /fapi/v1/openInterest`; the row's bar is derived from the response's own `time` (nearest boundary, rejected beyond `live_accept_window`), not from the call time. Requests go through the shared weight gate as `ClassLive`.
+- **Hist** (`hist.go`): `GET /futures/data/openInterestHist`, label `T` is stored at `T − 5m`. At start-up it reads, per symbol, the newest calibrated row from ClickHouse (`maxIf(start_time, src_rank >= 2)`) and decides: skip if current, otherwise fetch only the gap (`limit` sized to it, paged backwards through `endTime` because `startTime` alone cannot page forward). The same pass then runs hourly at `hh:05`, spread over 20 minutes, calibrating live rows. State is advanced only after the rows are flushed.
+- **Rate limits.** Live spends the `/fapi` weight pool via `internal/weightgate`; hist has its own pool (`DataPool`: 1000 requests / 5 min per IP, counted locally, no usage header).
+- **Writer.** A small independent batching writer (`writer.go`); `internal/chwriter` is deliberately untouched.
+- Tests: fake-clock unit tests against a fake API that mirrors the real one; `TestIntegrationClickHouse` and `TestE2ERealBinance` are skipped unless `CHOMO_TEST_*` variables are set.

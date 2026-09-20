@@ -245,3 +245,15 @@
 - **幂等硬保证**：聚合是 `sum()/argMin()/argMax()/min()/max()` 的**全量重算**，没有任何累加器；`FINAL` 先折叠 1m 的重复行；每次重算写更新的 `rollup_version`，ReplacingMergeTree 保留最新。因此 1m 重发、回补重叠、`003` 反复重跑都**不会让 volume 翻倍**。严禁改成 `SummingMergeTree` 或非刷新式增量 MV——那会按插入块累加而漂移。
 - **历史折叠** `003_rollup_backfill.sql`：MV 只吃创建之后到达的 1m 行，故 `002` 应用后运行一次 `003`（按月分片或一次性）把已有历史折进 rollup 表。
 - **OHLC 精确、volume 有 ~1e-8 相对漂移**（浮点求和顺序 vs 币安从 trade 累加）——`check_vs_binance.py` 对价用 `1e-9`、对量用 `1e-6` 容差。
+
+
+## 模块 9：`internal/openinterest`（5 分钟持仓量同步）
+
+设计与实测依据见 [`new_requirements/oi.md`](../new_requirements/oi.md)。默认关闭（`open_interest.hist_enabled` / `live_enabled`）。写入 `market.fapi_oi_5m`（`deploy/clickhouse/004_fapi_oi.sql`），汇总表是 `005` + `006`。它是拉取模型的旁路模块：不经过 dispatcher、窗口门控和 Redis。
+
+- **行的语义。** `start_time` 是“该持仓量所属的那根 5 分钟 K 线”的**开盘时间**（值是这根 K 线收盘时刻的），所以能按 `(symbol, start_time)` 与 `fapi_kline_5m` 直接拼接。`src_rank`（1 live、2 hist、3 归档）决定合并时谁胜出（`ReplacingMergeTree(src_rank)`）。
+- **Live**（`live.go`）：每个 5 分钟边界 `B`，从 `B − live_lead`（30 秒）开始，用 `GET /fapi/v1/openInterest` 给每个标的打一次快照；行归属哪根 K 线由响应里的 `time` 决定（取最近的边界，超出 `live_accept_window` 就丢弃），而不是调用时刻。请求经共享权重闸门（`ClassLive`）。
+- **Hist**（`hist.go`）：`GET /futures/data/openInterestHist`，标签 `T` 存到 `T − 5m`。启动时按标的从 ClickHouse 读“已校准到哪根”（`maxIf(start_time, src_rank >= 2)`）并决策：已是最新则跳过，否则只取缺口（`limit` 按缺口取值；因为只传 `startTime` 不能向前翻页，长缺口靠移动 `endTime` 从新往旧翻）。同一段代码之后每小时 `hh:05` 跑一轮，在 20 分钟内铺开，用来校准 live 行。内存状态只在行落盘之后才前进。
+- **限流。** live 通过 `internal/weightgate` 使用 `/fapi` 权重池；hist 有自己的池（`DataPool`：每 IP 每 5 分钟 1000 次，本地计数，接口没有用量头）。
+- **写入器。** 一个小型独立批量写入器（`writer.go`），刻意不改动 `internal/chwriter`。
+- 测试：假时钟单元测试（假 API 与真实接口语义一致）；`TestIntegrationClickHouse` 与 `TestE2ERealBinance` 只在设置了 `CHOMO_TEST_*` 环境变量时运行。

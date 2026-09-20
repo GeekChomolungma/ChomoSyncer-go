@@ -198,3 +198,61 @@ func TestValidateRejectsBadWeightGate(t *testing.T) {
 		t.Error("expected error: negative budget")
 	}
 }
+
+func TestOpenInterestDefaultsAreOffAndValid(t *testing.T) {
+	cfg := DefaultConfig()
+	oi := cfg.OpenInterest
+	if oi.HistEnabled || oi.LiveEnabled {
+		t.Fatal("open_interest must be off by default")
+	}
+	if oi.Table != "market.fapi_oi_5m" || oi.LiveLead != 30*time.Second || oi.HistReconcileSpread != 20*time.Minute ||
+		oi.HistReconcileInterval != time.Hour || oi.DataWindowCap != 900 || oi.HistMaxLimit != 500 {
+		t.Fatalf("unexpected defaults: %+v", oi)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("defaults must validate: %v", err)
+	}
+	m := oi.ToModule()
+	if m.Live.Lead != 30*time.Second || m.Hist.Spread != 20*time.Minute || m.DataRPS != 2 || m.Live.RPS != 25 {
+		t.Fatalf("ToModule mapping wrong: %+v", m)
+	}
+}
+
+func TestOpenInterestYAMLOverride(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	yamlContent := "open_interest:\n  hist_enabled: true\n  live_enabled: true\n  live_lead: 20s\n  hist_reconcile_spread: 10m\n  hist_max_backfill: 72h\n"
+	if err := os.WriteFile(cfgPath, []byte(yamlContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadYAML(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oi := cfg.OpenInterest
+	if !oi.HistEnabled || !oi.LiveEnabled || oi.LiveLead != 20*time.Second || oi.HistReconcileSpread != 10*time.Minute || oi.HistMaxBackfill != 72*time.Hour {
+		t.Fatalf("overrides not applied: %+v", oi)
+	}
+	if oi.FapiRPS != 25 || oi.HistWorkers != 4 { // untouched fields keep their defaults
+		t.Fatalf("defaults lost: %+v", oi)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid override rejected: %v", err)
+	}
+}
+
+func TestValidateRejectsBadOpenInterest(t *testing.T) {
+	for name, mutate := range map[string]func(*Config){
+		"lead as long as the bar":    func(c *Config) { c.OpenInterest.LiveLead = 5 * time.Minute },
+		"accept window too wide":     func(c *Config) { c.OpenInterest.LiveAcceptWindow = 3 * time.Minute },
+		"offset beyond the interval": func(c *Config) { c.OpenInterest.HistReconcileOffset = 2 * time.Hour },
+		"limit above Binance's max":  func(c *Config) { c.OpenInterest.HistMaxLimit = 1000 },
+		"backfill beyond retention":  func(c *Config) { c.OpenInterest.HistMaxBackfill = 60 * 24 * time.Hour },
+		"cold start beyond the cap":  func(c *Config) { c.OpenInterest.HistColdStartWindow = 200 * time.Hour },
+	} {
+		cfg := DefaultConfig()
+		mutate(&cfg)
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("%s: expected a validation error", name)
+		}
+	}
+}

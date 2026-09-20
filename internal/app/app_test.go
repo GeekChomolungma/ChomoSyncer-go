@@ -236,3 +236,47 @@ func TestBackfillDisabledByDefault(t *testing.T) {
 	}
 	_ = a.Shutdown(context.Background())
 }
+
+func TestOpenInterestIsOffByDefaultAndWiredWhenEnabled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	a, err := New(ctx, smokeConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.oi != nil {
+		t.Fatal("open interest must not be built when neither part is enabled")
+	}
+	_ = a.Shutdown(context.Background())
+
+	cfg := smokeConfig()
+	cfg.OpenInterest.HistEnabled = true
+	cfg.OpenInterest.LiveEnabled = true
+	a, err = New(ctx, cfg)
+	if err != nil {
+		t.Fatalf("New with open interest enabled: %v", err)
+	}
+	if a.oi == nil {
+		t.Fatal("open interest was not wired although enabled")
+	}
+	done := make(chan error, 1)
+	go func() { done <- a.Shutdown(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown hung with open interest enabled")
+	}
+}
+
+func TestInvalidOpenInterestConfigFailsFast(t *testing.T) {
+	cfg := smokeConfig()
+	cfg.OpenInterest.LiveEnabled = true
+	cfg.OpenInterest.LiveLead = 10 * time.Minute // longer than the bar
+	if _, err := New(context.Background(), cfg); err == nil {
+		t.Fatal("expected New to reject an invalid open_interest config")
+	}
+}

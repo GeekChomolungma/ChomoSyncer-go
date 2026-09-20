@@ -111,3 +111,24 @@ weight_gate:                     # /fapi 请求权重闸门：所有 /fapi REST 
   misc_budget: 100               # 杂项（universe 的 exchangeInfo）的权重/分钟。三项之和不得超过 2400，余量留给闸门看不到的同 IP 流量
   soft_limit: 1800               # 币安响应头 X-MBX-USED-WEIGHT-1M 达到此值时，批量任务等到下一分钟再继续
   hard_limit: 2300               # 达到此值时，连 live 与杂项也等到下一分钟
+
+open_interest:                   # 5 分钟持仓量（OI）同步，写入 market.fapi_oi_5m（先执行 deploy/clickhouse/004_fapi_oi.sql）。设计见 new_requirements/oi.md
+  hist_enabled: false            # 启动时读库中每个标的已校准到哪根，据此从 openInterestHist 补缺；之后每小时校准一次。建议先只开这个
+  live_enabled: false            # 每根 5m K 线收盘前 live_lead 用 /fapi/v1/openInterest 打一轮快照。观察校准指标后再开
+  table: "market.fapi_oi_5m"     # 目标表
+  live_lead: 30s                 # 在 K 线收盘前多久开始一轮（528 个标的约 21 秒发完）
+  live_accept_window: 60s        # 快照时间距最近 5m 边界超过此值则丢弃（必须 < 2m30s）
+  live_workers: 8                # live 并发请求数
+  fapi_rps: 25                   # live 一轮的请求节奏；/fapi 池的硬限制由 weight_gate 负责
+  hist_reconcile_interval: 1h    # 定时校准的周期
+  hist_reconcile_offset: 5m      # 每小时 hh:05 开始（标签 hh:00 最晚约 3 分钟可读）
+  hist_reconcile_spread: 20m     # 一轮的请求在这段时间内匀速铺开（启动补缺不铺开）
+  hist_publish_lag: 4m           # 标签 T 预计在 T 之后多久可读，用来判断“已是最新则跳过”
+  hist_limit_margin: 3           # 每次请求比缺口多要几根，容忍个别失败
+  hist_max_limit: 500            # 单次请求 limit 上限（币安文档上限 500）；更长的缺口从新往旧分页
+  hist_cold_start_window: 48h    # 库里没有任何已校准行的标的，补回多远
+  hist_max_backfill: 168h        # 补缺最远回溯多久（币安只保留约 30 天）；更早的缺口需要用归档导入
+  hist_workers: 4                # hist 并发拉取的标的数
+  data_rps: 2                    # /futures/data 池的请求速率（该池每 IP 每 5 分钟 1000 次）
+  data_window_cap: 900           # /futures/data 池 5 分钟滑动窗口的硬上限
+

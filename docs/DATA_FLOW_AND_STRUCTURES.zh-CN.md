@@ -4,9 +4,11 @@
 
 > **文档定位**：本文档深入剖析 `ChomoSyncer-go` 全市场行情数据采集器的业务工作流、数据流转管道、核心并发/线程模型以及各存储/缓存层的数据结构设计。重点阐明**从外部调用 Redis / ClickHouse 查询具体内容时的键命名规范、查询命令示例、返回格式及各字段业务定义**。  
 > **适用版本**：`ChomoSyncer-go` v1.0+  
-> **涉及核心包**：`cmd/chomosyncer-go`、`internal/app`、`internal/universe`、`internal/collector`、`internal/dispatcher`、`internal/rediswin`、`internal/windowgate`、`internal/chwriter`、`internal/backfill`  
+> **涉及核心包**：`cmd/chomosyncer-go`、`internal/app`、`internal/universe`、`internal/collector`、`internal/dispatcher`、`internal/rediswin`、`internal/windowgate`、`internal/chwriter`、`internal/backfill`、`internal/weightgate`、`internal/openinterest`  
 >
 > **重要（1m 基准 + 派生）**：本构建**只订阅 1 分钟 K 线**，只落一张原始表 `market.fapi_kline_1m`，Redis 只维护 1m 的 `livebar:{SYM}:1m` 与 `kline:{SYM}:1m`。下文凡出现 `{interval}` 的 Redis 键、`fapi_kline_<interval>` 表、"每个配置的 interval" 等表述，实际取值均为 `1m`。更粗周期（`serve_intervals`，默认 `5m/15m/1h/4h/1d`）由两处派生：① ClickHouse 侧从 `fapi_kline_1m FINAL` 幂等重算的 rollup 表 `fapi_kline_{5m,15m,1h,4h,1d}`（`deploy/clickhouse/002_kline_rollups.sql`）；② `stream:market:kline_ready` 上由"桶末 1m 截面"派生转发的截面信号。粗周期没有 Redis 窗口/livebar，下游直接查 ClickHouse。
+>
+> **持仓量（可选旁路模块）**：与上面的 K 线管线相互独立，`internal/openinterest` 可以从币安 REST 维护一张 5 分钟持仓量表 `market.fapi_oi_5m`（及其汇总表），见 §10，默认关闭。所有 `/fapi` REST 调用方（K 线回补、universe 刷新、持仓量 live 快照）共用同一个请求权重闸门 `internal/weightgate`（§8.3）。
 
 ---
 
@@ -89,7 +91,7 @@
   - 启动入口：[`internal/universe/monitor.go:141`](../internal/universe/monitor.go#L141) (`Monitor.Start`)
   - 后台循环：[`internal/universe/monitor.go:160`](../internal/universe/monitor.go#L160) (`Monitor.loop`)
   - 刷新逻辑：[`internal/universe/monitor.go:199`](../internal/universe/monitor.go#L199) (`Monitor.Refresh`)
-  - 业务消费与分发：[`internal/app/app.go:217`](../internal/app/app.go#L217) (`App.onUniverseChange`)
+  - 业务消费与分发：[`internal/app/app.go:386`](../internal/app/app.go#L386) (`App.onUniverseChange`)
 
 ### 1.3 数据结构与 Schema 设计
 #### 网络层 (Binance REST API)
@@ -579,7 +581,7 @@ ClickHouse 是全系统底层持久化的**唯一权威事实库**（Cold Storag
     - 底层 [`clickHouseFlusher.Flush`](../internal/chwriter/clickhouse.go#L93) 在连接失效时自动 Ping 和重连。
     - 写入失败时进入 [`flushWithRetry`](../internal/chwriter/writer.go#L217)，最多带半抖动重试 3 次，超出则报警。
 - **代码入口**：
-  - 路由分发：[`internal/app/app.go:348`](../internal/app/app.go#L348) (`archiveRouter.TryPush`)
+  - 路由分发：[`internal/app/app.go:620`](../internal/app/app.go#L620) (`archiveRouter.TryPush`)
   - 批量循环：[`internal/chwriter/writer.go:142`](../internal/chwriter/writer.go#L142) (`BatchWriter.loop`)
   - 列式发送：[`internal/chwriter/clickhouse.go:93`](../internal/chwriter/clickhouse.go#L93) (`clickHouseFlusher.Flush`)
 
@@ -621,9 +623,9 @@ Gapfill 负责与增量采集**并行运作**，在后台将缺失数据从币�
 ### 8.3 核心调用者、并发模型与代码入口
 - **核心调用者**：[`backfill.Backfiller`](../internal/backfill/backfill.go#L182)
 - **三大触发源**：
-  1. **冷启动 (Cold Start)**：[`App.Run`](../internal/app/app.go#L268) 中在 Universe 首次获取后调用 `SubmitColdStart`。若 ClickHouse 为空库，以 `cold_start_date` 为起点拉取历史；若已有历史落档，从 ClickHouse `max(start_time) + 1 step` 开始持续接续同步至当下最新时刻。在此期间 HTTP 探针 `/readyz` 返回 503，回补完成后转为 200。
-  2. **Shard 断线重连 (Shard Reconnect)**：Shard 重连成功后回调 [`collector.OnGap`](../internal/app/app.go#L196) -> [`Backfiller.HandleGap`](../internal/backfill/backfill.go#L328)。带有 30s 防抖，不再设限窗口，直接查询 ClickHouse 的最新记录时间作为起点，保证零缺口 (Zero Gap) 补齐。
-  3. **Universe 新增合约 (Universe Add)**：[`App.onUniverseChange`](../internal/app/app.go#L242) 检测到 Universe 发生增量，向队列提交新币的全窗口回补。
+  1. **冷启动 (Cold Start)**：[`App.Run`](../internal/app/app.go#L428) 中在 Universe 首次获取后调用 `SubmitColdStart`。若 ClickHouse 为空库，以 `cold_start_date` 为起点拉取历史；若已有历史落档，从 ClickHouse `max(start_time) + 1 step` 开始持续接续同步至当下最新时刻。在此期间 HTTP 探针 `/readyz` 返回 503，回补完成后转为 200。
+  2. **Shard 断线重连 (Shard Reconnect)**：Shard 重连成功后回调 [`collector.OnGap`](../internal/app/app.go#L261) -> [`Backfiller.HandleGap`](../internal/backfill/backfill.go#L328)。带有 30s 防抖，不再设限窗口，直接查询 ClickHouse 的最新记录时间作为起点，保证零缺口 (Zero Gap) 补齐。
+  3. **Universe 新增合约 (Universe Add)**：[`App.onUniverseChange`](../internal/app/app.go#L386) 检测到 Universe 发生增量，向队列提交新币的全窗口回补。
 - **离线回补模式 (`backfill.offline_only`)**：当开启此开关时，`App.Run` 走 `runBackfillOnly` 分支——只装配 universe/fetcher/chwriter/backfiller，跳过 collector、dispatcher、rediswin、windowgate；提交一次 whole-universe 冷启动后通过 `Backfiller.WaitColdStart` 阻塞至回补完成即退出（`gate_timeout` 失效，不会中途强制释放）。用于"先离线灌满深历史、校验后再上线实时业务"的两阶段冷启动，详见 `docs/OPERATIONS.md` §A.1 / §B.1（空库首次上线）。
 - **并发与 Goroutine 模型**：
   - **主请求调度 Loop（单 Goroutine）**：
@@ -632,7 +634,7 @@ Gapfill 负责与增量采集**并行运作**，在后台将缺失数据从币�
   - **REST 拉取 Worker Pool（多 Goroutine 并发）**：
     - 处理单个请求时，在 [`processInterval`](../internal/backfill/backfill.go#L413) 内部通过信号量 Channel `sem := make(chan struct{}, b.cfg.workers)` 限制最大并发 Worker 数（默认 4 个）。
     - **分割方式**：**按 Symbol 进行并发分割**。每个 Symbol 启动一个临时 Goroutine 并发执行 `fetchAndArchive`。
-    - **限流控制**：所有 Worker 共享一个全局 Token Bucket 限流器 [`rate.Limiter`](../internal/backfill/rest.go#L38)（默认 20 RPS），防止触发币安 429 / 418 IP 封禁。
+    - **限流控制**：每个请求先经过按请求速率的令牌桶（`rest_rps`，默认 20 RPS，[`rate.Limiter`](../internal/backfill/rest.go#L38)），再作为 `ClassBulk` 经过**共享的 `/fapi` 权重闸门** [`weightgate.Gate`](../internal/weightgate/gate.go#L239)。币安按请求里的 `limit` 参数来计 `/fapi/v1/klines` 的权重（实测：100 → 1、500 → 2、1000 → 5、1500 → 10），所以每页的 `limit` 按缺口取值（`pageLimitFor`）：3 分钟的缺口只花权重 1，而不是 10。闸门把按 IP 计的 2400/分钟额度拆成各类别的预算（live 600 / bulk 1200 / misc 100），读取每个响应里的 `X-MBX-USED-WEIGHT-1M`（导出为 `weightgate_used_weight_1m`），读数 ≥ 1800 时批量任务等待（live/misc 在 ≥ 2300 时才等）；收到 429/418 会暂停所有 `/fapi` 调用方。以此避免触发币安 429 / 418 IP 封禁。
   - **显式 Flush 同步屏障与尾部读回**：
     - REST 拉取的数据逐行调用 `chwriter.Push` 写入 ClickHouse 缓冲队列。
     - Worker 全部完成后，主循环主动调用 `aw.Flush(ctx)` 触发显式落盘屏障，BatchWriter 立即清空 Channel 中堆积的所有行并阻塞等待 ClickHouse TCP 批次物理写入完成（若无 writer 则 fallback 到 `FlushWait`）。
@@ -694,7 +696,92 @@ curl -s localhost:9090/metrics | grep dispatcher_kline_ready_suppressed_total
 
 ---
 
-## 10. 业务工作流对比矩阵
+## 10. 持仓量同步流 (Open Interest Sync Flow)
+
+> 拉取模型的**旁路模块**：它不经过 dispatcher、窗口门控和 Redis，且**默认关闭**（`open_interest.hist_enabled` / `live_enabled`）。币安没有持仓量的 WebSocket 流（已对照官方 connector 并实际订阅验证），所以这里全部走 REST。设计、实测数据以及每条规则背后的理由：[`../new_requirements/oi.md`](../new_requirements/oi.md)。
+
+### 10.1 外部存储查询契约 (ClickHouse Query Contract)
+
+#### 1. 表
+- **原始表**：`market.fapi_oi_5m`（`deploy/clickhouse/004_fapi_oi.sql`）——由 `internal/openinterest` 写入，**不经过** `chwriter`。引擎 `ReplacingMergeTree(src_rank)`，键 `(symbol, start_time)`，按月分区。它存着无法重放的 live 快照，所以**永远不要删**。
+- **汇总表**：`market.fapi_oi_{15m,1h,4h,1d,1mo}` + 刷新式物化视图 `*_rmv`（`005`），历史折叠 `006`。与 K 线汇总同一套设计：从 `FINAL` 全量重算、按桶对齐、UTC 锚定（见 `ARCHITECTURE_MODULES.zh-CN.md` §8.6）。
+- **查询约定**：`... FROM market.fapi_oi_5m FINAL ...`，按 `(symbol, start_time)` 与 `fapi_kline_5m` 拼接；LEFT JOIN 要加 `SETTINGS join_use_nulls = 1`，否则缺失的 OI 行会被读成 `0`。
+
+#### 2. 外部查询命令与代码示例
+```bash
+# 某个币种最新的持仓量行，以及是谁写的
+clickhouse-client --query "
+SELECT symbol, start_time, sum_open_interest, snap_time, src_rank
+FROM market.fapi_oi_5m FINAL WHERE symbol = 'BTCUSDT' ORDER BY start_time DESC LIMIT 5 FORMAT PrettyCompact"
+
+# 最近 6 小时里，还有多少是未校准的 live 快照(1)、币安历史(2)、归档(3)
+clickhouse-client --query "
+SELECT src_rank, count() AS rows, max(start_time) AS newest
+FROM market.fapi_oi_5m FINAL WHERE start_time >= now() - INTERVAL 6 HOUR GROUP BY src_rank ORDER BY src_rank"
+
+# 模块与共享 /fapi 权重闸门的运行状态
+curl -s localhost:9090/metrics | grep -E '^(oi_|weightgate_)'
+```
+
+消费侧的完整说明（对齐、修正、汇总表）：[`DATA_CONSUMER_GUIDE.zh-CN.md` §1b](DATA_CONSUMER_GUIDE.zh-CN.md)。一致性检查：`cmd/test-tools/check_oi_consistency.py`。
+
+#### 3. `market.fapi_oi_5m` 表结构
+
+| 列 | ClickHouse 类型 | 示例 | 业务含义 |
+| :--- | :--- | :--- | :--- |
+| `symbol` | `LowCardinality(String)` | `'BTCUSDT'` | 币种。 |
+| `start_time` | `DateTime64(3, 'UTC')` | `'2026-09-21 12:05:00.000'` | **主键。** 该值所属的那根 5m K 线（按**收盘**算）的开盘时间；与 `fapi_kline_5m.start_time` 完全一致。 |
+| `sum_open_interest` | `Float64` | `109049.48` | `start_time + 5m` 那一刻的持仓量，单位是合约张数（标的资产计）。 |
+| `snap_time` | `DateTime64(3, 'UTC')` | `'2026-09-21 12:09:27.000'` | 这个值实际被观测的时刻：live = 交易所响应里的 `time`；hist / 归档 = `start_time + 5m`。 |
+| `src_rank` | `UInt8` | `2` | `1` live，`2` hist（`openInterestHist`），`3` 归档。合并时最高的胜出。 |
+| `created_at` | `DateTime` | `'2026-09-21 12:10:04'` | 落盘时间，内部字段。 |
+
+---
+
+### 10.2 业务定位与目标
+给策略提供一条与它已经在读的 K 线对齐的持仓量序列：**在 bar 收盘的那一刻就有**，之后又被校准成与币安自己的历史**完全一致**。
+
+- **两个来源，一行数据。** *Live*（`GET /fapi/v1/openInterest`，在每根 5 分钟 K 线收盘前打一次快照）保证及时；*hist*（`GET /futures/data/openInterestHist`）是币安权威的序列，所以事后会覆盖 live 行。hist 的标签 `T` 是 `T` **时刻**的快照，属于在 `T` 收盘的那根 K 线，即存到 `start_time = T − 5m`；live 快照按响应里自己的 `time` 归属到同一根，而不是按发请求的时刻。
+- **启动时按数据库里的现状决策。** 每次启动，模块都会逐个标的读出“表已经校准到哪根”，只取缺的那一段（已是最新的标的一个请求都不发）——见 10.3。
+- **两个互相独立的限流池。** live 通过共享的 `internal/weightgate` 使用 `/fapi` 权重预算；hist 用自己的计数器使用 `/futures/data` 池（每 IP 每 5 分钟 1000 次）。二者互不竞争，所以再长的补缺也不会拖慢 live 快照。
+
+### 10.3 核心调用者、并发模型与代码入口
+- **核心调用者**：[`openinterest.Syncer`](../internal/openinterest/syncer.go#L144)（`Build`），由 `App.Run` 在**首次 universe 刷新之后**启动（它需要标的列表），由 `App.Shutdown` 关闭。
+
+```text
+                       Universe（标的列表）
+                                │
+        ┌───────────────────────┴───────────────────────┐
+        ▼                                               ▼
+  Live 循环（1 个 goroutine + 8 个 worker）         Hist 校准器（1 个 goroutine + 4 个 worker）
+  每个 5m 边界 B，从 B-30s 开始：                    LoadState：按标的读“已校准到哪根”
+  GET /fapi/v1/openInterest                          启动补缺一轮，之后每小时 hh:05（20 分钟内铺开）
+  经 weightgate.ClassLive（权重 1）                  GET /futures/data/openInterestHist，经 DataPool
+        │ Row{src_rank=1}                                  │ Row{src_rank=2}，标签 T 存到 start T-5m
+        └───────────────────────┬──────────────────────────┘
+                                ▼
+                    openinterest.Writer（攒批、重试）
+                                ▼
+                     market.fapi_oi_5m  (ReplacingMergeTree(src_rank))
+                                ▼
+                  刷新式 MV -> fapi_oi_{15m,1h,4h,1d,1mo}
+```
+
+- **并发与 Goroutine 模型**：
+  - **Live 循环**（[`Live.Run`](../internal/openinterest/live.go#L111)）：一个调度 goroutine。每个边界 `B`，等到 `B − live_lead`（30 秒）后执行 [`Cycle`](../internal/openinterest/live.go#L132)：8 个 worker 从 channel 里取标的，按 `fapi_rps`（25 次/秒）节奏、经权重闸门放行。这一轮在 `B + live_accept_window`（60 秒）时放弃未完成的请求。快照对应哪一行由响应的 `time` 决定（取最近的边界，距离超过接受窗口则丢弃），从不由调用时刻决定；实测响应里的 `time` 比发请求的时刻早约 3 秒。
+  - **Hist 校准器**（[`Reconciler.Run`](../internal/openinterest/hist.go#L164)）：一个调度 goroutine + 4 个 worker。[`LoadState`](../internal/openinterest/hist.go#L128) 从 ClickHouse 按标的读出 `src_rank >= 2` 的最新一行（数据库不可用时一直重试）。然后 [`plan`](../internal/openinterest/hist.go#L220) 逐个标的决策：已是最新 → **跳过，不发请求**；落后 → 从那一根起重取（多取一根做重叠）；没有任何已校准行 → 冷启动窗口（48 小时）；最远不超过 `hist_max_backfill`（7 天）。请求的 `limit` 按缺口取值（缺口 + 余量），并且因为只传 `startTime` 无法向前翻页，长缺口通过移动 `endTime` **从新往旧**翻页（[`fetchSymbol`](../internal/openinterest/hist.go#L375)）。启动那一轮不铺开；每小时的一轮从 `hh:05` 开始，把请求在 20 分钟内铺开，缺口大的先取，失败的标的轮末重试一次。内存里“校准到哪根”的状态只在行**落盘之后**才前进（[`Pass`](../internal/openinterest/hist.go#L262)）。
+  - **写入器**（[`Writer.loop`](../internal/openinterest/writer.go#L160)）：一个 goroutine，按数量或时间攒批并重试；是 `chwriter.BatchWriter` 的一个小型独立对应物（K 线写入器没有被改动）。
+  - **live 与 hist 的对比诊断几乎免费：** 每个标的最近约 24 根的 live 值保存在内存里，校准时直接和 hist 对比，不用查 ClickHouse（`oi_live_vs_hist_rel_diff`、`oi_live_gap_bars_total`）。
+- **限流控制**：live → [`weightgate.Gate.Wait`](../internal/weightgate/gate.go#L239)（`ClassLive`）；hist → [`DataPool.Wait`](../internal/openinterest/limiter.go#L87)（5 分钟滑动窗口上限 900、令牌桶 2 次/秒、收到 429/418 全局暂停）。
+- **代码入口**：
+  - 装配：[`internal/app/app.go:275`](../internal/app/app.go#L275)（`newOpenInterest`），启动在 [`app.go:455`](../internal/app/app.go#L455)，关闭在 [`app.go:546`](../internal/app/app.go#L546)
+  - 对齐规则：[`align.go:38`](../internal/openinterest/align.go#L38)（`liveBarStart`）、[`align.go:54`](../internal/openinterest/align.go#L54)（`histBarStart`）
+  - REST 客户端：[`client.go:132`](../internal/openinterest/client.go#L132)（`Snapshot`）、[`client.go:162`](../internal/openinterest/client.go#L162)（`History`）
+  - 启动时读库中状态：[`clickhouse.go:185`](../internal/openinterest/clickhouse.go#L185)（`CHStore.LastStarts`）
+
+---
+
+## 11. 业务工作流对比矩阵
 
 | 工作流名称 | 核心调用入口 | 并发/线程模型 | Goroutine 分割策略 | 写入存储目标 | 核心数据结构 / Key 设计 | 外部查询返回形式 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -706,4 +793,6 @@ curl -s localhost:9090/metrics | grep dispatcher_kline_ready_suppressed_total
 | **全市场截面聚合** | `aggregator.mark` | Dispatcher Workers | 内存 Mutex + Section 定时器 | Redis Stream | `stream:market:kline_ready` | Redis Stream Entry (`interval`, `timestamp`, `count`) |
 | **ClickHouse 批量归档** | `BatchWriter.loop` | 单 Goroutine / Interval | 每个 Interval 拥有独立 BatchWriter | ClickHouse | `market.fapi_kline_<iv>` (ReplacingMergeTree) | 列式/行式表格结果（12 列 Raw Fact 数据） |
 | **历史 Gapfill 回补** | `Backfiller.run` | 主 Loop + Worker Pool | 主 Loop 串行；Worker Pool 按 Symbol 并发 (4 workers) | CH + Redis | REST `/fapi/v1/klines` + Lua DEL/RPUSH | CH FINAL 表格 + Redis 覆盖后 200 根 List |
+| **持仓量 live 快照** | `Live.Run` | 1 个调度 Goroutine + 8 个 Worker | 按标的，Worker 竞争 Channel，每个 5 分钟边界一轮 | ClickHouse（独立的 `openinterest.Writer`） | `market.fapi_oi_5m`（`src_rank=1`，`start_time` = 正在收盘那根 bar 的开盘时间） | 5m 表的一行：`sum_open_interest`、`snap_time`、`src_rank` |
+| **持仓量 hist 补缺 / 校准** | `Reconciler.Run` | 1 个调度 Goroutine + 4 个 Worker | 按标的；`limit` 按缺口取值，用 `endTime` 从新往旧翻页 | ClickHouse（独立的 `openinterest.Writer`） | `market.fapi_oi_5m`（`src_rank=2`，标签 `T` 存到 `T-5m`） | 同一行，替换掉 live 的那一行 |
 | **窗口门控仲裁** | `Gate.Hold / Release` | 调用于主 Loop 与 Workers | 内存并发 RWMutex | 内存引用计数 | `Key{Symbol, Interval}` 引用计数器 | 控制 `kline:*` 与 `stream:market:kline_ready` 冻结 |

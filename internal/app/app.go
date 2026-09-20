@@ -18,6 +18,7 @@ import (
 	"github.com/HarvestStars/chomosyncer-go/internal/collector"
 	"github.com/HarvestStars/chomosyncer-go/internal/dispatcher"
 	"github.com/HarvestStars/chomosyncer-go/internal/metrics"
+	"github.com/HarvestStars/chomosyncer-go/internal/openinterest"
 	"github.com/HarvestStars/chomosyncer-go/internal/rediswin"
 	"github.com/HarvestStars/chomosyncer-go/internal/universe"
 	"github.com/HarvestStars/chomosyncer-go/internal/weightgate"
@@ -37,7 +38,8 @@ type App struct {
 	win       *rediswin.Writer
 	live      *rediswin.LiveBarWriter
 	univ      *universe.Monitor
-	wgate     *weightgate.Gate // shared /fapi request-weight gate: every /fapi REST caller goes through it
+	wgate     *weightgate.Gate     // shared /fapi request-weight gate: every /fapi REST caller goes through it
+	oi        *openinterest.Syncer // 5m open-interest sync (live snapshots + hist calibration); nil when disabled
 	disp      *dispatcher.Dispatcher
 	col       *collector.Collector
 
@@ -270,9 +272,38 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		return fail("collector: %w", err)
 	}
 
+	a.oi, err = newOpenInterest(cfg, reg, a.wgate, func() []string { return a.univ.Snapshot().Symbols })
+	if err != nil {
+		return fail("open interest: %w", err)
+	}
+
 	a.univ.OnChange(a.onUniverseChange)
 
 	return a, nil
+}
+
+// newOpenInterest builds the open-interest syncer, or nil when neither part is
+// enabled. It reuses the ClickHouse connection and batching settings of the kline
+// writers, and the shared /fapi weight gate for its live snapshots.
+func newOpenInterest(cfg Config, reg prometheus.Registerer, wgate *weightgate.Gate, symbols func() []string) (*openinterest.Syncer, error) {
+	oiCfg := cfg.OpenInterest.ToModule()
+	oiCfg.Writer = openinterest.WriterConfig{
+		BatchSize:       cfg.ClickHouse.BatchSize,
+		FlushInterval:   cfg.ClickHouse.FlushInterval,
+		ChannelSize:     cfg.ClickHouse.ChannelSize,
+		MaxRetries:      cfg.ClickHouse.MaxRetries,
+		RetryBackoff:    cfg.ClickHouse.RetryBackoff,
+		MaxRetryBackoff: cfg.ClickHouse.MaxRetryBackoff,
+		ShutdownTimeout: cfg.ClickHouse.ShutdownTimeout,
+	}
+	return openinterest.Build(oiCfg, openinterest.CHConfig{
+		Addrs:       cfg.ClickHouse.Addrs,
+		Database:    cfg.ClickHouse.Database,
+		Username:    cfg.ClickHouse.Username,
+		Password:    cfg.ClickHouse.Password,
+		DialTimeout: cfg.ClickHouse.DialTimeout,
+		TLS:         cfg.ClickHouse.TLS,
+	}, cfg.Universe.RESTURL, wgate, symbols, reg, cfg.Logger)
 }
 
 // newUniverse builds the market-discovery monitor.
@@ -419,11 +450,20 @@ func (a *App) Run(ctx context.Context) error {
 		a.log.Info("cold-start backfill submitted", "keys", len(syms)*len(a.cfg.Collector.Intervals))
 	}
 
+	// The open-interest sync needs the universe, so it starts after the first refresh.
+	if a.oi != nil {
+		if err := a.oi.Start(ctx); err != nil {
+			_ = a.Shutdown(context.Background())
+			return fmt.Errorf("app: start open interest: %w", err)
+		}
+	}
+
 	a.log.Info("chomosyncer-go running",
 		"metrics_addr", a.metrics.Addr(),
 		"intervals", a.cfg.Collector.Intervals,
 		"symbols", len(a.univ.Snapshot().Symbols),
-		"backfill", a.backfiller != nil)
+		"backfill", a.backfiller != nil,
+		"open_interest", a.oi != nil)
 
 	<-ctx.Done()
 	a.log.Info("shutdown signal received; draining")
@@ -501,6 +541,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 	a.shutdownOnce.Do(func() {
 		if a.col != nil {
 			closeStep(ctx, a.log, "collector", &errs, a.col.Close)
+		}
+		if a.oi != nil {
+			closeStep(ctx, a.log, "openinterest", &errs, a.oi.Close)
 		}
 		if a.backfiller != nil {
 			closeStep(ctx, a.log, "backfiller", &errs, a.backfiller.Close)

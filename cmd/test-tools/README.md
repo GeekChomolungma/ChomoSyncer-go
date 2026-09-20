@@ -17,6 +17,7 @@ The sections below are ordered to match **when each check first becomes meaningf
 | **A — before the live service starts** (right after offline backfill + `002`/`003` rollup) | ClickHouse-only; no Redis, no live daemon needed | 1) `check_clickhouse_integrity.py` → 2) `check_vs_binance.py` |
 | **B — after the live service is running** | Needs the daemon streaming into Redis | 3) `check_redis_livebars.py` → 4) `check_redis_closed_windows.py` → 5) `monitor_redis_kline_ready.py` → 6) `e2e_reconciliation.py` |
 | **C — anytime, wraps A2 + all of B** | One command, go/no-go verdict | 7) `run_all_checks.py` |
+| **D — after the `open_interest` module is enabled** | ClickHouse-only (plus Binance with `--vs-binance`) | 8) `check_oi_consistency.py` (also runnable from 7 with `--oi`) |
 
 This mirrors `docs/OPERATIONS.md` §3 (B.1/B.2): you validate ClickHouse's own history and cross-check it against Binance's ground truth *before* flipping on the online pipeline (see the two-phase cold-start rationale there), then validate the live Redis-facing paths once the daemon is actually running.
 
@@ -33,6 +34,7 @@ This mirrors `docs/OPERATIONS.md` §3 (B.1/B.2): you validate ClickHouse's own h
 | `monitor_redis_kline_ready.py` | **[Phase B·3] Redis cross-section notification stream monitor**: watches `stream:market:kline_ready` (including derived coarser-interval signals) and evaluates readiness latency, symbol coverage, and the aggregation trigger reason |
 | `e2e_reconciliation.py` | **[Phase B·4] Cache-vs-storage reconciliation tool**: compares the Redis `kline:{SYM}:1m` window against ClickHouse `fapi_kline_1m`, bar-by-bar, for timestamp and OHLCV consistency |
 | `run_all_checks.py` | **[Phase C] One-shot pre-flight orchestrator**: runs every check with a single command and outputs a visual red/green health scorecard |
+| `check_oi_consistency.py` | **[Phase D] Open-interest consistency checker**: read-only checks of `market.fapi_oi_5m` — gaps, 5-minute grid, `snap_time` semantics, freshness, calibration by hist, coverage against the kline table, per-bar cross-section, and (optionally) value-for-value against Binance |
 | `common.py` | Shared utility library: config loading, ClickHouse/Redis clients, symbol discovery, time utilities, table formatting, etc. Not a check by itself. |
 | `test_toolkit.py` | The toolkit's built-in unit tests and mock validation suite (`python -m pytest cmd/test-tools/test_toolkit.py`, or run directly) |
 | `requirements.txt` | Python dependency manifest |
@@ -50,7 +52,7 @@ pip install -r cmd/test-tools/requirements.txt
 > **Tips**:
 > - Scripts preferentially connect using the addresses configured in `config.yaml` (falling back to `config.example.yaml`); pass `--config /path/to/config.yaml` to point elsewhere, or use the per-tool `--ch-*` / `--redis-*` flags to override individual fields without touching the file.
 > - ClickHouse access supports two protocols: `clickhouse-connect` is preferred; if its native C extension is not installed, it automatically and seamlessly falls back to ClickHouse's native HTTP interface (port 8123), with no cross-platform compilation dependencies to worry about.
-> - Every tool that talks to Binance REST (`check_vs_binance.py`) shares the exchange's per-IP rate budget with the live daemon's own backfill traffic — see the rate-limit note in its section below before running it against the whole universe.
+> - Every tool that talks to Binance REST (`check_vs_binance.py`, and `check_oi_consistency.py --vs-binance`) shares the exchange's per-IP rate budget with the live daemon's own traffic — see the rate-limit notes in their sections below before running them against the whole universe.
 
 ---
 
@@ -299,7 +301,7 @@ Exit code `0` = Redis and ClickHouse agree on every compared bar; `1` = a mismat
 
 ### 7. One-Shot Pre-Flight Scorecard (`run_all_checks.py`)
 
-**Phase C — the final gate, and the tool most external users will actually run.** Internally runs tools #1, #3, #4, #5, #6 in that order (plus #2 only when `--vs-binance` is passed, since it's the slow, REST-heavy one), and aggregates everything into one red/green scorecard with a go/no-go verdict (`READY FOR PRODUCTION DEPLOYMENT` or `DEPLOYMENT BLOCKED`).
+**Phase C — the final gate, and the tool most external users will actually run.** Internally runs tools #1, #3, #4, #5, #6 in that order (plus #2 only when `--vs-binance` is passed, since it's the slow, REST-heavy one, and #8 only when `--oi` is passed, since the open-interest module is off by default), and aggregates everything into one red/green scorecard with a go/no-go verdict (`READY FOR PRODUCTION DEPLOYMENT` or `DEPLOYMENT BLOCKED`).
 
 #### Flags:
 | Flag | Default | Meaning |
@@ -313,6 +315,7 @@ Exit code `0` = Redis and ClickHouse agree on every compared bar; `1` = a mismat
 | `--skip-redis` | off | Skip the Redis checks (live bars + closed windows) |
 | `--skip-e2e` | off | Skip the end-to-end reconciliation |
 | `--vs-binance` | off | Also run `check_vs_binance.py` against the ClickHouse rollups (slow; hits the exchange — see tool #2's rate-limit note) |
+| `--oi` | off | Also run `check_oi_consistency.py` (last 6h; needs the `open_interest` module to be running). With `--vs-binance` it also compares a sample of OI rows with Binance |
 | `--verbose` | off | Print the full stdout of every sub-check, not just the summary |
 
 #### Example usage:
@@ -331,6 +334,67 @@ python cmd/test-tools/run_all_checks.py --verbose
 ```
 
 Exit code `0` = every sub-check that ran passed; `1` = at least one sub-check failed.
+
+---
+
+### 8. Open-Interest Table Consistency Check (`check_oi_consistency.py`)
+
+**Phase D — after the `open_interest` module has been enabled** (design: [`new_requirements/oi.md`](../../new_requirements/oi.md), consumer view: [`docs/DATA_CONSUMER_GUIDE.md`](../../docs/DATA_CONSUMER_GUIDE.md)). **Read-only.** It inspects `market.fapi_oi_5m` over the last `--hours` of bars that should already exist, and answers "can a strategy trust this series?". Only bars whose close is at least `--settle-minutes` old are examined, so a bar hist has not published yet is never reported as missing.
+
+| Check | What it looks at | Verdict |
+| :--- | :--- | :--- |
+| **A. Series integrity** (per symbol) | missing bars between the first and last bar; every `start_time` on the 5-minute grid; finite, non-negative values; **`snap_time` vs `start_time`** (hist/archive rows: exactly `start_time + 5m`; live rows: within `--live-accept` of it); the newest bar is at most `--max-lag-bars` behind | gap / off-grid / bad snap / stale → **FAIL**; zero value → WARN |
+| **B. Freshness & source health** | newest bar overall and newest *calibrated* (`src_rank >= 2`) bar; live rows older than `--max-uncalibrated-hours` that hist never replaced | table stale → **FAIL**; calibration stalled or uncalibrated live rows → WARN (**FAIL** with `--require-calibration`) |
+| **C. Consumer view** | for every `fapi_kline_5m` bar in the window, is there an OI row? per-symbol coverage | below `--min-coverage` (default 99.5%) → **FAIL**; a symbol with klines but no OI row at all is named explicitly |
+| **D. Cross-section** | per bar, the share of symbols that have an OI row | any bar below `--min-cross-section` (default 99%) → **FAIL** |
+| **E. vs Binance** (`--vs-binance`) | a sample of symbols compared value-for-value with Binance's own `openInterestHist`: label `T` must be stored at `start_time = T-5m`; rank ≥ 2 rows must equal Binance's value exactly; live rows within `--live-tol` | mismatch or missing row → **FAIL** |
+
+What the checks mean for the data (why they exist):
+- **`snap_time` and the `T-5m` rule** are what prove live snapshots are attributed to the kline that is closing and hist labels are stored one bar earlier; an off-by-one-bar shift would otherwise be invisible because adjacent OI values differ by only ~0.02%.
+- **Off-grid rows** are the fingerprint of a timezone or unit error at import time.
+- **Uncalibrated live rows** mean the hourly hist calibration is not running; live values would then never be replaced by Binance's own series.
+
+#### Flags:
+| Flag | Default | Meaning |
+| :--- | :--- | :--- |
+| `--config` | auto-discover | Path to `config.yaml` (`open_interest.table` is used if set) |
+| `--table` | `market.fapi_oi_5m` | OI table to inspect |
+| `--kline-table` | `market.fapi_kline_5m` | 5m kline table used for checks C and D |
+| `--hours` | `24` | Window length |
+| `--settle-minutes` | `10` | Only examine bars whose close is at least this old |
+| `--symbol` | whole market | Comma-separated symbols, e.g. `BTCUSDT,ETHUSDT` |
+| `--limit-symbols` | all | Inspect only the first N symbols |
+| `--max-lag-bars` | `2` | Newest bar may be at most this many bars behind |
+| `--live-accept` | `60` | Live rows: max seconds between `snap_time` and the bar's close |
+| `--max-uncalibrated-hours` | `2` | Live rows older than this should have been replaced by hist |
+| `--require-calibration` | off | Make uncalibrated live rows a FAIL instead of a WARN |
+| `--min-coverage` / `--min-cross-section` | `0.995` / `0.99` | Thresholds for checks C / D |
+| `--skip-coverage` | off | Skip the join against the kline table (C and D) |
+| `--vs-binance` | off | Also run check E (hits the exchange) |
+| `--binance-symbols` / `--binance-bars` | `5` / `48` | Symbols sampled / newest hist points fetched per symbol |
+| `--live-tol` | `0.005` | Relative tolerance for live rows vs Binance |
+| `--symbol-delay` | `0.5` | Seconds between Binance requests |
+| `--show-all` / `--max-rows` | off / `30` | List every symbol / cap rows per section |
+| `--ch-host/-port/-db/-user/-password` | from config | ClickHouse overrides |
+
+> **Rate limit note:** `--vs-binance` calls `/futures/data/openInterestHist`, which is a **different pool** from the `/fapi` weight budget (1000 requests per 5 minutes per IP, counted per request, shared with the live service's own hist calibration). It makes one request per sampled symbol, paced by `--symbol-delay`; a default run is 5 requests.
+
+#### Example usage:
+```bash
+# Whole market, last 24h, ClickHouse only
+python cmd/test-tools/check_oi_consistency.py
+
+# A few symbols over the last 6h, with the external ground-truth comparison
+python cmd/test-tools/check_oi_consistency.py --symbol BTCUSDT,ETHUSDT --hours 6 --vs-binance
+
+# Right after the first `hist_enabled` run, before live is switched on: demand calibration
+python cmd/test-tools/check_oi_consistency.py --require-calibration --max-uncalibrated-hours 1
+
+# Against a rehearsal database
+python cmd/test-tools/check_oi_consistency.py --table oi_rehearsal.fapi_oi_5m --kline-table market.fapi_kline_5m
+```
+
+Exit code `0` = no FAIL (WARNs allowed); `1` = at least one FAIL, an empty/missing table (the message says to apply `deploy/clickhouse/004_fapi_oi.sql`), or a connection error.
 
 ---
 

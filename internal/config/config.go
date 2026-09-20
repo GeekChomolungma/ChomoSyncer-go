@@ -7,6 +7,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/HarvestStars/chomosyncer-go/internal/openinterest"
 	"github.com/HarvestStars/chomosyncer-go/internal/weightgate"
 )
 
@@ -20,6 +21,8 @@ type Config struct {
 	Universe   UniverseConfig   `yaml:"universe"`
 	Backfill   BackfillConfig   `yaml:"backfill"`
 	WeightGate WeightGateConfig `yaml:"weight_gate"`
+
+	OpenInterest OpenInterestConfig `yaml:"open_interest"`
 }
 
 // AppConfig contains process-level settings.
@@ -166,6 +169,60 @@ type WeightGateConfig struct {
 	HardLimit  int `yaml:"hard_limit"`  // live/misc back off while Binance reports used weight >= this
 }
 
+// OpenInterestConfig configures the 5-minute open-interest module
+// (internal/openinterest, design: new_requirements/oi.md). Both parts are off by
+// default. They write market.fapi_oi_5m (deploy/clickhouse/004_fapi_oi.sql), which
+// must exist before either is enabled.
+type OpenInterestConfig struct {
+	// HistEnabled: at start-up read, per symbol, how far the table is calibrated and
+	// backfill the rest from openInterestHist; then calibrate every hour.
+	HistEnabled bool `yaml:"hist_enabled"`
+	// LiveEnabled: snapshot /fapi/v1/openInterest shortly before each 5m kline closes.
+	LiveEnabled bool   `yaml:"live_enabled"`
+	Table       string `yaml:"table"` // target table
+
+	// live
+	LiveLead         time.Duration `yaml:"live_lead"`          // start each round this long before the kline closes
+	LiveAcceptWindow time.Duration `yaml:"live_accept_window"` // max distance of a snapshot's time from a 5m boundary
+	LiveWorkers      int           `yaml:"live_workers"`       // concurrent snapshot requests
+	FapiRPS          float64       `yaml:"fapi_rps"`           // request pacing of a round; the shared weight gate is the hard limit
+
+	// hist
+	HistReconcileInterval time.Duration `yaml:"hist_reconcile_interval"`
+	HistReconcileOffset   time.Duration `yaml:"hist_reconcile_offset"`  // a pass starts at hh:offset of each interval
+	HistReconcileSpread   time.Duration `yaml:"hist_reconcile_spread"`  // a scheduled pass spreads its requests over this
+	HistPublishLag        time.Duration `yaml:"hist_publish_lag"`       // a label T is expected readable this long after T
+	HistLimitMargin       int           `yaml:"hist_limit_margin"`      // extra bars requested beyond the gap
+	HistMaxLimit          int           `yaml:"hist_max_limit"`         // largest limit per request (Binance max 500)
+	HistColdStartWindow   time.Duration `yaml:"hist_cold_start_window"` // symbols with no calibrated rows are backfilled this far
+	HistMaxBackfill       time.Duration `yaml:"hist_max_backfill"`      // never reach back further; older gaps need the archive
+	HistWorkers           int           `yaml:"hist_workers"`           // concurrent symbol fetches
+
+	// /futures/data pool (openInterestHist): 1000 requests per 5 minutes per IP
+	DataRPS       float64 `yaml:"data_rps"`
+	DataWindowCap int     `yaml:"data_window_cap"`
+}
+
+// ToModule converts the YAML shape to the module's own Config. The writer settings
+// are filled in by the caller from the ClickHouse section.
+func (o OpenInterestConfig) ToModule() openinterest.Config {
+	return openinterest.Config{
+		HistEnabled: o.HistEnabled,
+		LiveEnabled: o.LiveEnabled,
+		Table:       o.Table,
+		Live: openinterest.LiveConfig{
+			Lead: o.LiveLead, AcceptWindow: o.LiveAcceptWindow, Workers: o.LiveWorkers, RPS: o.FapiRPS,
+		},
+		Hist: openinterest.HistConfig{
+			Interval: o.HistReconcileInterval, Offset: o.HistReconcileOffset, Spread: o.HistReconcileSpread,
+			PublishLag: o.HistPublishLag, LimitMargin: o.HistLimitMargin, MaxLimit: o.HistMaxLimit,
+			ColdStartWindow: o.HistColdStartWindow, MaxBackfill: o.HistMaxBackfill, Workers: o.HistWorkers,
+		},
+		DataRPS:       o.DataRPS,
+		DataWindowCap: o.DataWindowCap,
+	}
+}
+
 // ParseColdStartTime parses ColdStartDate into time.Time (UTC). Supports "2006-01-02",
 // "2006-01-02 15:04:05", and RFC3339. Returns zero time if ColdStartDate is empty.
 func (b BackfillConfig) ParseColdStartTime() (time.Time, error) {
@@ -285,6 +342,26 @@ func DefaultConfig() Config {
 			SoftLimit:  weightgate.DefaultSoftLimit,
 			HardLimit:  weightgate.DefaultHardLimit,
 		},
+		OpenInterest: OpenInterestConfig{
+			HistEnabled:           false,
+			LiveEnabled:           false,
+			Table:                 openinterest.DefaultTable,
+			LiveLead:              30 * time.Second,
+			LiveAcceptWindow:      60 * time.Second,
+			LiveWorkers:           8,
+			FapiRPS:               25,
+			HistReconcileInterval: time.Hour,
+			HistReconcileOffset:   5 * time.Minute,
+			HistReconcileSpread:   20 * time.Minute,
+			HistPublishLag:        4 * time.Minute,
+			HistLimitMargin:       3,
+			HistMaxLimit:          500,
+			HistColdStartWindow:   48 * time.Hour,
+			HistMaxBackfill:       168 * time.Hour,
+			HistWorkers:           4,
+			DataRPS:               2,
+			DataWindowCap:         900,
+		},
 	}
 }
 
@@ -400,6 +477,9 @@ func (c *Config) Validate() error {
 		LiveBudget: c.WeightGate.LiveBudget, BulkBudget: c.WeightGate.BulkBudget, MiscBudget: c.WeightGate.MiscBudget,
 		SoftLimit: c.WeightGate.SoftLimit, HardLimit: c.WeightGate.HardLimit,
 	}).Validate(); err != nil {
+		return err
+	}
+	if err := c.OpenInterest.ToModule().Validate(); err != nil {
 		return err
 	}
 	return nil
