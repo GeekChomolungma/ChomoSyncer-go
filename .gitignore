@@ -61,3 +61,7 @@ Thumbs.db
 # --- logs ---
 *.log
 logs/
+
+# --- python bytecode (cmd/test-tools) ---
+__pycache__/
+*.py[cod]
