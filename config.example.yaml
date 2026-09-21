@@ -122,7 +122,7 @@ open_interest:                   # 5 分钟持仓量（OI）同步，写入 mark
   live_enabled: false            # 每根 5m K 线收盘前 live_lead 用 /fapi/v1/openInterest 打一轮快照。观察校准指标后再开
   table: "market.fapi_oi_5m"     # 目标表
   live_lead: 30s                 # 在 K 线收盘前多久开始一轮（528 个标的约 21 秒发完）
-  live_accept_window: 60s        # 快照时间距最近 5m 边界超过此值则丢弃（必须 < 2m30s）
+  live_accept_window: 60s        # 一轮快照在 K 线收盘之后最多还能继续多久，超时未返回的请求放弃（必须 < 5m）。不再按快照 time 丢弃：币安返回什么就记成这根 bar 的值
   live_workers: 8                # live 并发请求数
   fapi_rps: 25                   # live 一轮的请求节奏；/fapi 池的硬限制由 weight_gate 负责
   hist_reconcile_interval: 1h    # 定时校准的周期

@@ -252,7 +252,7 @@
 设计与实测依据见 [`new_requirements/oi.md`](../new_requirements/oi.md)。默认关闭（`open_interest.hist_enabled` / `live_enabled`）。写入 `market.fapi_oi_5m`（`deploy/clickhouse/004_fapi_oi.sql`），汇总表是 `005` + `006`。它是拉取模型的旁路模块：不经过 dispatcher、窗口门控和 Redis。
 
 - **行的语义。** `start_time` 是“该持仓量所属的那根 5 分钟 K 线”的**开盘时间**（值是这根 K 线收盘时刻的），所以能按 `(symbol, start_time)` 与 `fapi_kline_5m` 直接拼接。`src_rank`（1 live、2 hist、3 归档）决定合并时谁胜出（`ReplacingMergeTree(src_rank)`）。
-- **Live**（`live.go`）：每个 5 分钟边界 `B`，从 `B − live_lead`（30 秒）开始，用 `GET /fapi/v1/openInterest` 给每个标的打一次快照；行归属哪根 K 线由响应里的 `time` 决定（取最近的边界，超出 `live_accept_window` 就丢弃），而不是调用时刻。请求经共享权重闸门（`ClassLive`）。
+- **Live**（`live.go`）：每个 5 分钟边界 `B`，从 `B − live_lead`（30 秒）开始，用 `GET /fapi/v1/openInterest` 给每个标的打一次快照；行永远属于在 `B` 收盘的那根 K 线，币安返回什么就原样记下（响应里的 `time` 记入 `snap_time` 供以后核对；流动性差的标的返回的旧快照就当作这根 bar 的值，等 hist 校准）。`live_accept_window` 只限制一轮在 `B` 之后最多还能继续多久。请求经共享权重闸门（`ClassLive`）。
 - **Hist**（`hist.go`）：`GET /futures/data/openInterestHist`，标签 `T` 存到 `T − 5m`。启动时按标的从 ClickHouse 读“已校准到哪根”（`maxIf(start_time, src_rank >= 2)`）并决策：已是最新则跳过，否则只取缺口（`limit` 按缺口取值；因为只传 `startTime` 不能向前翻页，长缺口靠移动 `endTime` 从新往旧翻）。同一段代码之后每小时 `hh:05` 跑一轮，在 20 分钟内铺开，用来校准 live 行。内存状态只在行落盘之后才前进。
 - **限流。** live 通过 `internal/weightgate` 使用 `/fapi` 权重池；hist 有自己的池（`DataPool`：每 IP 每 5 分钟 1000 次，本地计数，接口没有用量头）。
 - **写入器。** 一个小型独立批量写入器（`writer.go`），刻意不改动 `internal/chwriter`。

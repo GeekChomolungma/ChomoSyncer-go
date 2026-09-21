@@ -192,7 +192,7 @@ type OpenInterestConfig struct {
 
 	// live
 	LiveLead         time.Duration `yaml:"live_lead"`          // start each round this long before the kline closes
-	LiveAcceptWindow time.Duration `yaml:"live_accept_window"` // max distance of a snapshot's time from a 5m boundary
+	LiveAcceptWindow time.Duration `yaml:"live_accept_window"` // how long after the boundary a live round may keep running; outstanding requests are then abandoned
 	LiveWorkers      int           `yaml:"live_workers"`       // concurrent snapshot requests
 	FapiRPS          float64       `yaml:"fapi_rps"`           // request pacing of a round; the shared weight gate is the hard limit
 

@@ -326,7 +326,6 @@ curl -s http://localhost:9090/metrics | grep -E '^(oi_|weightgate_)'
 | `oi_data_window_used` | far below 900 (a scheduled pass uses ~130 per 5 min) | throttled by the cap, or another tool shares the IP |
 | `oi_live_cycle_complete_ratio` | ≈ 1 | round did not finish in time (see `weightgate_*`) |
 | `oi_live_cycle_seconds` | about `symbols / fapi_rps` (~21 s for 528; an estimate) | slow responses or gate waits |
-| `oi_live_snapshots_total{result="dropped"}` | 0 | snapshot time far from a boundary: check host clock / NTP |
 | `oi_live_vs_hist_rel_diff` | mean ≈ 0.04%, nearly all < 0.5% | alignment or clock problem: run the check in 5.8 |
 | `oi_live_gap_bars_total` | ≈ 0 | live missed bars (weight gate, network, restart) |
 | `oi_rate_limited_total` | 0 | 429/418 seen: the pool pauses itself; find who else uses the IP |

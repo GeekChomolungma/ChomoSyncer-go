@@ -313,7 +313,6 @@ curl -s http://localhost:9090/metrics | grep -E '^(oi_|weightgate_)'
 | `oi_data_window_used` | 远低于 900（一轮定时校准每 5 分钟约用 130 次） | 被上限限速，或者同 IP 上有别的工具在用 |
 | `oi_live_cycle_complete_ratio` | ≈ 1 | 这一轮没能按时完成（看 `weightgate_*`） |
 | `oi_live_cycle_seconds` | 约 `标的数 / fapi_rps`（528 个约 21 秒；估算值） | 响应慢或闸门在等 |
-| `oi_live_snapshots_total{result="dropped"}` | 0 | 快照时间距边界太远：检查主机时钟 / NTP |
 | `oi_live_vs_hist_rel_diff` | 均值 ≈ 0.04%，绝大多数 < 0.5% | 对齐或时钟问题：跑 5.8 的检查 |
 | `oi_live_gap_bars_total` | ≈ 0 | live 漏了 bar（权重闸门、网络、重启） |
 | `oi_rate_limited_total` | 0 | 出现 429/418：该池会自己暂停；查同 IP 上还有谁在用 |

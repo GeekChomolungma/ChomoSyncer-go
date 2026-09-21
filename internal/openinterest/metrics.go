@@ -8,7 +8,7 @@ import (
 // metrics is shared by every component of one Syncer.
 type metrics struct {
 	// live
-	liveSnapshots     *prometheus.CounterVec // {result="ok|dropped|error"}
+	liveSnapshots     *prometheus.CounterVec // {result="ok|error"}
 	liveCycleSeconds  prometheus.Histogram
 	liveCycleComplete prometheus.Gauge // ok snapshots / symbols in the last cycle
 
@@ -44,7 +44,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 	return &metrics{
 		liveSnapshots: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "oi_live_snapshots_total",
-			Help: "Live open-interest snapshots by outcome (dropped = snapshot time too far from a 5m boundary).",
+			Help: "Live open-interest snapshots by outcome.",
 		}, []string{"result"}),
 		liveCycleSeconds: f.NewHistogram(prometheus.HistogramOpts{
 			Name:    "oi_live_cycle_seconds",

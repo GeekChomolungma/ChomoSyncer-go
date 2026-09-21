@@ -24,30 +24,6 @@ const (
 	RankArchive uint8 = 3
 )
 
-// liveBarStart maps a live snapshot to the kline it belongs to.
-//
-// The snapshot is taken shortly before a kline closes, so its exchange `time`
-// lies near a 5-minute boundary B, and the value is the open interest at the
-// close of the kline that starts at B-5m. The nearest boundary is used, and a
-// snapshot further than accept from any boundary is rejected (it would describe
-// some other moment, not a kline close).
-//
-//	time=14:09:41 -> boundary 14:10:00 -> start 14:05:00
-//	time=14:10:04 -> boundary 14:10:00 -> start 14:05:00  (slightly late is fine)
-//	time=14:07:00 -> no boundary within accept -> rejected
-func liveBarStart(t time.Time, accept time.Duration) (time.Time, bool) {
-	t = t.UTC()
-	b := t.Add(BarInterval / 2).Truncate(BarInterval) // nearest boundary
-	d := t.Sub(b)
-	if d < 0 {
-		d = -d
-	}
-	if d > accept {
-		return time.Time{}, false
-	}
-	return b.Add(-BarInterval), true
-}
-
 // histBarStart maps an openInterestHist label T (the snapshot instant, always a
 // whole 5-minute boundary) to the kline it belongs to: the one that closes at T,
 // i.e. the one starting at T-5m. A label that is not on a boundary is rejected.

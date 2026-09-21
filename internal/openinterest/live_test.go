@@ -75,53 +75,60 @@ func TestNextRoundNeverPicksABoundaryAlreadySnapshotted(t *testing.T) {
 	}
 }
 
-func TestCycleAttributesSnapshotsToTheClosingBar(t *testing.T) {
-	l, src, sink, cache, m, fc := newLiveHarness(t, "2026-09-21 12:09:30.000", "AAA", "BBB", "CCC", "DDD")
+func TestCycleStoresWhateverBinanceAnswersInTheClosingBar(t *testing.T) {
+	l, src, sink, cache, m, _ := newLiveHarness(t, "2026-09-21 12:09:30.000", "AAA", "BBB", "CCC", "DDD", "EEE")
 	boundary := ts("2026-09-21 12:10:00.000")
 	src.fn = func(sym string) (Snapshot, error) {
 		switch sym {
 		case "AAA":
 			return Snapshot{OpenInterest: 100, Time: boundary.Add(-20 * time.Second)}, nil
 		case "BBB":
-			return Snapshot{OpenInterest: 200, Time: boundary.Add(3 * time.Second)}, nil // slightly late is fine
+			return Snapshot{OpenInterest: 200, Time: boundary.Add(3 * time.Second)}, nil // slightly late
 		case "CCC":
-			return Snapshot{OpenInterest: 300, Time: boundary.Add(-2 * time.Minute)}, nil // stale: too far from a boundary
+			return Snapshot{OpenInterest: 300, Time: boundary.Add(-2 * time.Minute)}, nil // stale: an illiquid symbol
+		case "DDD":
+			return Snapshot{OpenInterest: 400, Time: boundary.Add(-40 * time.Minute)}, nil // very stale: still what Binance says
 		default:
 			return Snapshot{}, errors.New("boom")
 		}
 	}
-	_ = fc
 	st := l.Cycle(context.Background(), boundary)
 
-	if st.Symbols != 4 || st.OK != 2 || st.Dropped != 1 || st.Errors != 1 {
-		t.Fatalf("stats = %+v, want 4 symbols: 2 ok, 1 dropped, 1 error", st)
+	if st.Symbols != 5 || st.OK != 4 || st.Errors != 1 {
+		t.Fatalf("stats = %+v, want 5 symbols: 4 ok, 1 error", st)
 	}
-	wantStart := ts("2026-09-21 12:05:00.000") // the bar that closes at 12:10
-	for _, sym := range []string{"AAA", "BBB"} {
+	wantStart := ts("2026-09-21 12:05:00.000") // the bar that closes at 12:10, whatever the response's time says
+	want := map[string]struct {
+		oi   float64
+		snap time.Time
+	}{
+		"AAA": {100, boundary.Add(-20 * time.Second)},
+		"BBB": {200, boundary.Add(3 * time.Second)},
+		"CCC": {300, boundary.Add(-2 * time.Minute)},
+		"DDD": {400, boundary.Add(-40 * time.Minute)},
+	}
+	for sym, w := range want {
 		rows := sink.forSymbol(sym)
 		if len(rows) != 1 || !rows[0].StartTime.Equal(wantStart) || rows[0].SrcRank != RankLive {
 			t.Fatalf("%s rows = %+v, want one live row for bar %v", sym, rows, wantStart)
 		}
-	}
-	if r := sink.forSymbol("AAA")[0]; r.SumOpenInterest != 100 || !r.SnapTime.Equal(boundary.Add(-20*time.Second)) {
-		t.Fatalf("AAA row = %+v (value and snap_time must come from the response)", r)
-	}
-	if len(sink.forSymbol("CCC")) != 0 || len(sink.forSymbol("DDD")) != 0 {
-		t.Fatal("dropped/failed symbols must not produce rows")
-	}
-	if v, ok := cache.get("AAA", wantStart); !ok || v != 100 {
-		t.Fatalf("live cache for AAA = (%v, %v)", v, ok)
-	}
-	if _, ok := cache.get("CCC", wantStart); ok {
-		t.Fatal("dropped snapshot must not enter the cache")
-	}
-	for label, want := range map[string]float64{"ok": 2, "dropped": 1, "error": 1} {
-		if got := testutil.ToFloat64(m.liveSnapshots.WithLabelValues(label)); got != want {
-			t.Errorf("oi_live_snapshots_total{%s} = %v, want %v", label, got, want)
+		if rows[0].SumOpenInterest != w.oi || !rows[0].SnapTime.Equal(w.snap) {
+			t.Fatalf("%s row = %+v (value and snap_time must come from the response)", sym, rows[0])
+		}
+		if v, ok := cache.get(sym, wantStart); !ok || v != w.oi {
+			t.Fatalf("live cache for %s = (%v, %v)", sym, v, ok)
 		}
 	}
-	if v := testutil.ToFloat64(m.liveCycleComplete); v != 0.5 {
-		t.Fatalf("cycle complete ratio = %v, want 0.5", v)
+	if len(sink.forSymbol("EEE")) != 0 {
+		t.Fatal("a failed symbol must not produce a row")
+	}
+	for label, wantN := range map[string]float64{"ok": 4, "error": 1} {
+		if got := testutil.ToFloat64(m.liveSnapshots.WithLabelValues(label)); got != wantN {
+			t.Errorf("oi_live_snapshots_total{%s} = %v, want %v", label, got, wantN)
+		}
+	}
+	if v := testutil.ToFloat64(m.liveCycleComplete); v != 0.8 {
+		t.Fatalf("cycle complete ratio = %v, want 0.8", v)
 	}
 }
 

@@ -55,8 +55,8 @@ func (c Config) Validate() error {
 	switch {
 	case c.Live.Lead >= BarInterval:
 		return fmt.Errorf("open_interest.live_lead (%v) must be shorter than the 5m bar", c.Live.Lead)
-	case c.Live.AcceptWindow >= BarInterval/2:
-		return fmt.Errorf("open_interest.live_accept_window (%v) must be shorter than 2m30s, or a snapshot could be attributed to the wrong boundary", c.Live.AcceptWindow)
+	case c.Live.AcceptWindow >= BarInterval:
+		return fmt.Errorf("open_interest.live_accept_window (%v) must be shorter than the 5m bar: a round may not run into the next one", c.Live.AcceptWindow)
 	case c.Live.Lead < c.Live.MinRemaining:
 		return fmt.Errorf("open_interest.live_lead (%v) must not be shorter than the minimum remaining time (%v)", c.Live.Lead, c.Live.MinRemaining)
 	case c.Hist.Offset >= c.Hist.Interval:

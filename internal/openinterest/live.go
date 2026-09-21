@@ -14,7 +14,7 @@ import (
 // LiveConfig tunes the live snapshotter. Zero values take the defaults.
 type LiveConfig struct {
 	Lead           time.Duration // start each round this long before the kline closes (default 30s)
-	AcceptWindow   time.Duration // max distance of a snapshot's time from a 5m boundary (default 60s)
+	AcceptWindow   time.Duration // how long after the boundary a round may keep running; requests still outstanding are abandoned (default 60s)
 	Workers        int           // concurrent requests (default 8)
 	RPS            float64       // request pacing; the shared weight gate is the hard limit (default 25)
 	RequestTimeout time.Duration // per request (default 10s)
@@ -50,7 +50,6 @@ type CycleStats struct {
 	Boundary time.Time
 	Symbols  int
 	OK       int
-	Dropped  int // snapshot time too far from a 5m boundary
 	Errors   int
 	Took     time.Duration
 }
@@ -131,7 +130,7 @@ func (l *Live) Run(ctx context.Context) {
 		l.lastBoundary = boundary
 		l.log.Info("open-interest live round",
 			"boundary", st.Boundary.Format("15:04:05"), "symbols", st.Symbols, "ok", st.OK,
-			"dropped", st.Dropped, "errors", st.Errors, "took", st.Took.Round(100*time.Millisecond))
+			"errors", st.Errors, "took", st.Took.Round(100*time.Millisecond))
 	}
 }
 
@@ -142,6 +141,7 @@ func (l *Live) Cycle(ctx context.Context, boundary time.Time) CycleStats {
 	begin := l.now()
 	syms := l.symbols()
 	st := CycleStats{Boundary: boundary, Symbols: len(syms)}
+	start := boundary.Add(-BarInterval) // the bar that closes at the boundary: every row of this round belongs to it
 
 	// Abandon whatever is still outstanding once the accept window after the
 	// boundary is over (the duration is computed from the injected clock).
@@ -152,7 +152,7 @@ func (l *Live) Cycle(ctx context.Context, boundary time.Time) CycleStats {
 	cctx, cancel := context.WithTimeout(ctx, remaining)
 	defer cancel()
 
-	var ok, dropped, errs atomic.Int64
+	var ok, errs atomic.Int64
 	ch := make(chan string)
 	var wg sync.WaitGroup
 	for w := 0; w < l.cfg.Workers; w++ {
@@ -160,12 +160,9 @@ func (l *Live) Cycle(ctx context.Context, boundary time.Time) CycleStats {
 		go func() {
 			defer wg.Done()
 			for sym := range ch {
-				switch l.one(cctx, sym) {
-				case outcomeOK:
+				if l.one(cctx, sym, start) == outcomeOK {
 					ok.Add(1)
-				case outcomeDropped:
-					dropped.Add(1)
-				default:
+				} else {
 					errs.Add(1)
 				}
 			}
@@ -182,9 +179,9 @@ feed:
 	close(ch)
 	wg.Wait()
 
-	st.OK, st.Dropped, st.Errors = int(ok.Load()), int(dropped.Load()), int(errs.Load())
+	st.OK, st.Errors = int(ok.Load()), int(errs.Load())
 	// symbols never reached because the round timed out count as errors
-	if missed := st.Symbols - st.OK - st.Dropped - st.Errors; missed > 0 {
+	if missed := st.Symbols - st.OK - st.Errors; missed > 0 {
 		st.Errors += missed
 		l.m.liveSnapshots.WithLabelValues("error").Add(float64(missed))
 	}
@@ -200,11 +197,15 @@ type outcome int
 
 const (
 	outcomeOK outcome = iota
-	outcomeDropped
 	outcomeError
 )
 
-func (l *Live) one(ctx context.Context, symbol string) outcome {
+// one snapshots a single symbol and stores what Binance answers as the row of the bar
+// starting at `start`, the bar this round closes. The response's `time` is NOT used to
+// pick the bar or to reject the value: an illiquid symbol's snapshot may be older than
+// the round, and it is then taken as that symbol's open interest for this bar. The
+// response's `time` is kept in snap_time so the staleness can be audited later.
+func (l *Live) one(ctx context.Context, symbol string, start time.Time) outcome {
 	if err := l.lim.Wait(ctx); err != nil {
 		l.m.liveSnapshots.WithLabelValues("error").Inc() // the round ended before this symbol got its turn
 		return outcomeError
@@ -218,12 +219,6 @@ func (l *Live) one(ctx context.Context, symbol string) outcome {
 		}
 		l.m.liveSnapshots.WithLabelValues("error").Inc()
 		return outcomeError
-	}
-	start, ok := liveBarStart(snap.Time, l.cfg.AcceptWindow)
-	if !ok {
-		l.m.liveSnapshots.WithLabelValues("dropped").Inc()
-		l.log.Debug("live snapshot dropped: time not near a 5m boundary", "symbol", symbol, "time", snap.Time)
-		return outcomeDropped
 	}
 	row := Row{Symbol: symbol, StartTime: start, SumOpenInterest: snap.OpenInterest, SnapTime: snap.Time, SrcRank: RankLive}
 	if err := l.sink.Push(ctx, row); err != nil {

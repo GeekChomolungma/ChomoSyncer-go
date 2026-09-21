@@ -122,14 +122,13 @@ K 线 t                                                     K 线 t+5m（下一�
 ```
 
 1. 每个 5 分钟边界 `B = t+5m`：在 `B-30s` 启动一轮，限流器 25 请求/秒，528 个标的约 21 秒发完，预计在 `B-9s` 结束。
-2. **行的归属由响应里的 `time` 决定，不是由调用时刻决定：**
+2. **行的归属由这一轮的边界决定，与响应里的 `time` 无关：**
    ```
-   b = round_to_nearest_5m(time)        // 例：time=14:09:41 → 14:10:00
-   要求 |time − b| ≤ 60s，否则丢弃这条快照（并计数告警）
-   start_time = b − 5m                  // → 14:05:00，即 K 线 14:05 这一行
+   start_time = B − 5m                  // 例：B=14:10:00 → 14:05:00，即 K 线 14:05 这一行
    ```
-   `time = 14:10:04`（略迟）同样归属 `14:05` 这一行；`time = 14:07:00` 距任何边界都超过 60 秒，丢弃。
-3. `snap_time` 记录 `time`，用于审计快照实际发生的时刻。**实测响应里的 `time` 比发出请求的时刻早约 2~3 秒**（真实币安上，请求发出于 20:14:30，返回的 `time` 是 20:14:26.978），所以一轮 `B-30s` 起的快照，其 `time` 大约落在 `B-33s ~ B-12s`；这远在 `live_accept_window`（60 秒）以内，但意味着 live 值比“收盘前 20 秒”再早几秒。
+   这一轮打出去的所有快照，币安返回什么就记成这一行的值，**不按 `time` 做任何过滤**。流动性差的标的，OI 记录更新得慢，返回的 `time` 可能比请求时刻早几十秒甚至更久；这时就把它过去的值当作这根 bar 的快照——这个“旧”本身就是流动性差的信号，并由每小时的 hist 校准覆盖成币安自己的正式值。
+3. `snap_time` 记录响应里的 `time`，用于以后核对快照实际发生的时刻（`snap_time` 比 `start_time + 5m` 早得越多，说明这根 bar 的 live 值越旧）。实测流动性好的标的，响应 `time` 比请求时刻早约 2~4 秒；不活跃的标的可早 10~30 秒，偶尔更多。
+4. `live_accept_window`（默认 60 秒）现在只有一个作用：一轮在 `B + 60s` 时放弃仍未返回的请求，避免一轮拖进下一轮。
 
 ### 3.3 hist 与归档：标签 `T` 写到 `T-5m` 这一行
 
@@ -253,7 +252,7 @@ LEFT JOIN market.fapi_oi_5m AS o FINAL
 | `config.go` | 配置结构与默认值（见 §5.3） |
 | `client.go` | 手写 REST：`GetOpenInterest(ctx, symbol)`、`GetOpenInterestHist(ctx, symbol, limit, start, end)`；解析（数值是字符串）、429/418 识别与 `Retry-After`、`/fapi` 响应头的 `X-MBX-USED-WEIGHT-1M` 回报给闸门 |
 | `limiter.go` | `/futures/data` 池的限流器：令牌桶加 5 分钟滑动窗口计数器加全局 `Pause(until)`。`/fapi` 池使用 §1 的共享权重闸门（`internal/weightgate`，已实现，`ClassLive`），本包只负责在 live 里按 25 rps 匀速发出 |
-| `align.go` | 纯函数：`liveBarStart(time) (start, ok)` 与 `histBarStart(ts) start`（§3.2、§3.3）；**最需要单元测试** |
+| `align.go` | 纯函数：`histBarStart(ts) start`、`newestPublishedStart`（§3.3）；live 的归属由 `Cycle` 的边界决定（§3.2） |
 | `live.go` | 边界调度：每个 5 分钟边界在 `B-30s` 启动一轮；对 universe 里每个标的取快照，产出 `Row`（`src_rank=1`） |
 | `store.go` | 启动时读一次 ClickHouse：每个标的最新的 `src_rank ≥ 2` 的 `start_time`（`maxIf … GROUP BY symbol`），类似 `backfill.CHStore.MaxStartTime` |
 | `hist.go` | 启动补缺与每小时校准，**同一段代码**（见 §5.8）；产出 `Row`（`src_rank=2`） |
@@ -282,7 +281,7 @@ open_interest:
   live_enabled: false          # 每根 5m K 线收盘前 live_lead 打一轮快照。观察校准指标后再开
   table: "market.fapi_oi_5m"
   live_lead: 30s               # 在 K 线收盘前多久开始一轮
-  live_accept_window: 60s      # 快照时间距最近 5m 边界超过此值则丢弃（必须 < 2m30s）
+  live_accept_window: 60s      # 一轮在收盘后最多还能继续多久，超时未返回的请求放弃（必须 < 5m）
   live_workers: 8
   fapi_rps: 25                 # 一轮的请求节奏；/fapi 池的硬限制由 weight_gate 负责
   hist_reconcile_interval: 1h
@@ -298,7 +297,7 @@ open_interest:
   data_window_cap: 900         # 该池 5 分钟滑动窗口的硬上限
 ```
 
-`config.Validate` 会拒绝：`live_lead ≥ 5m`、`live_accept_window ≥ 2m30s`、`hist_reconcile_offset ≥ interval`、`hist_max_limit > 500`、`hist_max_backfill > 30 天`、`hist_cold_start_window > hist_max_backfill` 等。写入使用与 K 线相同的 ClickHouse 连接与批量参数。
+`config.Validate` 会拒绝：`live_lead ≥ 5m`、`live_accept_window ≥ 5m`、`hist_reconcile_offset ≥ interval`、`hist_max_limit > 500`、`hist_max_backfill > 30 天`、`hist_cold_start_window > hist_max_backfill` 等。写入使用与 K 线相同的 ClickHouse 连接与批量参数。
 
 ### 5.4 启动与停机顺序
 
@@ -309,7 +308,7 @@ open_interest:
 
 ### 5.5 指标（Prometheus）
 
-`oi_live_snapshots_total{result="ok|dropped|error"}`、`oi_live_cycle_seconds`、`oi_hist_requests_total{result}`、`oi_data_window_used`（`/futures/data` 5 分钟窗口已用次数）、`oi_rate_limited_total{code="429|418"}`、`oi_rows_written_total{src_rank}`、`oi_last_start_time_lag_seconds{symbol}`、`oi_live_vs_hist_rel_diff`（校准时 live 与 hist 的相对偏差直方图）、`oi_live_gap_bars_total`（校准时发现 live 缺失的根数）、`oi_cross_section_complete_ratio`（每轮结束后，拿到最近一根已收盘 bar 的标的数 ÷ universe 大小）。
+`oi_live_snapshots_total{result="ok|error"}`、`oi_live_cycle_seconds`、`oi_hist_requests_total{result}`、`oi_data_window_used`（`/futures/data` 5 分钟窗口已用次数）、`oi_rate_limited_total{code="429|418"}`、`oi_rows_written_total{src_rank}`、`oi_last_start_time_lag_seconds{symbol}`、`oi_live_vs_hist_rel_diff`（校准时 live 与 hist 的相对偏差直方图）、`oi_live_gap_bars_total`（校准时发现 live 缺失的根数）、`oi_cross_section_complete_ratio`（每轮结束后，拿到最近一根已收盘 bar 的标的数 ÷ universe 大小）。
 
 ### 5.6 冷启动（归档导入器）
 
@@ -321,7 +320,7 @@ open_interest:
 
 ### 5.7 测试要点
 
-- `align.go`：`liveBarStart` 覆盖“略早、略迟、恰好在边界、超过 60 秒被丢弃”；`histBarStart` 覆盖日边界。
+- `align.go`：`histBarStart` 覆盖日边界；`live_test.go` 覆盖“无论响应 `time` 多旧，都记在本轮边界对应的 bar 上，`snap_time` 保持响应原值”。
 - 归档对账：把某个标的一天的归档与同时刻 hist 的结果逐行比较，验证平移后 `start_time` 一致。
 - 限流器：突发不超过上限、429 后暂停、窗口计数正确。
 - `hist.go`：每个标的的动态 `limit`（含 30 小时缺口、超过 500 分页、新上市标的）；一轮的请求按 `spread` 匀速铺开；缺口优先的排序。
@@ -367,7 +366,7 @@ SELECT symbol, max(start_time), maxIf(start_time, src_rank >= 2) FROM market.fap
 | 步骤 | 状态 |
 |---|---|
 | 配置（`open_interest:`、校验、示例） | 已完成 |
-| `align.go`（`liveBarStart` / `histBarStart` / `newestPublishedStart`）与测试 | 已完成 |
+| `align.go`（`histBarStart` / `newestPublishedStart`）与测试 | 已完成 |
 | `row.go`、`writer.go`（独立批量写入器）、`clickhouse.go`（写入与 `LastStarts` 读取） | 已完成 |
 | `client.go`（手写 REST）、`limiter.go`（`/futures/data` 池） | 已完成 |
 | `hist.go`（冷启动决策、分页、校准）、`live.go`（边界调度）、`syncer.go` | 已完成 |
