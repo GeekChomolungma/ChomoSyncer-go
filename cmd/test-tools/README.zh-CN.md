@@ -28,6 +28,7 @@
 | 文件 | 说明 |
 | :--- | :--- |
 | `check_clickhouse_integrity.py` | **[阶段 A·1] ClickHouse K 线完整性检查器**：检测 1m 原始表 + 各 rollup 表的时间戳连续性（缺口/断档判定）与字段非空/有效性校验 |
+| `backfill_missing_1m.py` | **[修复] 缺失 1m K 线回填**：读取 `check_clickhouse_integrity.py --gaps-csv` 生成的 CSV，从币安 REST 只拉这些缺失的分钟并写入 `market.fapi_kline_1m`。不带 `--apply` 只演练 |
 | `check_vs_binance.py` | **[阶段 A·2] 外部真值对账**：把 ClickHouse（1m 原始表 / rollup 表）逐根对回币安 `/fapi/v1/klines`，抓采集字段映射、单位、rollup 桶对齐与聚合函数的系统性偏差 |
 | `check_redis_livebars.py` | **[阶段 B·1] Redis 未收盘 Live Bar 检查器**：检测各币种 `livebar:{SYM}:1m` Hash 是否存在、TTL 时效、时延与字段完备性 |
 | `check_redis_closed_windows.py` | **[阶段 B·2] Redis 已收盘滑窗检查器**：检测 `kline:{SYM}:1m` 200 根滑窗是否存在、单调递减连续性、内部有无漏 Bar、头部是否当下最新 |
@@ -83,6 +84,7 @@ pip install -r cmd/test-tools/requirements.txt
 | `--table-prefix` | `market.fapi_kline` | ClickHouse 表前缀 |
 | `--start-date` / `--end-date` | *(全部历史)* | 限定扫描时间范围，如 `"2024-01-01"` 或 `"2024-01-01 00:00:00"` |
 | `--max-gaps` | `5` | 每个币种最多打印几个断档，超出截断 |
+| `--gaps-csv PATH` | 关 | 把**全部**断档（不受 `--max-gaps` 截断）另存为 CSV，供 `backfill_missing_1m.py` 使用（列：`symbol,interval,from_ms,to_ms,from_utc,to_utc,missing_count`，缺失的 bar 开盘时间为 `[from_ms, to_ms)`）。建议配合 `--intervals 1m` |
 | `--show-all-gaps` | 关 | 打印全部断档，不截断 |
 | `--ch-host` / `--ch-port` / `--ch-db` / `--ch-user` / `--ch-password` | 取自配置 | 逐字段覆盖 ClickHouse 连接信息 |
 
@@ -102,6 +104,37 @@ python cmd/test-tools/check_clickhouse_integrity.py --limit-symbols 10
 ```
 
 退出码：`0` = 无断档、无非法字段；`1` = 发现完整性问题（或连接失败）。
+
+---
+
+### 1b. 缺失 1m K 线回填 (`backfill_missing_1m.py`)
+
+**修复工具——检查 #1 的后续。** 检查器指出哪里有洞，本脚本负责补。（在线服务本身每 30 分钟也会自动修复最近 24 小时的洞，见 `backfill.sweep_*` 配置；本脚本用于更早的历史、服务停机期间，以及人工复核。）
+
+```bash
+python cmd/test-tools/check_clickhouse_integrity.py --intervals 1m --gaps-csv gaps.csv   # 1. 列出所有洞
+python cmd/test-tools/backfill_missing_1m.py gaps.csv                                    # 2. 演练：拉取并报告，不写库
+python cmd/test-tools/backfill_missing_1m.py gaps.csv --apply                            # 3. 写入拉到的 K 线
+python cmd/test-tools/check_clickhouse_integrity.py --intervals 1m                       # 4. 复核
+```
+
+按币种处理：先剔除库里已有的分钟（所以可以放心重复运行）；把剩下的合并成尽量少且不更贵的 `/fapi/v1/klines` 请求；按 IP 权重限制限速（遵守 `429`/`418`）；只写入被请求过的**已收盘** bar。
+
+**有些洞补不上。** 币安对"该分钟无成交"的币种不返回 K 线，这类分钟会被报告为 *empty at exchange*，不会写入，检查器也会一直列出它们。请结合该币种的流动性判断，不要当作故障。
+
+| 参数 | 默认 | 含义 |
+| :--- | :--- | :--- |
+| `csv`（位置参数） | 必填 | 断档 CSV，只使用 `1m` 的行 |
+| `--apply` | 关 | 真正 `INSERT`；不带则不写任何数据 |
+| `--symbol` | *(文件内全部)* | 只处理该币种 |
+| `--table-prefix` | `market.fapi_kline` | 写入 `<prefix>_1m` |
+| `--weight-budget` | `600` | 本脚本每分钟最多消耗的请求权重（IP 上限 2400，且与在线服务共用） |
+| `--soft-limit` | `1800` | 币安 `X-MBX-USED-WEIGHT-1M` 达到此值时等到下一分钟 |
+| `--rest-url` | 取配置 | 币安 REST 基址 |
+| `--batch-rows` | `2000` | 每次 `INSERT` 的行数 |
+| `--ch-*` | 取配置 | ClickHouse 连接覆盖 |
+
+**Rollup。** 只写 1m 表。`5m`/`15m`/`1h` 在 3 天内的修复会在下次刷新时自动带上（`4h` 7 天，`1d` 10 天）；更早的修复脚本会提示用 `deploy/clickhouse-fixes/001_fix_kline_rollup_lookback.sh apply --from <YYYY-MM> --to <YYYY-MM>` 重折叠。
 
 ---
 

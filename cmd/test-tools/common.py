@@ -180,6 +180,29 @@ class ClickHouseClient:
         data = resp.json()
         return data.get("data", [])
 
+    def insert_json_rows(self, table: str, columns: List[str], rows: List[Dict[str, Any]]) -> int:
+        """
+        INSERT ... FORMAT JSONEachRow over the HTTP interface. Returns the row count sent.
+
+        DateTime64 columns must be given as 'YYYY-MM-DD HH:MM:SS.mmm' strings (UTC column
+        timezone): a raw epoch number is parsed as garbage, not as milliseconds.
+        """
+        if not rows:
+            return 0
+        if requests is None:
+            raise RuntimeError("the 'requests' package is required to insert into ClickHouse.")
+        body = "\n".join(json.dumps({c: r[c] for c in columns}, separators=(",", ":")) for r in rows)
+        params = {
+            "database": self.database,
+            "query": f"INSERT INTO {table} ({', '.join(columns)}) FORMAT JSONEachRow",
+        }
+        auth = (self.username, self.password) if self.password else None
+        resp = requests.post(f"http://{self.host}:{self.port}/", params=params, data=body.encode("utf-8"),
+                             auth=auth, timeout=max(self.timeout, 60))
+        if resp.status_code != 200:
+            raise RuntimeError(f"ClickHouse HTTP insert error {resp.status_code}: {resp.text[:500]}")
+        return len(rows)
+
     def test_connection(self) -> Tuple[bool, str]:
         """
         Tests connection to ClickHouse.

@@ -10,6 +10,7 @@ Verifies:
 import os
 import sys
 import argparse
+import csv
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -134,6 +135,8 @@ def check_symbol_table(
                 "gap_start": format_ms_to_utc(p_ms + interval_ms),
                 "gap_end": format_ms_to_utc(c_ms - 1),
                 "missing_count": m_cnt,
+                "from_ms": p_ms + interval_ms,  # first missing bar-open time (inclusive)
+                "to_ms": c_ms,                  # next existing bar-open time (exclusive)
             })
 
         result["gap_count"] = len(gaps)
@@ -161,6 +164,24 @@ def check_symbol_table(
     return result
 
 
+GAPS_CSV_HEADER = ["symbol", "interval", "from_ms", "to_ms", "from_utc", "to_utc", "missing_count"]
+
+
+def write_gaps_csv(path: str, rows: List[Tuple[str, str, Dict[str, Any]]]) -> int:
+    """
+    Writes one CSV line per gap: the missing bar-open times are [from_ms, to_ms).
+    This is the input format of backfill_missing_1m.py. Returns the number of lines.
+    """
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(GAPS_CSV_HEADER)
+        for sym, interval, g in rows:
+            w.writerow([sym, interval, g["from_ms"], g["to_ms"],
+                        format_ms_to_utc(g["from_ms"]), format_ms_to_utc(g["to_ms"]),
+                        g["missing_count"]])
+    return len(rows)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Check ClickHouse K-Line data continuity and field integrity.")
     parser.add_argument("--config", help="Path to config.yaml (auto-discovered if omitted)")
@@ -172,6 +193,9 @@ def main():
     parser.add_argument("--end-date", help="Optional filter: end date/time")
     parser.add_argument("--max-gaps", type=int, default=5, help="Max gaps to display per symbol (default: 5)")
     parser.add_argument("--show-all-gaps", action="store_true", help="Print all gaps without truncation")
+    parser.add_argument("--gaps-csv", metavar="PATH",
+                        help="Also write EVERY gap found (no --max-gaps truncation) to this CSV; feed it to "
+                             "backfill_missing_1m.py to repair the missing 1m bars")
     parser.add_argument("--ch-host", help="ClickHouse host override")
     parser.add_argument("--ch-port", type=int, help="ClickHouse HTTP port override (default: 8123)")
     parser.add_argument("--ch-db", help="ClickHouse database override")
@@ -204,6 +228,7 @@ def main():
     intervals = [i.strip() for i in args.intervals.split(",") if i.strip()]
 
     overall_pass = True
+    csv_rows: List[Tuple[str, str, Dict[str, Any]]] = []
     for interval in intervals:
         table = f"{args.table_prefix}_{interval}"
         try:
@@ -293,6 +318,7 @@ def main():
             if res["gap_count"] > 0:
                 gap_str = f"{Colors.RED}{res['gap_count']}{Colors.RESET}"
                 all_symbol_gaps.append((sym, res["gaps"]))
+                csv_rows.extend((sym, interval, g) for g in res["gaps"])
 
             missing_str = str(res["missing_bars"])
             if res["missing_bars"] > 0:
@@ -335,6 +361,13 @@ def main():
                     print(f"    - Missing {g['missing_count']} bar(s) between {Colors.YELLOW}{g['gap_start']}{Colors.RESET} and {Colors.YELLOW}{g['gap_end']}{Colors.RESET}")
                 if not args.show_all_gaps and len(gaps) > args.max_gaps:
                     print(f"    - ... and {len(gaps) - args.max_gaps} more gap(s) (use --show-all-gaps to see all)")
+
+    if args.gaps_csv:
+        n = write_gaps_csv(args.gaps_csv, csv_rows)
+        print(f"\nWrote {n} gap line(s) to {args.gaps_csv}")
+        if any(iv != "1m" for _, iv, _ in csv_rows):
+            print(f"{Colors.YELLOW}[NOTE] The CSV contains gaps of derived intervals too; the backfill script "
+                  f"only repairs 1m (rollups refold from 1m). Use --intervals 1m for a clean file.{Colors.RESET}")
 
     if overall_pass:
         print(f"\n" + f"{Colors.GREEN}{Colors.BOLD}? All ClickHouse integrity checks PASSED.{Colors.RESET}")

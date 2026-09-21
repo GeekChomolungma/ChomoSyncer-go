@@ -203,6 +203,18 @@ func (c Config) withDefaults() Config {
 	if c.Backfill.FlushWait <= 0 {
 		c.Backfill.FlushWait = def.Backfill.FlushWait
 	}
+	if c.Backfill.SweepEvery <= 0 {
+		c.Backfill.SweepEvery = def.Backfill.SweepEvery
+	}
+	if c.Backfill.SweepWindow <= 0 {
+		c.Backfill.SweepWindow = def.Backfill.SweepWindow
+	}
+	if c.Backfill.SweepSettle <= 0 {
+		c.Backfill.SweepSettle = def.Backfill.SweepSettle
+	}
+	if c.Backfill.SweepEmptyTTL <= 0 {
+		c.Backfill.SweepEmptyTTL = def.Backfill.SweepEmptyTTL
+	}
 
 	if c.WeightGate.LiveBudget <= 0 {
 		c.WeightGate.LiveBudget = def.WeightGate.LiveBudget

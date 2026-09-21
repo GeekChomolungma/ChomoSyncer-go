@@ -30,6 +30,7 @@ type fakeClient struct {
 
 	lastMsg atomic.Int64
 	errCh   chan error
+	gapCh   chan GapWindow
 	errOnce sync.Once
 }
 
@@ -76,8 +77,9 @@ func (f *fakeClient) connects() int {
 	return f.connectN
 }
 
-func (f *fakeClient) LastMessageAt() time.Time { return time.Unix(0, f.lastMsg.Load()) }
-func (f *fakeClient) Errors() <-chan error     { return f.errCh }
+func (f *fakeClient) LastMessageAt() time.Time     { return time.Unix(0, f.lastMsg.Load()) }
+func (f *fakeClient) Errors() <-chan error         { return f.errCh }
+func (f *fakeClient) Reconnects() <-chan GapWindow { return f.gapCh }
 
 func (f *fakeClient) Close() error {
 	f.mu.Lock()
@@ -118,7 +120,7 @@ func newFakeFactory() *fakeFactory {
 func (f *fakeFactory) make(id string, onEvent func(dispatcher.KlineEvent)) streamClient {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	fc := &fakeClient{id: id, onEvent: onEvent, streams: map[string]struct{}{}, errCh: make(chan error, 8)}
+	fc := &fakeClient{id: id, onEvent: onEvent, streams: map[string]struct{}{}, errCh: make(chan error, 8), gapCh: make(chan GapWindow, 4)}
 	fc.lastMsg.Store(time.Now().UnixNano())
 	f.connectSeen[id]++
 	if f.failFirst[id] > 0 {
@@ -479,5 +481,53 @@ func TestOnGapNotFiredOnFirstConnect(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	if n.Load() != 0 {
 		t.Fatalf("OnGap fired %d times on first connect, want 0", n.Load())
+	}
+}
+
+// A silent reconnect (the connector's 23h keep-alive) must reach OnGap without the
+// shard tearing its connection down.
+func TestSilentReconnectReportsGapWithoutReconnecting(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		gaps []GapEvent
+	)
+	f := newFakeFactory()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c, err := New(ctx, Config{
+		Intervals: []string{"1m"}, ShardsPerInterval: 1,
+		WatchdogInterval: 5 * time.Millisecond, ConnectStagger: time.Millisecond,
+		Registerer: prometheus.NewRegistry(),
+		OnGap: func(g GapEvent) {
+			mu.Lock()
+			gaps = append(gaps, g)
+			mu.Unlock()
+		},
+	}, &fakeSink{}, withClientFactory(f.make))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	c.SetSymbols([]string{"BTCUSDT", "ETHUSDT"})
+	eventually(t, time.Second, func() bool { return f.latest("kline_1m_0") != nil && f.latest("kline_1m_0").connects() == 1 })
+
+	fc := f.latest("kline_1m_0")
+	last := time.Now().Add(-2 * time.Second)
+	up := time.Now()
+	fc.gapCh <- GapWindow{LastMsgAt: last, ReconnectAt: up}
+
+	eventually(t, time.Second, func() bool { mu.Lock(); defer mu.Unlock(); return len(gaps) == 1 })
+	mu.Lock()
+	g := gaps[0]
+	mu.Unlock()
+	if !g.LastMsgAt.Equal(last) || !g.ReconnectAt.Equal(up) || len(g.Streams) != 2 || g.ShardID != "kline_1m_0" {
+		t.Fatalf("gap = %+v", g)
+	}
+	if got := testutil.ToFloat64(c.metrics.silentReconnects.WithLabelValues("kline_1m_0")); got != 1 {
+		t.Fatalf("silent reconnect metric = %v, want 1", got)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if fc.connects() != 1 || f.latest("kline_1m_0") != fc {
+		t.Fatal("a silent reconnect must not make the shard reconnect")
 	}
 }

@@ -29,7 +29,8 @@ type binanceStreamClient struct {
 
 	fc      *wsstreams.WebsocketStreamsClient
 	errCh   chan error
-	lastMsg atomic.Int64 // unixnano
+	gapCh   chan GapWindow // silent reconnects seen by the status watcher
+	lastMsg atomic.Int64   // unixnano
 
 	closeOnce sync.Once
 	closed    atomic.Bool
@@ -51,6 +52,7 @@ func newBinanceStreamClient(shardID, baseURL string, onEvent func(dispatcher.Kli
 		onEvent:   onEvent,
 		log:       log.With("shard", shardID),
 		errCh:     make(chan error, 4),
+		gapCh:     make(chan GapWindow, 4),
 		stopDrain: make(chan struct{}),
 	}
 }
@@ -75,6 +77,7 @@ func (b *binanceStreamClient) Connect(ctx context.Context, streams []string) err
 		}
 	}
 	b.drainConnErrors()
+	b.watchReconnects()
 	_ = ctx
 	return nil
 }
@@ -106,6 +109,31 @@ func (b *binanceStreamClient) LastMessageAt() time.Time {
 }
 
 func (b *binanceStreamClient) Errors() <-chan error { return b.errCh }
+
+// Reconnects delivers the connector's silent scheduled reconnects (see watchStatus).
+func (b *binanceStreamClient) Reconnects() <-chan GapWindow { return b.gapCh }
+
+// statusPollInterval is how often connection status is sampled; the connector holds
+// CLOSING for its reconnect delay (1s), so 100ms cannot miss a transition.
+const statusPollInterval = 100 * time.Millisecond
+
+// watchReconnects starts the status watcher over the connector's connections.
+func (b *binanceStreamClient) watchReconnects() {
+	if b.fc == nil || b.fc.WsMarket == nil || b.fc.WsMarket.WsCommon == nil {
+		return
+	}
+	var conns []connStatus
+	for _, c := range b.fc.WsMarket.WsCommon.Connections {
+		if c != nil {
+			conns = append(conns, c)
+		}
+	}
+	b.errWG.Add(1)
+	go func() {
+		defer b.errWG.Done()
+		watchStatus(b.stopDrain, conns, b.LastMessageAt, b.gapCh, statusPollInterval, time.Now)
+	}()
+}
 
 func (b *binanceStreamClient) Close() error {
 	b.closeOnce.Do(func() {

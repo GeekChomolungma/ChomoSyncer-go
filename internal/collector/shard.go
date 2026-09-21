@@ -163,12 +163,27 @@ func (s *shard) connectAndPump(ctx context.Context, prevDownAt time.Time) (reaso
 	wd := time.NewTicker(s.c.cfg.watchdogInterval)
 	defer wd.Stop()
 
+	// A nil channel blocks forever, so clients without silent-reconnect support
+	// simply never take this select case.
+	var silent <-chan GapWindow
+	if sr, ok := cl.(silentReconnects); ok {
+		silent = sr.Reconnects()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return reasonStopped, time.Time{}
 		case <-s.stopCh:
 			return reasonStopped, time.Time{}
+
+		case g := <-silent:
+			// The library re-created the connection on its own schedule and told nobody;
+			// frames sent in the meantime are gone. Repair them like any other gap.
+			s.c.metrics.silentReconnects.WithLabelValues(s.id).Inc()
+			s.c.log.Info("shard connection silently reconnected by the connector; requesting gap repair",
+				"shard", s.id, "last_msg", g.LastMsgAt.UTC().Format(time.RFC3339), "reconnected_at", g.ReconnectAt.UTC().Format(time.RFC3339))
+			s.reportGap(g.LastMsgAt, g.ReconnectAt, sortedKeys(subscribed))
 
 		case e, ok := <-cl.Errors():
 			if !ok {

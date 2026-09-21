@@ -28,6 +28,7 @@ This mirrors `docs/OPERATIONS.md` §3 (B.1/B.2): you validate ClickHouse's own h
 | File | Description |
 | :--- | :--- |
 | `check_clickhouse_integrity.py` | **[Phase A·1] ClickHouse kline integrity checker**: detects timestamp continuity (gap/discontinuity) issues and non-null/validity problems across the 1m raw table and every rollup table |
+| `backfill_missing_1m.py` | **[Repair] Backfill missing 1m klines**: reads the CSV from `check_clickhouse_integrity.py --gaps-csv`, fetches exactly those minutes from Binance REST and inserts them into `market.fapi_kline_1m`. Dry run unless `--apply` |
 | `check_vs_binance.py` | **[Phase A·2] External ground-truth reconciliation**: reconciles ClickHouse (raw 1m table / rollup tables) bar-by-bar against Binance `/fapi/v1/klines`, catching systematic deviations in field mapping, units, rollup bucket alignment, and aggregation functions |
 | `check_redis_livebars.py` | **[Phase B·1] Redis unclosed live-bar checker**: verifies the existence, TTL freshness, latency, and field completeness of each symbol's `livebar:{SYM}:1m` hash |
 | `check_redis_closed_windows.py` | **[Phase B·2] Redis closed-window checker**: verifies the existence of the 200-bar `kline:{SYM}:1m` rolling window, its strictly decreasing continuity, whether any bar is missing internally, and whether the head is up to date |
@@ -84,6 +85,7 @@ Uses ClickHouse's vectorized window functions (`lagInFrame`) to scan hundreds of
 | `--start-date` / `--end-date` | *(all history)* | Restrict the scan window, e.g. `"2024-01-01"` or `"2024-01-01 00:00:00"` |
 | `--max-gaps` | `5` | Max gaps printed per symbol before truncating |
 | `--show-all-gaps` | off | Print every gap, no truncation |
+| `--gaps-csv PATH` | off | Also write **every** gap (no `--max-gaps` truncation) to a CSV for `backfill_missing_1m.py` (columns `symbol,interval,from_ms,to_ms,from_utc,to_utc,missing_count`; the missing bar-open times are `[from_ms, to_ms)`). Use with `--intervals 1m` |
 | `--ch-host` / `--ch-port` / `--ch-db` / `--ch-user` / `--ch-password` | from config | Per-field ClickHouse connection overrides |
 
 #### Example usage:
@@ -102,6 +104,37 @@ python cmd/test-tools/check_clickhouse_integrity.py --limit-symbols 10
 ```
 
 Exit code `0` = no gaps / no invalid rows found; `1` = integrity issues detected (or connection failure).
+
+---
+
+### 1b. Backfill Missing 1m Klines (`backfill_missing_1m.py`)
+
+**Repair tool — the follow-up to check #1.** The checker names the holes; this script fills them. (The running service also repairs the last 24 hours by itself every 30 minutes — the `backfill.sweep_*` settings — so this script is for older history, for a stopped service, and for a manual re-check.)
+
+```bash
+python cmd/test-tools/check_clickhouse_integrity.py --intervals 1m --gaps-csv gaps.csv   # 1. list every hole
+python cmd/test-tools/backfill_missing_1m.py gaps.csv                                    # 2. dry run: fetch + report, writes nothing
+python cmd/test-tools/backfill_missing_1m.py gaps.csv --apply                            # 3. insert what was found
+python cmd/test-tools/check_clickhouse_integrity.py --intervals 1m                       # 4. verify
+```
+
+What it does per symbol: drops the minutes ClickHouse already has (so re-running is safe), groups the rest into as few `/fapi/v1/klines` requests as is cheap, fetches them paced against the IP weight limit (honours `429`/`418`), and inserts only **closed** bars that were asked for.
+
+**Some holes cannot be filled.** Binance returns no kline for a minute in which the symbol had no trades; those are reported as *empty at exchange*, are not inserted, and the integrity checker will keep listing them. Judge them by the symbol's liquidity, not as a fault.
+
+| Flag | Default | Meaning |
+| :--- | :--- | :--- |
+| `csv` (positional) | required | The gaps CSV. Only `1m` lines are used |
+| `--apply` | off | Actually `INSERT`. Without it nothing is written |
+| `--symbol` | *(all in file)* | Only this symbol |
+| `--table-prefix` | `market.fapi_kline` | Writes `<prefix>_1m` |
+| `--weight-budget` | `600` | Max request weight this script spends per minute (the IP limit is 2400 and the live service shares it) |
+| `--soft-limit` | `1800` | Wait for the next minute when Binance's `X-MBX-USED-WEIGHT-1M` reaches this |
+| `--rest-url` | from config | Binance REST base URL |
+| `--batch-rows` | `2000` | Rows per `INSERT` |
+| `--ch-*` | from config | ClickHouse connection overrides |
+
+**Rollups.** Only the 1m table is written. `5m`/`15m`/`1h` pick the repair up on their next refresh if it is within 3 days (`4h`: 7, `1d`: 10). For older repairs the script prints a hint to refold them with `deploy/clickhouse-fixes/001_fix_kline_rollup_lookback.sh apply --from <YYYY-MM> --to <YYYY-MM>`.
 
 ---
 

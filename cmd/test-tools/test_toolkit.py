@@ -15,6 +15,8 @@ from check_redis_closed_windows import validate_compact_bar, inspect_symbol_wind
 from monitor_redis_kline_ready import parse_stream_entry
 from e2e_reconciliation import compare_bars
 from check_vs_binance import rel_close
+import backfill_missing_1m as bf
+from check_clickhouse_integrity import write_gaps_csv, GAPS_CSV_HEADER
 from check_oi_consistency import bar_window, evaluate_symbol, compare_with_binance, coverage_status, BAR_MS
 
 
@@ -293,6 +295,162 @@ class TestOICoverage(unittest.TestCase):
         self.assertEqual(coverage_status(288, 287, 0.995)[1], "PASS")   # one bar of 288 is tolerated
         self.assertEqual(coverage_status(288, 285, 0.995)[1], "FAIL")
         self.assertEqual(coverage_status(0, 0, 0.995), (1.0, "PASS"))   # nothing to cover
+
+
+M = bf.MINUTE_MS
+
+
+class TestBackfillMissing1m(unittest.TestCase):
+    def test_weight_table(self):
+        self.assertEqual([bf.kline_weight(n) for n in (1, 99, 100, 499, 500, 1000, 1001, 1500)],
+                         [1, 1, 2, 2, 5, 5, 10, 10])
+
+    def test_merge_ranges(self):
+        self.assertEqual(bf.merge_ranges([(5 * M, 6 * M), (1 * M, 2 * M), (2 * M, 3 * M), (10 * M, 11 * M)]),
+                         [(1 * M, 3 * M), (5 * M, 6 * M), (10 * M, 11 * M)])
+
+    def test_subtract_present(self):
+        self.assertEqual(bf.subtract_present([(0, 5 * M)], [1 * M, 3 * M]),
+                         [(0, 1 * M), (2 * M, 3 * M), (4 * M, 5 * M)])
+        self.assertEqual(bf.subtract_present([(0, 2 * M)], [0, 1 * M]), [])
+
+    def test_plan_requests_groups_close_gaps_and_splits_long_ones(self):
+        # two 1-minute gaps 10 minutes apart cost 1+1 separately, 1 together -> one request
+        self.assertEqual(bf.plan_requests([(0, 1 * M), (10 * M, 11 * M)]), [(0, 11 * M)])
+        # far apart (span > 1500 min) stay separate
+        far = 2000 * M
+        self.assertEqual(bf.plan_requests([(0, 1 * M), (far, far + M)]), [(0, 1 * M), (far, far + M)])
+        # a 3000-minute range is cut into pages of 1500
+        self.assertEqual(bf.plan_requests([(0, 3000 * M)]), [(0, 1500 * M), (1500 * M, 3000 * M)])
+        # merging must never cost more weight: 99+99 minutes (1+1) would become 200 (2) -> equal, allowed;
+        # 90 + 90 with a 400-minute hole would become weight 2 vs 1+1 -> allowed; but 98,98 far apart 450 -> 5 > 2
+        a, b = (0, 98 * M), (500 * M, 598 * M)
+        self.assertEqual(bf.plan_requests([a, b]), [a, b])
+
+    def test_kline_to_row_matches_go_mapping(self):
+        k = [1789755240000, "1.5", "2", "1", "1.8", "10", 1789755299999, "18.5", 42, "4", "7.2", "0"]
+        r = bf.kline_to_row("BTCUSDT", k)
+        self.assertEqual(r["start_time"], "2026-09-18 18:14:00.000")
+        self.assertEqual(r["end_time"], "2026-09-18 18:14:59.999")
+        self.assertEqual((r["quote_volume"], r["trades_count"], r["taker_buy_volume"], r["taker_buy_quote_volume"]),
+                         (18.5, 42, 4.0, 7.2))
+
+    def test_read_gaps_csv_filters_and_merges(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, newline="") as f:
+            f.write("symbol,interval,from_ms,to_ms,from_utc,to_utc,missing_count\n")
+            f.write(f"btcusdt,1m,{60 * M},{61 * M},x,x,1\n")
+            f.write(f"BTCUSDT,1m,{61 * M},{63 * M},x,x,2\n")   # touches the previous one -> merged
+            f.write(f"BTCUSDT,5m,{0},{300000},x,x,1\n")          # not 1m -> skipped
+            f.write(f"币安人生USDT,1m,{60 * M},{61 * M},x,x,1\n")   # CJK symbol is valid
+            f.write(f"BTC;DROP,1m,{60 * M},{61 * M},x,x,1\n")    # bad symbol -> skipped
+            f.write(f"ETHUSDT,1m,{60 * M + 5},{61 * M},x,x,1\n") # misaligned -> skipped
+            path = f.name
+        try:
+            gaps, warns = bf.read_gaps_csv(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(gaps, {"BTCUSDT": [(60 * M, 63 * M)], "币安人生USDT": [(60 * M, 61 * M)]})
+        self.assertEqual(len(warns), 3)
+
+    def test_gaps_csv_roundtrip_from_integrity_checker(self):
+        import tempfile
+        g = {"from_ms": 60 * M, "to_ms": 62 * M, "missing_count": 2}
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as f:
+            path = f.name
+        try:
+            self.assertEqual(write_gaps_csv(path, [("BTCUSDT", "1m", g)]), 1)
+            gaps, warns = bf.read_gaps_csv(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(gaps, {"BTCUSDT": [(60 * M, 62 * M)]})
+        self.assertEqual(warns, [])
+        self.assertEqual(GAPS_CSV_HEADER[:4], ["symbol", "interval", "from_ms", "to_ms"])
+
+    def test_rollup_hint(self):
+        now = 100 * 86_400_000
+        self.assertEqual(bf.rollup_hint(now - 2 * 86_400_000, now), [])
+        self.assertEqual(bf.rollup_hint(now - 5 * 86_400_000, now), ["5m", "15m", "1h"])
+        self.assertEqual(bf.rollup_hint(now - 20 * 86_400_000, now), ["5m", "15m", "1h", "4h", "1d"])
+
+    def test_pacer_waits_when_budget_spent(self):
+        t = [0.0]
+        slept = []
+
+        def sleep(d):
+            slept.append(d)
+            t[0] += d
+
+        p = bf.WeightPacer(budget=10, soft_limit=1800, clock=lambda: t[0], sleep=sleep)
+        p.before(6)
+        p.before(4)          # exactly the budget: no wait
+        self.assertEqual(slept, [])
+        p.before(1)          # over budget: waits for the oldest event to leave the minute
+        self.assertTrue(slept and slept[0] > 59)
+
+    def test_run_inserts_only_missing_closed_wanted_bars(self):
+        base = 1_000_000 * 60_000
+
+        class FakeCH:
+            def __init__(self):
+                self.inserted = []
+            def query(self, sql):
+                return [{"t": base + 1 * M}]        # minute 1 is already present
+            def insert_json_rows(self, table, cols, rows):
+                self.inserted.extend(rows)
+                return len(rows)
+
+        class FakeFetch:
+            def __init__(self):
+                self.calls = []
+            def fetch(self, sym, a, b):
+                self.calls.append((sym, a, b))
+                # exchange has minutes 0, 2 and an out-of-range extra (minute 5); minute 3 is empty
+                mk = lambda m: [base + m * M, "1", "2", "1", "1", "1", base + m * M + 59999, "1", 1, "1", "1", "0"]
+                return [mk(0), mk(2), mk(5)]
+
+        ch, fe = FakeCH(), FakeFetch()
+        now_ms = base + 60 * M
+        st = bf.run(ch, "t", {"AAAUSDT": [(base, base + 4 * M)]}, fe, apply=True, now_ms=now_ms, out=lambda *_: None)
+        self.assertEqual([r["start_time"] for r in ch.inserted],
+                         [bf.fmt_ts(base), bf.fmt_ts(base + 2 * M)])
+        self.assertEqual((st["fetched"], st["inserted"], st["empty_at_exchange"], st["already_present"]), (2, 2, 1, 1))
+
+    def test_run_dry_run_writes_nothing(self):
+        base = 1_000_000 * 60_000
+
+        class FakeCH:
+            def query(self, sql): return []
+            def insert_json_rows(self, *a): raise AssertionError("dry run must not insert")
+
+        class FakeFetch:
+            def fetch(self, sym, a, b):
+                return [[base, "1", "2", "1", "1", "1", base + 59999, "1", 1, "1", "1", "0"]]
+
+        st = bf.run(FakeCH(), "t", {"AAAUSDT": [(base, base + M)]}, FakeFetch(), apply=False,
+                    now_ms=base + 60 * M, out=lambda *_: None)
+        self.assertEqual((st["fetched"], st["inserted"]), (1, 0))
+
+    def test_run_skips_unclosed_minutes_and_isolates_failures(self):
+        base = 1_000_000 * 60_000
+
+        class FakeCH:
+            def query(self, sql): return []
+            def insert_json_rows(self, t, c, rows): return len(rows)
+
+        class FakeFetch:
+            def fetch(self, sym, a, b):
+                if sym == "BADUSDT":
+                    raise RuntimeError("boom")
+                return []
+
+        st = bf.run(FakeCH(), "t", {"BADUSDT": [(base, base + M)], "OKUSDT": [(base, base + M)]}, FakeFetch(),
+                    apply=True, now_ms=base + 30_000, out=lambda *_: None)   # minute 0 not yet closed
+        self.assertEqual(st["failed_symbols"], [])   # the open minute is dropped before any request
+        st = bf.run(FakeCH(), "t", {"BADUSDT": [(base, base + M)], "OKUSDT": [(base, base + M)]}, FakeFetch(),
+                    apply=True, now_ms=base + 5 * M, out=lambda *_: None)
+        self.assertEqual(st["failed_symbols"], ["BADUSDT"])
+        self.assertEqual(st["empty_at_exchange"], 1)
 
 
 if __name__ == "__main__":

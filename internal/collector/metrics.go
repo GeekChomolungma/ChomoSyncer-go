@@ -6,14 +6,15 @@ import (
 )
 
 type metrics struct {
-	wsStatus       *prometheus.GaugeVec   // {shard} 1 up / 0 down
-	wsReconnects   *prometheus.CounterVec // {shard}
-	wsMessages     *prometheus.CounterVec // {shard}
-	lastMsgAge     *prometheus.GaugeVec   // {shard} seconds since last frame
-	subUpdates     *prometheus.CounterVec // {shard} subscription-delta applications
-	shardsActive   prometheus.Gauge
-	klineIngested  *prometheus.CounterVec // {symbol,interval} closed bars forwarded
-	dispatchErrors *prometheus.CounterVec // {reason} busy|closed|other
+	wsStatus         *prometheus.GaugeVec   // {shard} 1 up / 0 down
+	wsReconnects     *prometheus.CounterVec // {shard}
+	wsMessages       *prometheus.CounterVec // {shard}
+	silentReconnects *prometheus.CounterVec // {shard} connector-initiated reconnects (23h keep-alive) with no error
+	lastMsgAge       *prometheus.GaugeVec   // {shard} seconds since last frame
+	subUpdates       *prometheus.CounterVec // {shard} subscription-delta applications
+	shardsActive     prometheus.Gauge
+	klineIngested    *prometheus.CounterVec // {symbol,interval} closed bars forwarded
+	dispatchErrors   *prometheus.CounterVec // {reason} busy|closed|other
 }
 
 func newMetrics(reg prometheus.Registerer) *metrics {
@@ -29,6 +30,10 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		wsReconnects: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "ws_reconnects_total",
 			Help: "WebSocket shard reconnect attempts.",
+		}, []string{"shard"}),
+		silentReconnects: f.NewCounterVec(prometheus.CounterOpts{
+			Name: "ws_silent_reconnects_total",
+			Help: "Reconnects the Binance connector performed by itself (23h keep-alive) without reporting an error; each triggers a gap repair.",
 		}, []string{"shard"}),
 		wsMessages: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "ws_messages_total",

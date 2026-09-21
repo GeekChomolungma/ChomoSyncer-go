@@ -618,3 +618,88 @@ func TestStreamFetcherIntegration(t *testing.T) {
 	fa := arc["1h"].(*fakeArchive)
 	eventually(t, 2*time.Second, func() bool { return fa.count() == 2 })
 }
+
+// --- repair mode ---
+
+func TestRepairFetchesExplicitRangesAndReportsOutcomes(t *testing.T) {
+	h := newHarness(t, Config{})
+	// CH max is far ahead: resume mode would fetch nothing; repair must still fetch the hole.
+	h.store.maxTimes["1m"] = map[string]time.Time{"BTCUSDT": fixedNow.Add(-time.Minute)}
+	from := fixedNow.Add(-2 * time.Hour)
+	to := from.Add(time.Minute)
+	h.fetch.rows["BTCUSDT/1m"] = []chwriter.Row{row("BTCUSDT", from.UnixMilli(), 5)}
+
+	res := make(chan RepairResult, 1)
+	k := Key{"btcusdt", "1m"}
+	h.b.Submit(Request{
+		Keys: []Key{k}, Reason: ReasonSweep, Result: res,
+		Ranges: map[Key][]Range{k: {{From: from, To: to}}},
+	})
+	var r RepairResult
+	select {
+	case r = <-res:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no repair result")
+	}
+	if len(r.Outcomes) != 1 || r.Outcomes[0].Fetched != 1 || r.Outcomes[0].Err != nil {
+		t.Fatalf("outcomes = %+v", r.Outcomes)
+	}
+	if c, _ := h.fetch.lastCall(); !c.since.Equal(from) || !c.until.Equal(to) {
+		t.Fatalf("fetched [%v,%v), want [%v,%v)", c.since, c.until, from, to)
+	}
+	if h.arc["1m"].count() != 1 {
+		t.Fatalf("archived %d, want 1", h.arc["1m"].count())
+	}
+	if h.store.maxCalls != 0 {
+		t.Fatalf("repair mode must not consult MaxStartTime (calls=%d)", h.store.maxCalls)
+	}
+}
+
+func TestRepairRebuildsOnlyRecentWindows(t *testing.T) {
+	h := newHarness(t, Config{WindowSize: 100})
+	old := Key{"OLDUSDT", "1m"}
+	recent := Key{"NEWUSDT", "1m"}
+	res := make(chan RepairResult, 1)
+	h.b.Submit(Request{
+		Keys: []Key{old, recent}, Reason: ReasonSweep, Result: res,
+		Ranges: map[Key][]Range{
+			old:    {{From: fixedNow.Add(-5 * time.Hour), To: fixedNow.Add(-5*time.Hour + time.Minute)}},
+			recent: {{From: fixedNow.Add(-10 * time.Minute), To: fixedNow.Add(-9 * time.Minute)}},
+		},
+	})
+	<-res
+	eventually(t, 2*time.Second, func() bool { _, ok := h.rb.get("NEWUSDT", "1m"); return ok })
+	if _, ok := h.rb.get("OLDUSDT", "1m"); ok {
+		t.Fatal("range older than the Redis window must not trigger a rebuild")
+	}
+}
+
+func TestRepairReportsFetchError(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.fetch.err = errors.New("boom")
+	res := make(chan RepairResult, 1)
+	k := Key{"BTCUSDT", "1m"}
+	h.b.Submit(Request{Keys: []Key{k}, Reason: ReasonSweep, Result: res,
+		Ranges: map[Key][]Range{k: {{From: fixedNow.Add(-time.Hour), To: fixedNow.Add(-time.Hour + time.Minute)}}}})
+	r := <-res
+	if len(r.Outcomes) != 1 || r.Outcomes[0].Err == nil {
+		t.Fatalf("want one failed outcome, got %+v", r.Outcomes)
+	}
+}
+
+func TestRepairResultWhenKeyInflight(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.fetch.blockCh = make(chan struct{})
+	h.b.Submit(Request{Keys: []Key{{"BTCUSDT", "1m"}}, Reason: ReasonColdStart})
+	eventually(t, time.Second, func() bool { return h.fetch.callCount() == 1 })
+
+	res := make(chan RepairResult, 1)
+	k := Key{"BTCUSDT", "1m"}
+	h.b.Submit(Request{Keys: []Key{k}, Reason: ReasonSweep, Result: res,
+		Ranges: map[Key][]Range{k: {{From: fixedNow.Add(-time.Hour), To: fixedNow.Add(-time.Hour + time.Minute)}}}})
+	r := <-res
+	if r.SkippedKeys != 1 || len(r.Outcomes) != 0 {
+		t.Fatalf("result = %+v, want 1 skipped key", r)
+	}
+	close(h.fetch.blockCh)
+}

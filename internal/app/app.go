@@ -45,6 +45,7 @@ type App struct {
 
 	gate       *windowgate.Gate
 	backfiller *backfill.Backfiller
+	sweeper    *backfill.Sweeper // periodic 1m hole repair; nil when disabled
 	chStore    *backfill.CHStore
 
 	coldStartSubmitted atomic.Bool
@@ -240,6 +241,20 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		a.backfiller, err = newBackfiller(cfg, reg, a.wgate, a.chWriters, a.chStore, a.win, gateAdapter{a.gate})
 		if err != nil {
 			return fail("backfiller: %w", err)
+		}
+		if cfg.Backfill.SweepEnabled {
+			a.sweeper, err = backfill.NewSweeper(backfill.SweepConfig{
+				Interval:   "1m",
+				Every:      cfg.Backfill.SweepEvery,
+				Window:     cfg.Backfill.SweepWindow,
+				Settle:     cfg.Backfill.SweepSettle,
+				EmptyTTL:   cfg.Backfill.SweepEmptyTTL,
+				Registerer: reg,
+				Logger:     cfg.Logger,
+			}, a.chStore, a.backfiller)
+			if err != nil {
+				return fail("sweeper: %w", err)
+			}
 		}
 	}
 
@@ -450,6 +465,11 @@ func (a *App) Run(ctx context.Context) error {
 		a.log.Info("cold-start backfill submitted", "keys", len(syms)*len(a.cfg.Collector.Intervals))
 	}
 
+	// The sweeper's first pass waits a couple of minutes, so it never races the cold start.
+	if a.sweeper != nil {
+		a.sweeper.Start(ctx)
+	}
+
 	// The open-interest sync needs the universe, so it starts after the first refresh.
 	if a.oi != nil {
 		if err := a.oi.Start(ctx); err != nil {
@@ -541,6 +561,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 	a.shutdownOnce.Do(func() {
 		if a.col != nil {
 			closeStep(ctx, a.log, "collector", &errs, a.col.Close)
+		}
+		if a.sweeper != nil {
+			closeStep(ctx, a.log, "sweeper", &errs, a.sweeper.Close)
 		}
 		if a.oi != nil {
 			closeStep(ctx, a.log, "openinterest", &errs, a.oi.Close)

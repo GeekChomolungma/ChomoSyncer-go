@@ -104,6 +104,11 @@ backfill:
   gap_debounce: 30s              # 断线重连重复缺口事件合并防抖时长
   gate_timeout: 10m               # 窗口门控最长持有超时（防止回补卡死导致实时数据一直被压制）
   flush_wait: 2s                 # 回补数据 Push 完毕后，若无 writer 时的回退等待时长
+  sweep_enabled: true            # 定时完整性回查：兜底 WS 静默重连/丢帧造成的 1m 缺口（在线模式）
+  sweep_every: 30m               # 回查周期
+  sweep_window: 24h              # 每次回查最近多久的 1m K 线（库内相邻两根之间缺的分钟，用 REST 补）
+  sweep_settle: 3m               # 最新这段时间内的 K 线不判定（给实时链路与落盘留出时间）
+  sweep_empty_ttl: 12h           # 币安对"该分钟无成交"不返回 K 线；REST 也查不到的缺口记住这么久，不重复请求。建议 >= sweep_window，否则同一个空区间在窗口内会被重复请求 window/ttl 次（仅内存记忆，重启后清空）
 
 weight_gate:                     # /fapi 请求权重闸门：所有 /fapi REST 调用（K 线回补、universe 刷新，之后还有 OI 快照）共用同一个按 IP 计的 2400 权重/分钟
   live_budget: 600               # 时间敏感的快照（OI）预留的权重/分钟；独立预算，不会被回补饿死

@@ -136,3 +136,45 @@ LIMIT %d BY symbol`, s.table(interval), n)
 	}
 	return out, nil
 }
+
+// FindGaps returns, per symbol, the interior holes in [from, to): stretches of
+// missing bar-open times lying strictly between two bars that exist. Each Range is
+// [prevBar+interval, nextBar). Holes before a symbol's first bar or after its last
+// bar in the window are not reported: the former may just be a later listing, the
+// latter is the tail that resume-mode backfill already covers.
+func (s *CHStore) FindGaps(ctx context.Context, interval string, from, to time.Time) (map[string][]Range, error) {
+	dur, ok := parseIntervalDuration(interval)
+	if !ok {
+		return nil, fmt.Errorf("backfill: FindGaps: unknown interval %q", interval)
+	}
+	secs := int64(dur / time.Second)
+	// FINAL: the table is a ReplacingMergeTree; un-merged duplicates would show as
+	// zero-width "gaps" of size 0 and are harmless, but a stale parts view is not.
+	q := fmt.Sprintf(`
+SELECT symbol, prev_start, start_time
+FROM (
+    SELECT symbol, start_time,
+           lagInFrame(start_time) OVER (PARTITION BY symbol ORDER BY start_time
+                                        ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prev_start,
+           row_number() OVER (PARTITION BY symbol ORDER BY start_time) AS rn
+    FROM %s FINAL
+    WHERE start_time >= ? AND start_time < ?
+)
+WHERE rn > 1 AND toUnixTimestamp(start_time) - toUnixTimestamp(prev_start) > %d
+ORDER BY symbol, start_time`, s.table(interval), secs)
+	rows, err := s.conn.Query(ctx, q, from.UTC(), to.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("backfill: FindGaps %s: %w", interval, err)
+	}
+	defer rows.Close()
+	out := map[string][]Range{}
+	for rows.Next() {
+		var sym string
+		var prev, next time.Time
+		if err := rows.Scan(&sym, &prev, &next); err != nil {
+			return nil, err
+		}
+		out[sym] = append(out[sym], Range{From: prev.Add(dur), To: next})
+	}
+	return out, rows.Err()
+}

@@ -153,6 +153,15 @@ type BackfillConfig struct {
 	GapDebounce   time.Duration `yaml:"gap_debounce"`
 	GateTimeout   time.Duration `yaml:"gate_timeout"`
 	FlushWait     time.Duration `yaml:"flush_wait"`
+
+	// Integrity sweep: every SweepEvery, look at the last SweepWindow of 1m bars in
+	// ClickHouse and REST-repair the holes (see internal/backfill/sweep.go). The
+	// safety net behind the live stream and the reconnect-gap logic.
+	SweepEnabled  bool          `yaml:"sweep_enabled"`
+	SweepEvery    time.Duration `yaml:"sweep_every"`
+	SweepWindow   time.Duration `yaml:"sweep_window"`
+	SweepSettle   time.Duration `yaml:"sweep_settle"`
+	SweepEmptyTTL time.Duration `yaml:"sweep_empty_ttl"`
 }
 
 // WeightGateConfig sizes the shared /fapi request-weight gate
@@ -334,6 +343,11 @@ func DefaultConfig() Config {
 			GapDebounce:   30 * time.Second,
 			GateTimeout:   5 * time.Minute,
 			FlushWait:     2 * time.Second,
+			SweepEnabled:  true,
+			SweepEvery:    30 * time.Minute,
+			SweepWindow:   24 * time.Hour,
+			SweepSettle:   3 * time.Minute,
+			SweepEmptyTTL: 24 * time.Hour,
 		},
 		WeightGate: WeightGateConfig{
 			LiveBudget: weightgate.DefaultLiveBudget,

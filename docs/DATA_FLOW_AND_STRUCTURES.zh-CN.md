@@ -133,7 +133,7 @@
     - **建连错峰**：新建 shard 启动前强制 Sleep 错峰（`startDelay += c.cfg.connectStagger`，默认 300ms），避免同一时刻突发握手被币安 IP 限流。
     - **读帧并发**：底层官方库 `binance-connector-go` 的 `OnMarket` 回调会为每个到来的消息启动临时 Goroutine 调用 [`handleRaw`](../internal/collector/binanceclient.go#L116)，因此进入采集链路的事件调用是**高并发、多 Goroutine** 的。
     - **保活与断线自愈**：
-      - 官方连接器处理服务端 ping 自动回 pong，每 23h 主动重建连接。
+      - 官方连接器处理服务端 ping 自动回 pong，每 23h 重建连接。这次重建是先断后连且**静默**的：连接器只记一条"正常关闭"日志，不会报任何错误，`Errors()` 毫无动静，而期间的帧就丢了。适配层（[`watchStatus`](../internal/collector/silentreconnect.go)）每 100ms 轮询连接状态，把 `OPEN → CLOSING → CONNECTING → OPEN` 一个周期转成缺口（`ws_silent_reconnects_total`），走同一条 `OnGap` 通路。
       - Shard Supervisor 内部运行 [`watchdogInterval`](../internal/collector/shard.go#L180)（10s）看门狗：若距上次收到消息超过 `StaleTimeout`（默认 60s），判定为半开连接（Half-open TCP），主动切断重连。
       - 重连使用带半抖动的指数退避（1s ~ 30s）。重连成功后计算断线缺口 `[lastMsgAt, reconnectAt]`，回调 `OnGap` 投递至回补模块。
 - **代码入口**：
@@ -625,6 +625,8 @@ Gapfill 负责与增量采集**并行运作**，在后台将缺失数据从币�
 - **三大触发源**：
   1. **冷启动 (Cold Start)**：[`App.Run`](../internal/app/app.go#L428) 中在 Universe 首次获取后调用 `SubmitColdStart`。若 ClickHouse 为空库，以 `cold_start_date` 为起点拉取历史；若已有历史落档，从 ClickHouse `max(start_time) + 1 step` 开始持续接续同步至当下最新时刻。在此期间 HTTP 探针 `/readyz` 返回 503，回补完成后转为 200。
   2. **Shard 断线重连 (Shard Reconnect)**：Shard 重连成功后回调 [`collector.OnGap`](../internal/app/app.go#L261) -> [`Backfiller.HandleGap`](../internal/backfill/backfill.go#L328)。带有 30s 防抖，不再设限窗口，直接查询 ClickHouse 的最新记录时间作为起点，保证零缺口 (Zero Gap) 补齐。
+  2b. **连接器静默重连（23 小时 keep-alive）**：与上面走同一条 `OnGap` → `HandleGap` 通路（见 collector 一节）。resume 模式的回补只补"尾巴"，所以这个触发必须及时。
+  2c. **完整性回查（兜底）**：[`Sweeper`](../internal/backfill/sweep.go) 每 `sweep_every`（30m）运行一次，向 ClickHouse（[`CHStore.FindGaps`](../internal/backfill/clickhouse.go)）询问最近 `sweep_window`（24h）内**已有 1m bar 之间**的洞，并以**修复模式**（`Request.Ranges`：精确补这些区间，而不是"从最后一根往后"）提交。币安对"无成交"分钟不返回 K 线，这类区间会被记住 `sweep_empty_ttl`，不会每轮重复请求。指标：`backfill_sweep_*`。更早于窗口的洞用 `cmd/test-tools/backfill_missing_1m.py`。
   3. **Universe 新增合约 (Universe Add)**：[`App.onUniverseChange`](../internal/app/app.go#L386) 检测到 Universe 发生增量，向队列提交新币的全窗口回补。
 - **离线回补模式 (`backfill.offline_only`)**：当开启此开关时，`App.Run` 走 `runBackfillOnly` 分支——只装配 universe/fetcher/chwriter/backfiller，跳过 collector、dispatcher、rediswin、windowgate；提交一次 whole-universe 冷启动后通过 `Backfiller.WaitColdStart` 阻塞至回补完成即退出（`gate_timeout` 失效，不会中途强制释放）。用于"先离线灌满深历史、校验后再上线实时业务"的两阶段冷启动，详见 `docs/OPERATIONS.md` §A.1 / §B.1（空库首次上线）。
 - **并发与 Goroutine 模型**：

@@ -213,7 +213,95 @@ Precedence (low → high): **built-in `DefaultConfig()` < `config.yaml` < `CHOMO
 - **Bare metal**: `-config config.yaml` is all you need; to temporarily override a given item, use a `-flag` or `CHOMOSYNCER_*`.
 - **Docker**: maintain only the single root-level `config.yaml` (mounted into the container); the two addresses hardcoded as env vars in compose (`CHOMOSYNCER_REDIS_ADDR=redis:6379` / `CHOMOSYNCER_CH_ADDR=clickhouse:9000`) are the only container-specific overrides — because `config.yaml` has `localhost`, which isn't reachable inside the container network. To override another item inside the container, add the corresponding `CHOMOSYNCER_*` to the `chomosyncer-go` service's `environment:` (rule: flag `-redis-pool-size` ↔ env `CHOMOSYNCER_REDIS_POOL_SIZE`; see `chomosyncer-go -h` for the full list).
 - **To use environment variables exclusively instead of YAML**: remove the `config.yaml` mount in `docker-compose.yml` and uncomment `env_file:` (pointing at `deploy/chomosyncer-go.env`, copied from `chomosyncer-go.env.example`).
-- **Parameters that can only be set via YAML, with no environment-variable counterpart**: `redis.dial_timeout` / `read_timeout` / `write_timeout`, `redis.window.stream_maxlen` / `key_prefix` / `atomic`, `redis.live.ttl_multiple` / `default_ttl` / `write_timeout` / `key_prefix`, `clickhouse.table_prefix` / `dial_timeout` / `tls` / `max_retries` / `retry_backoff` / `max_retry_backoff` / `shutdown_timeout`, `collector.connect_stagger` / `connect_timeout` / `reconnect_base` / `reconnect_max` / `watchdog_interval`, `dispatcher.publish_timeout`, `universe.refresh_offset` / `http_timeout` / `contract_type` / `status`, `backfill.queue_size`, `app.shutdown_timeout`.
+- **Parameters that can only be set via YAML, with no environment-variable counterpart**: the whole `open_interest.*` and `weight_gate.*` sections (§3.4), `redis.dial_timeout` / `read_timeout` / `write_timeout`, `redis.window.stream_maxlen` / `key_prefix` / `atomic`, `redis.live.ttl_multiple` / `default_ttl` / `write_timeout` / `key_prefix`, `clickhouse.table_prefix` / `dial_timeout` / `tls` / `max_retries` / `retry_backoff` / `max_retry_backoff` / `shutdown_timeout`, `collector.connect_stagger` / `connect_timeout` / `reconnect_base` / `reconnect_max` / `watchdog_interval`, `dispatcher.publish_timeout`, `universe.refresh_offset` / `http_timeout` / `contract_type` / `status`, `backfill.queue_size`, `app.shutdown_timeout`.
+
+---
+
+### 3.4 Enabling Open-Interest Sync (optional)
+
+The open-interest (OI) module is **off by default** and independent of the kline pipeline: it neither delays `/readyz` nor touches Redis. It writes `market.fapi_oi_5m`; design and measurements: [`../new_requirements/oi.md`](../new_requirements/oi.md), consumer view: [`DATA_CONSUMER_GUIDE.md`](DATA_CONSUMER_GUIDE.md) §1b.
+
+**Two switches, enabled one after the other** (`config.yaml`, see `open_interest:` in `config.example.yaml`):
+
+| Switch | What it does | Pool it spends |
+| :--- | :--- | :--- |
+| `open_interest.hist_enabled` | At start-up reads, per symbol, how far the table is already calibrated and backfills only the gap from `openInterestHist`; then calibrates every hour at `hh:05` | `/futures/data` (1000 requests / 5 min / IP), its own counter |
+| `open_interest.live_enabled` | Every 5-minute boundary, from 30 s before the kline closes, snapshots each symbol with `/fapi/v1/openInterest` | `/fapi` weight budget (2400/min/IP) through the shared `weight_gate` |
+
+#### Step by step
+
+```bash
+# 1. Create the raw table. NOT run by docker compose (only 001 is), and the module never creates it.
+clickhouse-client --host localhost --user default --password "<pw>" --multiquery < deploy/clickhouse/004_fapi_oi.sql
+
+#    Docker: docker compose -f deploy/docker-compose.yml exec clickhouse \
+#              clickhouse-client --queries-file /clickhouse/004_fapi_oi.sql
+
+# 2. Turn on hist ONLY, restart the service.
+#      open_interest:
+#        hist_enabled: true
+#        live_enabled: false
+#    Expected logs:  "open-interest sync started"  ->  "loaded open-interest state from ClickHouse"
+#                    -> "open-interest hist pass" reason=startup
+
+# 3. Let it run for a day, then validate (see 5.8):
+python cmd/test-tools/check_oi_consistency.py --vs-binance --require-calibration
+
+# 4. Then turn on live (live_enabled: true), restart, validate again after a few 5-minute boundaries.
+
+# 5. Optional rollups (15m / 1h / 4h / 1d / 1mo). Requires ClickHouse >= 24.10 (same as 002); build them
+#    only after history is in fapi_oi_5m, then fold the history month by month (006 needs month-aligned ranges):
+clickhouse-client --queries-file deploy/clickhouse/005_oi_rollups.sql
+clickhouse-client --param_m_start='2026-08-01 00:00:00' --param_m_end='2026-09-01 00:00:00' \
+                  --queries-file deploy/clickhouse/006_oi_rollup_backfill.sql
+```
+
+#### What the first start does (and what a restart does)
+
+- **Empty table**: every symbol is backfilled 48 hours (`hist_cold_start_window`), 2 requests per symbol. For ~528 symbols that is ~1050 requests at `data_rps: 2`, roughly **9 minutes** (an estimate; the end-to-end test measured 2 s for 3 symbols). During that time this IP spends about 60% of its `/futures/data` budget: do not run other `/futures/data` heavy tools meanwhile.
+- **Every later start**: the module re-reads the newest calibrated row per symbol from ClickHouse and decides per symbol — already current → **no request at all**; behind → only the gap (`limit` sized to it; verified: a 3-hour outage costs one request per symbol). If ClickHouse is down at start it retries every 5–60 s and logs `could not read open-interest state; will retry`.
+- **Long downtime**: gaps are backfilled up to `hist_max_backfill` (7 days). Older parts are counted in `oi_hist_gap_beyond_cap_total` and need the archive import, which is not part of the module yet. Live snapshots of the downtime are gone for good (the live endpoint has no history) — hist fills those bars instead, with Binance's own values.
+- The service does **not** need to be stopped to change the switches, but a restart is required for them to take effect.
+
+#### Watching it (`/metrics`)
+
+```bash
+curl -s http://localhost:9090/metrics | grep -E '^(oi_|weightgate_)'
+```
+
+| Metric | Healthy | If not |
+| :--- | :--- | :--- |
+| `oi_hist_last_pass_timestamp_seconds` | younger than ~1.5 h | calibration stalled |
+| `oi_cross_section_complete_ratio` | ≈ 1 after each hist pass | some symbols failed or lag |
+| `oi_hist_symbols_total{outcome="failed"}` | not increasing | see logs `hist request failed` |
+| `oi_data_window_used` | far below 900 (a scheduled pass uses ~130 per 5 min) | throttled by the cap, or another tool shares the IP |
+| `oi_live_cycle_complete_ratio` | ≈ 1 | round did not finish in time (see `weightgate_*`) |
+| `oi_live_cycle_seconds` | about `symbols / fapi_rps` (~21 s for 528; an estimate) | slow responses or gate waits |
+| `oi_live_snapshots_total{result="dropped"}` | 0 | snapshot time far from a boundary: check host clock / NTP |
+| `oi_live_vs_hist_rel_diff` | mean ≈ 0.04%, nearly all < 0.5% | alignment or clock problem: run the check in 5.8 |
+| `oi_live_gap_bars_total` | ≈ 0 | live missed bars (weight gate, network, restart) |
+| `oi_rate_limited_total` | 0 | 429/418 seen: the pool pauses itself; find who else uses the IP |
+| `oi_writer_rows_dropped_total` | 0 | ClickHouse outage longer than the flush retries |
+| `weightgate_used_weight_1m` | below 1800 | above it, bulk kline backfill waits (live waits above 2300) |
+
+#### Common problems
+
+| Symptom | Likely cause | Action |
+| :--- | :--- | :--- |
+| Logs repeat `could not read open-interest state; will retry` | `market.fapi_oi_5m` does not exist (or ClickHouse unreachable) | Apply `004_fapi_oi.sql` (or fix connectivity); nothing else is needed |
+| `check_oi_consistency.py`: "missing bar(s)" | The module was stopped, or live was off and hist has not caught up | Restart (hist backfills the gap) and rerun the check |
+| `check_oi_consistency.py`: "live row(s) never calibrated" | `hist_enabled` is off, or hist has been failing | Enable/fix hist; live rows are otherwise never replaced by Binance's series |
+| Live rows exist but the last few bars are missing | Normal: hist publishes a label 1–3 minutes late; the check ignores the newest `--settle-minutes` | None |
+| A whole hist pass shows `committed=false` | The writer's flush failed (ClickHouse down) | The next pass refetches the same window automatically |
+| Everything is quiet after `live_enabled: true` | Restart missing, or `live_lead` window already passed | Check for `open-interest live round` lines at each 5-minute boundary |
+
+#### Turning it off / rolling back
+
+Set both switches to `false` and restart. **Never `DROP market.fapi_oi_5m`**: it holds live snapshots that cannot be re-created. The rollup tables and views (`005`) are derived and safe to drop and rebuild (`005` does so by design; rerun `006` afterwards).
+
+#### Rate-limit budget (`weight_gate`)
+
+All `/fapi` REST callers (kline gap backfill, universe refresh, OI live) share one gate that splits the per-IP 2400 weight/min into budgets (live 600 / bulk 1200 / misc 100, `weight_gate.*` in YAML) and backs off from Binance's own `X-MBX-USED-WEIGHT-1M`. Normally nothing needs tuning; if `weightgate_backpressure_waits_total{class="live"}` keeps growing, something else on the same IP is consuming weight. `/futures/data` is a separate pool and is not governed by it.
 
 ---
 
@@ -236,7 +324,10 @@ Once the service starts, the built-in HTTP server (default `:9090`) exposes thre
 3. **Prometheus Metrics Collection**:
    ```bash
    curl -s http://localhost:9090/metrics | grep -E "ws_shards_active|universe_size|redis_bars_pushed_total|clickhouse_rows_flushed_total"
+   # if open-interest sync is enabled (§3.4) and for the shared /fapi rate-limit gate:
+   curl -s http://localhost:9090/metrics | grep -E '^(oi_|weightgate_)'
    ```
+   (`/readyz` is **not** affected by open-interest catch-up.)
 
 ---
 
@@ -258,6 +349,7 @@ python cmd/test-tools/check_clickhouse_integrity.py
 # In-depth check for a specific major symbol
 python cmd/test-tools/check_clickhouse_integrity.py --symbol BTCUSDT --show-all-gaps
 ```
+- **Repairing what it finds**: add `--intervals 1m --gaps-csv gaps.csv`, then `python cmd/test-tools/backfill_missing_1m.py gaps.csv` (dry run) and again with `--apply`. The running service already repairs the last 24 hours itself every 30 minutes (`backfill.sweep_*`); the script is for older holes. Minutes in which a symbol had no trades have no kline at Binance and stay listed — see the tool README (§1b).
 - **Core criteria**: automatically uses ClickHouse window functions to scan the timestamp differences between adjacent klines to detect gaps; also validates `open/high/low/close > 0`, `high >= low`, `volume >= 0`, `trades_count >= 0`.
 
 ### 5.2 Real-Time Check of Redis Unclosed Live Bars
@@ -308,6 +400,20 @@ python cmd/test-tools/run_all_checks.py --vs-binance
 ```
 - The console prints a full traffic-light scorecard and gives a final go-live decision: `READY FOR PRODUCTION DEPLOYMENT` or `DEPLOYMENT BLOCKED`.
 
+### 5.8 Open-Interest Table Consistency Check (only when §3.4 is enabled)
+```bash
+# Whole market, last 24h (ClickHouse only, read-only)
+python cmd/test-tools/check_oi_consistency.py
+
+# Also compare a sample with Binance's own openInterestHist (5 requests on the /futures/data pool)
+python cmd/test-tools/check_oi_consistency.py --vs-binance
+
+# Right after the first hist-only day: demand that live rows were calibrated
+python cmd/test-tools/check_oi_consistency.py --require-calibration --max-uncalibrated-hours 1
+```
+- It checks gaps, the 5-minute grid, `snap_time` semantics, freshness, calibration by hist, coverage against `fapi_kline_5m`, and per-bar cross-section completeness; exit `0` = no FAIL. It can also be run as part of the scorecard: `python cmd/test-tools/run_all_checks.py --oi`.
+- If the table does not exist it says so and points at `004_fapi_oi.sql`.
+
 ---
 
 ## 6. Chaos and Resilience Drills
@@ -331,6 +437,21 @@ To verify high availability, the following drills are recommended in a test envi
 2. Observe the ChomoSyncer logs: `BatchWriter` triggers exponential-backoff retries, and rows accumulate in the in-memory queue;
 3. Restart ClickHouse within 15 seconds: `docker start chomo-clickhouse`;
 4. **Expected behavior**: the connection self-heals, the backlogged kline data is successfully persisted in batch, and `clickhouse_rows_dropped_total` stays at 0.
+
+### Drill 4: The Connector's 23-Hour Reconnect (silent gap) and the Sweep
+
+The Binance connector re-creates each WebSocket connection every 23 hours without telling the application; a few 1m bars can be lost right after a minute boundary. Two independent layers cover it.
+1. Look for `shard connection silently reconnected by the connector; requesting gap repair` in the log (one per shard per ~23h) and `ws_silent_reconnects_total` increasing; a `backfill request done reason=shard_reconnect` follows within seconds.
+2. Every `sweep_every` the log shows `sweep done ... holes_found=… bars_repaired=… empty_at_exchange=…`; `backfill_sweep_last_success_timestamp_seconds` must stay fresh (alert if older than ~2 × `sweep_every`).
+3. **Expected**: `python cmd/test-tools/check_clickhouse_integrity.py --intervals 1m --start-date "<a day ago>"` shows only holes at minutes with genuinely no trades. To rehearse without waiting 23h, delete a few 1m rows of a **scratch** database and point the service at it; the next sweep refills them.
+
+### Drill 3: Open-Interest Module Down for a Few Hours (only when §3.4 is enabled)
+1. Set both `open_interest` switches to `false` (or stop the service) for ~3 hours, then enable them again and restart;
+2. **Expected behavior**:
+   - The log shows `loaded open-interest state from ClickHouse` and a `reason=startup` hist pass with `cold_start=0` and about one request per symbol (a 3-hour gap is a single small page each; the pass is not spread out);
+   - The bars of the outage are filled with Binance's own values (`src_rank = 2`); symbols that were already current make **no** request;
+   - `oi_cross_section_complete_ratio` returns to ≈ 1;
+   - `python cmd/test-tools/check_oi_consistency.py --vs-binance` shows zero missing bars.
 
 ---
 
@@ -367,4 +488,5 @@ To verify high availability, the following drills are recommended in a test envi
 - [ ] `cmd/chomosyncer-go` has been run and the logs show no ERROR entries;
 - [ ] Both the `/healthz` and `/readyz` probes have been checked and return HTTP 200;
 - [ ] `python cmd/test-tools/run_all_checks.py` has been run and returns an all-green PASS verdict;
-- [ ] Prometheus is scraping `/metrics` normally, with alerting rules configured for `ws_connection_status` and `ws_last_message_age_seconds`.
+- [ ] Prometheus is scraping `/metrics` normally, with alerting rules configured for `ws_connection_status` and `ws_last_message_age_seconds`;
+- [ ] *(only if open-interest sync is enabled)* `deploy/clickhouse/004_fapi_oi.sql` has been applied, `python cmd/test-tools/check_oi_consistency.py --vs-binance` passes, and alerts exist for `oi_hist_last_pass_timestamp_seconds` (stale), `oi_live_cycle_complete_ratio` (< 0.99) and `weightgate_used_weight_1m` (> 1800).

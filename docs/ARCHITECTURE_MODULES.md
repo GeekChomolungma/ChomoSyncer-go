@@ -116,7 +116,7 @@ The only module that connects directly to the Binance derivatives WebSocket serv
 - **Storm prevention and staggered connection setup**:
   - A `connect_stagger` (default 300ms) is introduced between multiple shard connections for staggered connection setup, avoiding concurrent handshakes that would trigger the exchange's IP rate limiting.
 - **Dual keepalive and watchdog (`shard.go`)**:
-  - The underlying driver has built-in automatic Ping/Pong and a proactive, smooth 23-hour rebuild;
+  - The underlying driver has built-in automatic Ping/Pong and a proactive 23-hour rebuild that is **not** seamless (break-before-make; frames sent between the old socket closing and the new one reading are lost) and is **silent** (no error reaches the app) — the adapter therefore watches the connection status and reports it as a gap, and a periodic sweep is the backstop (see the backfill section);
   - A top-level **staleness watchdog** is configured (default 60s): if a shard has not received any market data frame for longer than this duration (even if the TCP connection remains ESTABLISHED), it is judged a half-open/stale connection and is forcibly disconnected and reconnected.
 - **Unlimited backoff reconnection**:
   - After a disconnect, it retries continuously with exponential backoff (1s → 30s) plus random jitter until recovery.

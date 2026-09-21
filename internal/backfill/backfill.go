@@ -40,7 +40,30 @@ const (
 	ReasonShardReconnect Reason = "shard_reconnect"
 	ReasonUniverseAdd    Reason = "universe_add"
 	ReasonReconcile      Reason = "reconcile" // TODO: not emitted yet
+	ReasonSweep          Reason = "sweep"     // periodic integrity sweep repairing holes in the archive
 )
+
+// Range is a half-open interval [From, To) of bar OPEN times.
+type Range struct {
+	From, To time.Time
+}
+
+// RangeOutcome is what happened to one requested Range in repair mode.
+type RangeOutcome struct {
+	Key     Key
+	Range   Range
+	Fetched int   // closed bars the exchange returned for the range
+	Err     error // non-nil: the fetch failed (Fetched may still be > 0 for a partial page run)
+}
+
+// RepairResult is delivered on Request.Result when a repair request finishes.
+type RepairResult struct {
+	Outcomes []RangeOutcome
+	// SkippedKeys counts keys that were not processed at all (already inflight,
+	// queue full, or the backfiller was closing). Their ranges are simply retried
+	// by the next sweep.
+	SkippedKeys int
+}
 
 // Request is one unit of backfill work.
 type Request struct {
@@ -48,6 +71,27 @@ type Request struct {
 	Since  time.Time // zero: cold-start semantics (resume from CH max, floored by lookback)
 	Until  time.Time // zero: now
 	Reason Reason
+
+	// Ranges switches the request to REPAIR mode: exactly these bar-open ranges are
+	// fetched per key, instead of resuming from ClickHouse's max(start_time). Resume
+	// only fills the tail, so a bar that was lost while later bars kept arriving (an
+	// interior hole) is invisible to it; repair mode is how such holes get filled.
+	Ranges map[Key][]Range
+	// Result, if non-nil, receives the outcome of a repair request. It must be
+	// buffered (size >= 1): the send never blocks.
+	Result chan<- RepairResult
+
+	skipped int // keys Submit dropped as already inflight; reported back in the result
+}
+
+func (r Request) deliver(res RepairResult) {
+	if r.Result == nil {
+		return
+	}
+	select {
+	case r.Result <- res:
+	default:
+	}
 }
 
 // GapEvent is what a shard reconnect reports (structurally mirrors
@@ -294,6 +338,7 @@ func (b *Backfiller) SubmitColdStart(keys []Key) {
 // held immediately for the remaining keys.
 func (b *Backfiller) Submit(req Request) {
 	if b.closed.Load() {
+		req.deliver(RepairResult{SkippedKeys: len(req.Keys)})
 		return
 	}
 	b.mu.Lock()
@@ -311,10 +356,12 @@ func (b *Backfiller) Submit(req Request) {
 	}
 	b.mu.Unlock()
 
+	skipped := len(req.Keys) - len(fresh)
 	if len(fresh) == 0 {
 		if req.Reason == ReasonColdStart {
 			b.coldStartDone.Store(true)
 		}
+		req.deliver(RepairResult{SkippedKeys: skipped})
 		return
 	}
 	if b.gate != nil {
@@ -323,12 +370,21 @@ func (b *Backfiller) Submit(req Request) {
 		}
 	}
 	req.Keys = fresh
+	req.skipped = skipped
+	if req.Ranges != nil { // keys were upper-cased above; normalise the range map to match
+		nr := make(map[Key][]Range, len(req.Ranges))
+		for k, v := range req.Ranges {
+			nr[Key{Symbol: strings.ToUpper(k.Symbol), Interval: k.Interval}] = v
+		}
+		req.Ranges = nr
+	}
 	b.metrics.requests.WithLabelValues(string(req.Reason)).Inc()
 
 	select {
 	case b.reqCh <- req:
 	default:
 		b.releaseKeys(fresh)
+		req.deliver(RepairResult{SkippedKeys: skipped + len(fresh)})
 		b.metrics.dropped.Inc()
 		b.log.Error("backfill queue full; request dropped", "reason", req.Reason, "keys", len(fresh))
 		if req.Reason == ReasonColdStart {
@@ -389,6 +445,7 @@ func (b *Backfiller) drainRelease() {
 		select {
 		case req := <-b.reqCh:
 			b.releaseKeys(req.Keys)
+			req.deliver(RepairResult{SkippedKeys: len(req.Keys) + req.skipped})
 		default:
 			return
 		}
@@ -417,8 +474,20 @@ func (b *Backfiller) process(parent context.Context, req Request) {
 	for _, k := range req.Keys {
 		byIv[k.Interval] = append(byIv[k.Interval], k.Symbol)
 	}
+	var rec *recorder
+	if req.Ranges != nil {
+		rec = &recorder{}
+		defer func() { req.deliver(RepairResult{Outcomes: rec.all(), SkippedKeys: req.skipped}) }()
+	}
 	for iv, symbols := range byIv {
-		b.processInterval(ctx, iv, symbols, req.Since, until)
+		var repair map[string][]Range
+		if req.Ranges != nil {
+			repair = map[string][]Range{}
+			for _, sym := range symbols {
+				repair[sym] = req.Ranges[Key{Symbol: sym, Interval: iv}]
+			}
+		}
+		b.processInterval(ctx, iv, symbols, req.Since, until, repair, rec)
 	}
 
 	b.metrics.duration.WithLabelValues(string(req.Reason)).Observe(b.now().Sub(start).Seconds())
@@ -426,7 +495,32 @@ func (b *Backfiller) process(parent context.Context, req Request) {
 		"reason", req.Reason, "keys", len(req.Keys), "took", b.now().Sub(start).Round(time.Millisecond))
 }
 
-func (b *Backfiller) processInterval(ctx context.Context, iv string, symbols []string, since, until time.Time) {
+// recorder collects per-range outcomes of a repair request from concurrent workers.
+type recorder struct {
+	mu  sync.Mutex
+	out []RangeOutcome
+}
+
+func (r *recorder) add(o RangeOutcome) {
+	r.mu.Lock()
+	r.out = append(r.out, o)
+	r.mu.Unlock()
+}
+
+func (r *recorder) all() []RangeOutcome {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]RangeOutcome(nil), r.out...)
+}
+
+// fetchJob is one REST fetch: bars with open time in [since, until).
+type fetchJob struct {
+	sym          string
+	since, until time.Time
+	rng          *Range // non-nil in repair mode
+}
+
+func (b *Backfiller) processInterval(ctx context.Context, iv string, symbols []string, since, until time.Time, repair map[string][]Range, rec *recorder) {
 	ivDur, ok := parseIntervalDuration(iv)
 	if !ok {
 		ivDur = time.Minute
@@ -434,7 +528,7 @@ func (b *Backfiller) processInterval(ctx context.Context, iv string, symbols []s
 	aw := b.archive[iv]
 
 	var chMax map[string]time.Time
-	if b.store != nil {
+	if b.store != nil && repair == nil { // repair mode fetches explicit ranges; no resume point needed
 		m, err := b.store.MaxStartTime(ctx, iv, symbols)
 		if err != nil {
 			b.metrics.errors.WithLabelValues("ch_max").Inc()
@@ -460,26 +554,45 @@ func (b *Backfiller) processInterval(ctx context.Context, iv string, symbols []s
 		return until.Add(-time.Duration(b.cfg.windowSize) * ivDur)
 	}
 
-	// 1. fetch + archive, parallel
+	// 1. plan the fetches: one per symbol (resume from the tail) or one per range (repair)
+	var jobs []fetchJob
+	if repair != nil {
+		for _, sym := range symbols {
+			for _, r := range repair[sym] {
+				r := r
+				jobs = append(jobs, fetchJob{sym: sym, since: r.From, until: r.To, rng: &r})
+			}
+		}
+	} else {
+		for _, sym := range symbols {
+			s := sinceFor(sym)
+			if until.Sub(s) < ivDur {
+				continue // no closed bar in range
+			}
+			jobs = append(jobs, fetchJob{sym: sym, since: s, until: until})
+		}
+	}
+
+	// fetch + archive, parallel
 	sem := make(chan struct{}, b.cfg.workers)
 	var wg sync.WaitGroup
-	for _, sym := range symbols {
-		s := sinceFor(sym)
-		if until.Sub(s) < ivDur {
-			continue // no closed bar in range
-		}
+	for _, j := range jobs {
 		wg.Add(1)
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
 			wg.Done()
+			wg.Wait()
 			return
 		}
-		go func(sym string, s time.Time) {
+		go func(j fetchJob) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			b.fetchAndArchive(ctx, iv, sym, s, until, aw)
-		}(sym, s)
+			n, err := b.fetchAndArchive(ctx, iv, j.sym, j.since, j.until, aw)
+			if rec != nil && j.rng != nil {
+				rec.add(RangeOutcome{Key: Key{Symbol: j.sym, Interval: iv}, Range: *j.rng, Fetched: n, Err: err})
+			}
+		}(j)
 	}
 	wg.Wait()
 
@@ -502,7 +615,23 @@ func (b *Backfiller) processInterval(ctx context.Context, iv string, symbols []s
 		}
 	}
 
-	// 3. read the deduped tail back, rebuild windows
+	// 3. read the deduped tail back, rebuild windows. In repair mode only symbols
+	//    whose repaired ranges reach into the Redis window need it.
+	if repair != nil {
+		windowStart := until.Add(-time.Duration(b.cfg.windowSize) * ivDur)
+		var touched []string
+		for _, sym := range symbols {
+			for _, r := range repair[sym] {
+				if r.To.After(windowStart) {
+					touched = append(touched, sym)
+					break
+				}
+			}
+		}
+		if symbols = touched; len(symbols) == 0 {
+			return
+		}
+	}
 	last, err := b.store.LastBars(ctx, iv, symbols, b.cfg.windowSize)
 	if err != nil {
 		b.metrics.errors.WithLabelValues("ch_read").Inc()
@@ -524,7 +653,9 @@ func (b *Backfiller) processInterval(ctx context.Context, iv string, symbols []s
 	}
 }
 
-func (b *Backfiller) fetchAndArchive(ctx context.Context, iv, sym string, since, until time.Time, aw ArchiveWriter) {
+// fetchAndArchive pulls [since, until) for one symbol into the archive and returns
+// how many bars the exchange returned plus the fetch error, if any.
+func (b *Backfiller) fetchAndArchive(ctx context.Context, iv, sym string, since, until time.Time, aw ArchiveWriter) (int, error) {
 	if sf, ok := b.fetch.(StreamFetcher); ok {
 		var totalFetched, totalWritten int
 		err := sf.FetchStream(ctx, sym, iv, since, until, func(batch []chwriter.Row) error {
@@ -548,18 +679,18 @@ func (b *Backfiller) fetchAndArchive(ctx context.Context, iv, sym string, since,
 			b.metrics.errors.WithLabelValues("rest").Inc()
 			b.log.Warn("REST fetch failed", "symbol", sym, "interval", iv, "err", err)
 		}
-		return
+		return totalFetched, err
 	}
 
 	rows, err := b.fetch.Fetch(ctx, sym, iv, since, until)
 	if err != nil {
 		b.metrics.errors.WithLabelValues("rest").Inc()
 		b.log.Warn("REST fetch failed", "symbol", sym, "interval", iv, "err", err)
-		return
+		return 0, err
 	}
 	b.metrics.barsFetched.WithLabelValues(iv).Add(float64(len(rows)))
 	if aw == nil || len(rows) == 0 {
-		return
+		return len(rows), nil
 	}
 	written := 0
 	for i := range rows {
@@ -571,6 +702,7 @@ func (b *Backfiller) fetchAndArchive(ctx context.Context, iv, sym string, since,
 		written++
 	}
 	b.metrics.barsWritten.WithLabelValues(iv).Add(float64(written))
+	return len(rows), nil
 }
 
 func (b *Backfiller) releaseKeys(keys []Key) {
