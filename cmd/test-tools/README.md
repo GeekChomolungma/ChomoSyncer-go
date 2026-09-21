@@ -377,14 +377,14 @@ Exit code `0` = every sub-check that ran passed; `1` = at least one sub-check fa
 
 | Check | What it looks at | Verdict |
 | :--- | :--- | :--- |
-| **A. Series integrity** (per symbol) | missing bars between the first and last bar; every `start_time` on the 5-minute grid; finite, non-negative values; **`snap_time` vs `start_time`** (hist/archive rows: exactly `start_time + 5m`; live rows: within `--live-accept` of it); the newest bar is at most `--max-lag-bars` behind | gap / off-grid / bad snap / stale → **FAIL**; zero value → WARN |
+| **A. Series integrity** (per symbol) | missing bars between the first and last bar; every `start_time` on the 5-minute grid; finite, non-negative values; **`snap_time` vs `start_time`** (hist/archive rows: exactly `start_time + 5m`; live rows are stored as Binance returned them, so one further than `--live-accept` from it is only counted); the newest bar is at most `--max-lag-bars` behind | gap / off-grid / bad hist snap / stale → **FAIL**; zero value, or a live row whose `snap_time` is far from the close → WARN |
 | **B. Freshness & source health** | newest bar overall and newest *calibrated* (`src_rank >= 2`) bar; live rows older than `--max-uncalibrated-hours` that hist never replaced | table stale → **FAIL**; calibration stalled or uncalibrated live rows → WARN (**FAIL** with `--require-calibration`) |
 | **C. Consumer view** | for every `fapi_kline_5m` bar in the window, is there an OI row? per-symbol coverage | below `--min-coverage` (default 99.5%) → **FAIL**; a symbol with klines but no OI row at all is named explicitly |
 | **D. Cross-section** | per bar, the share of symbols that have an OI row | any bar below `--min-cross-section` (default 99%) → **FAIL** |
 | **E. vs Binance** (`--vs-binance`) | a sample of symbols compared value-for-value with Binance's own `openInterestHist`: label `T` must be stored at `start_time = T-5m`; rank ≥ 2 rows must equal Binance's value exactly; live rows within `--live-tol` | mismatch or missing row → **FAIL** |
 
 What the checks mean for the data (why they exist):
-- **`snap_time` and the `T-5m` rule** are what prove live snapshots are attributed to the kline that is closing and hist labels are stored one bar earlier; an off-by-one-bar shift would otherwise be invisible because adjacent OI values differ by only ~0.02%.
+- **The `T-5m` rule** (hist/archive `snap_time == start_time + 5m`) proves hist labels are stored one bar earlier; live rows are attributed by the round's boundary, so their `snap_time` only records when Binance took the snapshot; an off-by-one-bar shift would otherwise be invisible because adjacent OI values differ by only ~0.02%.
 - **Off-grid rows** are the fingerprint of a timezone or unit error at import time.
 - **Uncalibrated live rows** mean the hourly hist calibration is not running; live values would then never be replaced by Binance's own series.
 
@@ -399,7 +399,7 @@ What the checks mean for the data (why they exist):
 | `--symbol` | whole market | Comma-separated symbols, e.g. `BTCUSDT,ETHUSDT` |
 | `--limit-symbols` | all | Inspect only the first N symbols |
 | `--max-lag-bars` | `2` | Newest bar may be at most this many bars behind |
-| `--live-accept` | `60` | Live rows: max seconds between `snap_time` and the bar's close |
+| `--live-accept` | `60` | Live rows whose `snap_time` is further than this from the bar's close are counted as a WARN (they are stored as returned, not rejected) |
 | `--max-uncalibrated-hours` | `2` | Live rows older than this should have been replaced by hist |
 | `--require-calibration` | off | Make uncalibrated live rows a FAIL instead of a WARN |
 | `--min-coverage` / `--min-cross-section` | `0.995` / `0.99` | Thresholds for checks C / D |

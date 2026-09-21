@@ -189,6 +189,15 @@ func (h *hh) pass(t *testing.T, spread time.Duration) PassStats {
 	return st
 }
 
+func (h *hh) passFull(t *testing.T) PassStats {
+	t.Helper()
+	st, err := h.r.PassFull(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
 func (h *hh) last(sym string) time.Time { h.r.mu.Lock(); defer h.r.mu.Unlock(); return h.r.last[sym] }
 
 func histogramCount(t *testing.T, reg *prometheus.Registry, name string) uint64 {
@@ -523,6 +532,101 @@ func TestCrossSectionGauge(t *testing.T) {
 	h.pass(t, 0)
 	if v := gaugeVal(t, h.reg, "oi_cross_section_complete_ratio"); v != 0.5 {
 		t.Fatalf("cross-section ratio = %v, want 0.5 (AAA current, BBB failed)", v)
+	}
+}
+
+func TestFullPassAsksEverySymbolForAWholePage(t *testing.T) {
+	h := newHistHarness(t, HistConfig{}, "CUR", "LAG")
+	h.setLast("CUR", "2026-09-21 11:55:00.000") // == the newest expected bar: an hourly pass skips it
+	h.setLast("LAG", "2026-09-21 11:00:00.000")
+	for _, s := range h.syms {
+		h.api.setSeries(s, "2026-09-19 00:00:00.000", "2026-09-21 12:05:00.000", 100)
+	}
+	h.load(t)
+	st := h.passFull(t)
+
+	if st.Skipped != 0 || st.Fetched != 2 || !st.Committed {
+		t.Fatalf("stats = %+v, want nothing skipped and both symbols fetched", st)
+	}
+	// One page: MaxLimit(500) - LimitMargin(3) = 497 bars back from floorNow, and one request.
+	pageStart := ts("2026-09-21 12:05:00.000").Add(-497 * BarInterval)
+	for _, s := range h.syms {
+		calls := h.api.callsFor(s)
+		if len(calls) != 1 || !calls[0].start.Equal(pageStart.Add(BarInterval)) || calls[0].limit != 500 || !calls[0].end.Equal(h.fc.Now()) {
+			t.Fatalf("%s calls = %+v, want one request for start %v limit 500 end=now", s, calls, pageStart.Add(BarInterval))
+		}
+		rows := h.sink.forSymbol(s)
+		if len(rows) != 497 || rows[0].SrcRank != RankHist {
+			t.Fatalf("%s rows = %d rank %d, want 497 hist rows (the whole page is rewritten)", s, len(rows), rows[0].SrcRank)
+		}
+		if !h.last(s).Equal(ts("2026-09-21 12:00:00.000")) {
+			t.Fatalf("%s state = %v, want advanced to 12:00", s, h.last(s))
+		}
+	}
+	// the incremental pass that follows has nothing to do
+	if st2 := h.pass(t, 0); st2.Skipped != 2 {
+		t.Fatalf("the hourly pass after it should skip both symbols: %+v", st2)
+	}
+}
+
+func TestFullPassStillPagesBackToTheLastCalibratedBar(t *testing.T) {
+	h := newHistHarness(t, HistConfig{}, "AAA")
+	lh := ts("2026-09-21 12:05:00.000").Add(-700 * BarInterval) // older than one page
+	h.store.data["AAA"] = LastStarts{Hist: lh, Any: lh}
+	h.api.setSeries("AAA", "2026-09-18 00:00:00.000", "2026-09-21 12:05:00.000", 1)
+	h.load(t)
+	h.passFull(t)
+	calls := h.api.callsFor("AAA")
+	if len(calls) != 2 || !calls[0].start.Equal(lh.Add(BarInterval)) {
+		t.Fatalf("calls = %+v, want 2 pages starting at the label after the last calibrated bar", calls)
+	}
+	if rows := h.sink.forSymbol("AAA"); len(rows) != 700 {
+		t.Fatalf("rows = %d, want the whole 700-bar gap", len(rows))
+	}
+}
+
+func TestFullPassNeverReachesBeyondMaxBackfill(t *testing.T) {
+	// MaxBackfill (24h) is shorter than one page (~41h): the page is cut to 24h, which is not a gap beyond the cap.
+	h := newHistHarness(t, HistConfig{MaxBackfill: 24 * time.Hour, ColdStartWindow: 24 * time.Hour}, "REC", "OLD")
+	h.setLast("REC", "2026-09-21 11:55:00.000")
+	h.setLast("OLD", "2026-09-19 00:00:00.000") // its own gap reaches past the cap
+	for _, s := range h.syms {
+		h.api.setSeries(s, "2026-09-18 00:00:00.000", "2026-09-21 12:05:00.000", 1)
+	}
+	h.load(t)
+	st := h.passFull(t)
+	capStart := floorBar(h.fc.Now().Add(-24 * time.Hour))
+	for _, s := range h.syms {
+		if c := h.api.callsFor(s)[0]; !c.start.Equal(capStart.Add(BarInterval)) {
+			t.Fatalf("%s first request start = %v, want the capped %v", s, c.start, capStart.Add(BarInterval))
+		}
+	}
+	if st.BeyondCap != 1 {
+		t.Fatalf("BeyondCap = %d, want 1 (only OLD's own gap is beyond the cap)", st.BeyondCap)
+	}
+}
+
+func TestFullPassColdStartsSymbolsWithoutState(t *testing.T) {
+	h := newHistHarness(t, HistConfig{}, "NEW")
+	h.api.setSeries("NEW", "2026-09-10 00:00:00.000", "2026-09-21 12:05:00.000", 1)
+	h.load(t)
+	st := h.passFull(t)
+	if st.ColdStart != 1 || len(h.sink.forSymbol("NEW")) != 576 { // the 48h window is wider than one page
+		t.Fatalf("stats = %+v rows = %d, want the 48h cold-start window (576 bars)", st, len(h.sink.forSymbol("NEW")))
+	}
+}
+
+func TestRunStartsWithAFullPass(t *testing.T) {
+	h := newHistHarness(t, HistConfig{}, "AAA")
+	h.setLast("AAA", "2026-09-21 11:55:00.000") // current: an hourly pass would skip it
+	h.api.setSeries("AAA", "2026-09-19 00:00:00.000", "2026-09-21 12:05:00.000", 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.r.sleep = func(ctx context.Context, d time.Duration) error { cancel(); return ctx.Err() }
+	h.r.Run(ctx)
+	if h.api.totalCalls() != 1 || len(h.sink.forSymbol("AAA")) != 497 {
+		t.Fatalf("calls=%d rows=%d, want the start-up pass to re-read a whole page even for a current symbol",
+			h.api.totalCalls(), len(h.sink.forSymbol("AAA")))
 	}
 }
 

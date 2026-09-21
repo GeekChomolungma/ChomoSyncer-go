@@ -32,7 +32,9 @@ func newLiveHarness(t *testing.T, now string, syms ...string) (*Live, *fakeSnaps
 	sink := &fakeSink{}
 	cache := newLiveCache(24)
 	m := newMetrics(prometheus.NewRegistry())
-	l := NewLive(LiveConfig{Workers: 3, RPS: 1e6}, src, sink, func() []string { return syms }, cache, m, nil)
+	// CatchUp is 1ns so that Run's start-up catch-up round stays out of the tests that are
+	// about something else; the catch-up tests set it explicitly.
+	l := NewLive(LiveConfig{Workers: 3, RPS: 1e6, CatchUp: time.Nanosecond}, src, sink, func() []string { return syms }, cache, m, nil)
 	l.now, l.sleep = fc.Now, fc.Sleep
 	return l, src, sink, cache, m, fc
 }
@@ -219,6 +221,56 @@ func TestRunSnapshotsEachBoundaryOnce(t *testing.T) {
 	}
 	if rows := sink.forSymbol("AAA"); len(rows) != 1 {
 		t.Fatalf("got %d rows for boundary 12:10, want exactly one round", len(rows))
+	}
+}
+
+func TestRunSnapshotsTheBarOfABoundaryItJustMissed(t *testing.T) {
+	// Started at 12:08:00, 3 minutes after the 12:05 boundary: the bar that closed then
+	// (start 12:00) never got its round. It is snapshotted at once, and the next regular
+	// round is the one for 12:10.
+	l, src, sink, cache, _, fc := newLiveHarness(t, "2026-09-21 12:08:00.000", "AAA", "BBB")
+	l.cfg.CatchUp = 4 * time.Minute
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var slept []time.Duration
+	l.sleep = func(ctx context.Context, d time.Duration) error {
+		slept = append(slept, d)
+		cancel()
+		return ctx.Err()
+	}
+	src.fn = func(string) (Snapshot, error) { return Snapshot{OpenInterest: 7, Time: fc.Now()}, nil }
+	l.Run(ctx)
+
+	// The deadline is relative to now: measured from the long-gone 12:05 boundary it would be over already
+	// and every request would be abandoned.
+	for _, sym := range []string{"AAA", "BBB"} {
+		rows := sink.forSymbol(sym)
+		if len(rows) != 1 || !rows[0].StartTime.Equal(ts("2026-09-21 12:00:00.000")) || rows[0].SrcRank != RankLive {
+			t.Fatalf("%s rows = %+v, want one live row for the bar 12:00", sym, rows)
+		}
+		if !rows[0].SnapTime.Equal(ts("2026-09-21 12:08:00.000")) {
+			t.Fatalf("%s snap_time = %v, want the real snapshot time 12:08:00", sym, rows[0].SnapTime)
+		}
+	}
+	if _, ok := cache.get("AAA", ts("2026-09-21 12:00:00.000")); !ok {
+		t.Fatal("the catch-up snapshot must reach the live cache like any other")
+	}
+	if len(slept) != 1 || slept[0] != 90*time.Second { // 12:08:00 -> 12:09:30, the round for 12:10
+		t.Fatalf("waits = %v, want a single 90s wait for the regular 12:10 round", slept)
+	}
+}
+
+func TestRunDoesNotCatchUpLongAfterABoundary(t *testing.T) {
+	// 12:09:10 is 4m10s after 12:05: hist has certainly published that bar by now.
+	l, src, sink, _, _, fc := newLiveHarness(t, "2026-09-21 12:09:10.000", "AAA")
+	l.cfg.CatchUp = 4 * time.Minute
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	l.sleep = func(ctx context.Context, d time.Duration) error { cancel(); return ctx.Err() }
+	src.fn = func(string) (Snapshot, error) { return Snapshot{OpenInterest: 7, Time: fc.Now()}, nil }
+	l.Run(ctx)
+	if sink.count() != 0 {
+		t.Fatalf("%d rows written before the first wait, want none", sink.count())
 	}
 }
 

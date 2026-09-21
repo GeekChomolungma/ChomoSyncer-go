@@ -252,8 +252,8 @@
 设计与实测依据见 [`new_requirements/oi.md`](../new_requirements/oi.md)。默认关闭（`open_interest.hist_enabled` / `live_enabled`）。写入 `market.fapi_oi_5m`（`deploy/clickhouse/004_fapi_oi.sql`），汇总表是 `005` + `006`。它是拉取模型的旁路模块：不经过 dispatcher、窗口门控和 Redis。
 
 - **行的语义。** `start_time` 是“该持仓量所属的那根 5 分钟 K 线”的**开盘时间**（值是这根 K 线收盘时刻的），所以能按 `(symbol, start_time)` 与 `fapi_kline_5m` 直接拼接。`src_rank`（1 live、2 hist、3 归档）决定合并时谁胜出（`ReplacingMergeTree(src_rank)`）。
-- **Live**（`live.go`）：每个 5 分钟边界 `B`，从 `B − live_lead`（30 秒）开始，用 `GET /fapi/v1/openInterest` 给每个标的打一次快照；行永远属于在 `B` 收盘的那根 K 线，币安返回什么就原样记下（响应里的 `time` 记入 `snap_time` 供以后核对；流动性差的标的返回的旧快照就当作这根 bar 的值，等 hist 校准）。`live_accept_window` 只限制一轮在 `B` 之后最多还能继续多久。请求经共享权重闸门（`ClassLive`）。
-- **Hist**（`hist.go`）：`GET /futures/data/openInterestHist`，标签 `T` 存到 `T − 5m`。启动时按标的从 ClickHouse 读“已校准到哪根”（`maxIf(start_time, src_rank >= 2)`）并决策：已是最新则跳过，否则只取缺口（`limit` 按缺口取值；因为只传 `startTime` 不能向前翻页，长缺口靠移动 `endTime` 从新往旧翻）。同一段代码之后每小时 `hh:05` 跑一轮，在 20 分钟内铺开，用来校准 live 行。内存状态只在行落盘之后才前进。
+- **Live**（`live.go`）：每个 5 分钟边界 `B`，从 `B − live_lead`（30 秒）开始，用 `GET /fapi/v1/openInterest` 给每个标的打一次快照；行永远属于在 `B` 收盘的那根 K 线，币安返回什么就原样记下（响应里的 `time` 记入 `snap_time` 供以后核对；流动性差的标的返回的旧快照就当作这根 bar 的值，等 hist 校准）。`live_accept_window` 只限制一轮在 `B` 之后最多还能继续多久。服务启动时如果距上一个边界不到 `live_catchup_window`，`Run` 会先给那个边界刚收盘的 bar 补拍一轮（hist 还没发布那一根）。请求经共享权重闸门（`ClassLive`）。
+- **Hist**（`hist.go`）：`GET /futures/data/openInterestHist`，标签 `T` 存到 `T − 5m`。启动那一轮是全量的：每个标的至少请求一整页最新标签（500 根 ≈ 41 小时）并写入所有返回内容；缺口更长时靠移动 `endTime` 从新往旧翻页（因为只传 `startTime` 不能向前翻页），一直翻到 ClickHouse 里最新已校准的那一行（`maxIf(start_time, src_rank >= 2)`），最远不超过 `hist_max_backfill`。之后每小时 `hh:05` 跑一轮增量校准，在 20 分钟内铺开：逐个标的判断，已是最新则跳过，否则从最新已校准的那根起重取，用来校准 live 行。内存状态只在行落盘之后才前进。
 - **限流。** live 通过 `internal/weightgate` 使用 `/fapi` 权重池；hist 有自己的池（`DataPool`：每 IP 每 5 分钟 1000 次，本地计数，接口没有用量头）。
 - **写入器。** 一个小型独立批量写入器（`writer.go`），刻意不改动 `internal/chwriter`。
 - 测试：假时钟单元测试（假 API 与真实接口语义一致）；`TestIntegrationClickHouse` 与 `TestE2ERealBinance` 只在设置了 `CHOMO_TEST_*` 环境变量时运行。

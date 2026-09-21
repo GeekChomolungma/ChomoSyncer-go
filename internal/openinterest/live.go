@@ -18,6 +18,11 @@ type LiveConfig struct {
 	Workers        int           // concurrent requests (default 8)
 	RPS            float64       // request pacing; the shared weight gate is the hard limit (default 25)
 	RequestTimeout time.Duration // per request (default 10s)
+	// CatchUp: when Run starts less than this long after a 5-minute boundary, the bar that
+	// closed at that boundary missed its round (the service was down): it is snapshotted at
+	// once, and hist replaces the value when it publishes the bar (default 4m, the time
+	// hist needs to publish a label).
+	CatchUp time.Duration
 	// MinRemaining: a round is not started when fewer than this remains before the
 	// boundary (default 5s); it waits for the next boundary instead.
 	MinRemaining time.Duration
@@ -38,6 +43,9 @@ func (c LiveConfig) withDefaults() LiveConfig {
 	}
 	if c.RequestTimeout <= 0 {
 		c.RequestTimeout = 10 * time.Second
+	}
+	if c.CatchUp <= 0 {
+		c.CatchUp = 4 * time.Minute
 	}
 	if c.MinRemaining <= 0 {
 		c.MinRemaining = 5 * time.Second
@@ -114,8 +122,35 @@ func (l *Live) nextRound(now time.Time) (boundary, start time.Time) {
 	return boundary, start
 }
 
-// Run snapshots at every boundary until ctx ends.
+// missedBoundary returns the boundary whose round the service missed by starting up
+// shortly after it: the latest boundary at or before now, if it is at most CatchUp ago
+// and has not been snapshotted.
+func (l *Live) missedBoundary(now time.Time) (time.Time, bool) {
+	b := floorBar(now)
+	if now.Sub(b) > l.cfg.CatchUp || !b.After(l.lastBoundary) {
+		return time.Time{}, false
+	}
+	return b, true
+}
+
+func (l *Live) logRound(st CycleStats, catchUp bool) {
+	l.log.Info("open-interest live round",
+		"boundary", st.Boundary.Format("15:04:05"), "symbols", st.Symbols, "ok", st.OK,
+		"errors", st.Errors, "took", st.Took.Round(100*time.Millisecond), "catch_up", catchUp)
+}
+
+// Run snapshots at every boundary until ctx ends. If it starts shortly after a boundary
+// it first snapshots the bar that boundary closed (see LiveConfig.CatchUp): hist may not
+// have published that bar yet, and a value now is better than none.
 func (l *Live) Run(ctx context.Context) {
+	if b, ok := l.missedBoundary(l.now()); ok {
+		st := l.cycle(ctx, b, l.now().Add(l.cfg.AcceptWindow))
+		if ctx.Err() != nil {
+			return
+		}
+		l.lastBoundary = b
+		l.logRound(st, true)
+	}
 	for ctx.Err() == nil {
 		boundary, start := l.nextRound(l.now())
 		if d := start.Sub(l.now()); d > 0 {
@@ -128,9 +163,7 @@ func (l *Live) Run(ctx context.Context) {
 			return
 		}
 		l.lastBoundary = boundary
-		l.log.Info("open-interest live round",
-			"boundary", st.Boundary.Format("15:04:05"), "symbols", st.Symbols, "ok", st.OK,
-			"errors", st.Errors, "took", st.Took.Round(100*time.Millisecond))
+		l.logRound(st, false)
 	}
 }
 
@@ -138,14 +171,19 @@ func (l *Live) Run(ctx context.Context) {
 // window after the boundary has passed are abandoned: their snapshots would be
 // rejected anyway.
 func (l *Live) Cycle(ctx context.Context, boundary time.Time) CycleStats {
+	return l.cycle(ctx, boundary, boundary.Add(l.cfg.AcceptWindow))
+}
+
+// cycle is Cycle with an explicit deadline for the requests still outstanding.
+func (l *Live) cycle(ctx context.Context, boundary, deadline time.Time) CycleStats {
 	begin := l.now()
 	syms := l.symbols()
 	st := CycleStats{Boundary: boundary, Symbols: len(syms)}
 	start := boundary.Add(-BarInterval) // the bar that closes at the boundary: every row of this round belongs to it
 
-	// Abandon whatever is still outstanding once the accept window after the
-	// boundary is over (the duration is computed from the injected clock).
-	remaining := boundary.Add(l.cfg.AcceptWindow).Sub(begin)
+	// Abandon whatever is still outstanding at the deadline (the duration is computed
+	// from the injected clock).
+	remaining := deadline.Sub(begin)
 	if remaining < 0 {
 		remaining = 0
 	}

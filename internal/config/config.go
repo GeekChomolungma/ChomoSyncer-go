@@ -191,10 +191,11 @@ type OpenInterestConfig struct {
 	Table       string `yaml:"table"` // target table
 
 	// live
-	LiveLead         time.Duration `yaml:"live_lead"`          // start each round this long before the kline closes
-	LiveAcceptWindow time.Duration `yaml:"live_accept_window"` // how long after the boundary a live round may keep running; outstanding requests are then abandoned
-	LiveWorkers      int           `yaml:"live_workers"`       // concurrent snapshot requests
-	FapiRPS          float64       `yaml:"fapi_rps"`           // request pacing of a round; the shared weight gate is the hard limit
+	LiveLead         time.Duration `yaml:"live_lead"`           // start each round this long before the kline closes
+	LiveAcceptWindow time.Duration `yaml:"live_accept_window"`  // how long after the boundary a live round may keep running; outstanding requests are then abandoned
+	LiveCatchUp      time.Duration `yaml:"live_catchup_window"` // starting up within this long after a boundary snapshots the bar that boundary closed
+	LiveWorkers      int           `yaml:"live_workers"`        // concurrent snapshot requests
+	FapiRPS          float64       `yaml:"fapi_rps"`            // request pacing of a round; the shared weight gate is the hard limit
 
 	// hist
 	HistReconcileInterval time.Duration `yaml:"hist_reconcile_interval"`
@@ -220,7 +221,7 @@ func (o OpenInterestConfig) ToModule() openinterest.Config {
 		LiveEnabled: o.LiveEnabled,
 		Table:       o.Table,
 		Live: openinterest.LiveConfig{
-			Lead: o.LiveLead, AcceptWindow: o.LiveAcceptWindow, Workers: o.LiveWorkers, RPS: o.FapiRPS,
+			Lead: o.LiveLead, AcceptWindow: o.LiveAcceptWindow, CatchUp: o.LiveCatchUp, Workers: o.LiveWorkers, RPS: o.FapiRPS,
 		},
 		Hist: openinterest.HistConfig{
 			Interval: o.HistReconcileInterval, Offset: o.HistReconcileOffset, Spread: o.HistReconcileSpread,
@@ -362,6 +363,7 @@ func DefaultConfig() Config {
 			Table:                 openinterest.DefaultTable,
 			LiveLead:              30 * time.Second,
 			LiveAcceptWindow:      60 * time.Second,
+			LiveCatchUp:           4 * time.Minute,
 			LiveWorkers:           8,
 			FapiRPS:               25,
 			HistReconcileInterval: time.Hour,

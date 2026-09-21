@@ -216,8 +216,8 @@ curl -i http://localhost:9090/readyz     # 回补补完后转 200
 
 | 开关 | 做什么 | 使用的额度池 |
 | :--- | :--- | :--- |
-| `open_interest.hist_enabled` | 启动时按标的读“表已校准到哪根”，只从 `openInterestHist` 补缺的那段；之后每小时 `hh:05` 校准一次 | `/futures/data`（每 IP 每 5 分钟 1000 次），自己的计数器 |
-| `open_interest.live_enabled` | 每个 5 分钟边界，在 K 线收盘前 30 秒起用 `/fapi/v1/openInterest` 给每个标的打一次快照 | `/fapi` 权重预算（每 IP 每分钟 2400），经共享的 `weight_gate` |
+| `open_interest.hist_enabled` | 启动时对每个标的都请求一整页（约 41 小时）`openInterestHist` 并写入币安返回的所有内容（缺口更长则往回翻页到最新已校准的那根）；之后每小时 `hh:05` 增量校准一次 | `/futures/data`（每 IP 每 5 分钟 1000 次），自己的计数器 |
+| `open_interest.live_enabled` | 每个 5 分钟边界，在 K 线收盘前 30 秒起用 `/fapi/v1/openInterest` 给每个标的打一次快照；如果服务启动时距上一个边界不到 `live_catchup_window`（4 分钟），先给刚收盘的那根 bar 补拍一轮 | `/fapi` 权重预算（每 IP 每分钟 2400），经共享的 `weight_gate` |
 
 #### 逐步操作
 
@@ -295,7 +295,8 @@ python cmd/test-tools/backfill_missing_oi.py oi_gaps.csv --ch-password "<pw>" --
 #### 首次启动做什么，重启又做什么
 
 - **空表**：每个标的补 48 小时（`hist_cold_start_window`），每个标的 2 个请求。约 528 个标的就是约 1050 个请求，按 `data_rps: 2` 大约需要 **9 分钟**（这是估算；端到端测试里 3 个标的只用了 2 秒）。这段时间这个 IP 会用掉约 60% 的 `/futures/data` 额度：期间不要再跑其他大量调用 `/futures/data` 的工具。
-- **之后每次启动**：模块会重新从 ClickHouse 读出每个标的最新的已校准行，逐个标的决策——已是最新 → **一个请求都不发**；落后 → 只补缺口（`limit` 按缺口取值；已验证：停机 3 小时，每个标的只花一个请求）。启动时 ClickHouse 不可用的话，每 5 到 60 秒重试一次，并打印 `could not read open-interest state; will retry`。
+- **之后每次启动**：启动那一轮是**全量**的：**每个标的都请求一整页最新数据**（500 根，约 41 小时；约 528 个请求，按 `data_rps: 2` 约 4.5 分钟），不管库里有什么，币安返回的所有内容都会写入（`src_rank = 2` 覆盖 live 行，归档行仍然优先），所以顺带把最近约 41 小时重新校准了一遍。不跳过任何标的：重启会给每个标的留下一个缺口，而且上次每小时校准之后的 live 行本来就在等校准。缺口比一页更长时，会往回翻页到最新已校准的那根（从 ClickHouse 读出），最远不超过 `hist_max_backfill`。启动时 ClickHouse 不可用的话，每 5 到 60 秒重试一次，并打印 `could not read open-interest state; will retry`。只有每小时的校准才会跳过已是最新的标的。
+- **刚过边界就重启**：币安要在 5 分钟整点之后 1 到 3 分钟才发布对应的标签，所以 hist 拿不到刚收盘的那一根。如果服务启动时距上一个边界不到 `live_catchup_window`（4 分钟），live 会立刻给那根 bar 补拍一次（`open-interest live round` 日志里 `catch_up=true`，`src_rank = 1`），下一次 hist 会用币安自己的值覆盖它。
 - **长时间停机**：缺口最多补到 `hist_max_backfill`（7 天）。更早的部分会计入 `oi_hist_gap_beyond_cap_total`，需要用归档导入，这一块还不在模块里。停机期间的 live 快照是永久丢失的（live 接口没有历史），那些 bar 由 hist 用币安自己的值来补。
 - 改开关**不需要**先停服务，但要重启才生效。
 
@@ -482,8 +483,8 @@ python cmd/test-tools/check_oi_consistency.py --require-calibration --max-uncali
 ### 演练 3：持仓量模块停几个小时（仅在启用 §3.4 时）
 1. 把 `open_interest` 的两个开关设为 `false`（或者停服务）约 3 小时，再重新打开并重启；
 2. **预期表现**：
-   - 日志出现 `loaded open-interest state from ClickHouse`，以及一轮 `reason=startup` 的 hist，`cold_start=0`，每个标的大约一个请求（3 小时的缺口每个标的只是一页小请求；这一轮不铺开）；
-   - 停机期间的 bar 由币安自己的值补齐（`src_rank = 2`）；本来就是最新的标的**不发**任何请求；
+   - 日志出现 `loaded open-interest state from ClickHouse`，以及一轮 `reason=startup` 的 hist，`skipped=0 cold_start=0`，每个标的恰好一个请求（整页最新数据；这一轮不铺开）；如果重启距边界不到 4 分钟，还会有一条 `open-interest live round ... catch_up=true`；
+   - 停机期间的 bar 由币安自己的值补齐（`src_rank = 2`）；币安还没发布的、刚收盘的那一根暂时是 live 值，等下一次 hist 覆盖；
    - `oi_cross_section_complete_ratio` 回到 ≈ 1；
    - `python cmd/test-tools/check_oi_consistency.py --vs-binance` 显示零缺失 bar。
 

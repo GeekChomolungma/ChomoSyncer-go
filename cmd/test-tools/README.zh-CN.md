@@ -377,14 +377,14 @@ python cmd/test-tools/run_all_checks.py --verbose
 
 | 检查项 | 看什么 | 判定 |
 | :--- | :--- | :--- |
-| **A. 序列完整性**（逐标的） | 第一根到最后一根之间有没有缺 bar；每个 `start_time` 是否落在 5 分钟网格上；值是否有限且非负；**`snap_time` 与 `start_time` 的关系**（hist/归档行必须恰好等于 `start_time + 5m`；live 行在 `--live-accept` 之内）；最新一根最多落后 `--max-lag-bars` 根 | 缺 bar / 偏离网格 / snap 错误 / 陈旧 → **FAIL**；零值 → WARN |
+| **A. 序列完整性**（逐标的） | 第一根到最后一根之间有没有缺 bar；每个 `start_time` 是否落在 5 分钟网格上；值是否有限且非负；**`snap_time` 与 `start_time` 的关系**（hist/归档行必须恰好等于 `start_time + 5m`；live 行是币安返回什么就存什么，所以距离超过 `--live-accept` 的只计数，不算失败）；最新一根最多落后 `--max-lag-bars` 根 | 缺 bar / 偏离网格 / hist 的 snap 错误 / 陈旧 → **FAIL**；零值，或 live 行的 `snap_time` 离收盘很远 → WARN |
 | **B. 新鲜度与来源健康** | 全表最新一根与最新的“已校准”（`src_rank >= 2`）一根；超过 `--max-uncalibrated-hours` 仍没被 hist 替换的 live 行 | 表陈旧 → **FAIL**；校准停滞或有未校准的 live 行 → WARN（加 `--require-calibration` 则 **FAIL**） |
 | **C. 消费视角** | 窗口内每一根 `fapi_kline_5m`，有没有对应的 OI 行；逐标的覆盖率 | 低于 `--min-coverage`（默认 99.5%）→ **FAIL**；有 K 线但完全没有 OI 行的标的会被单独点名 |
 | **D. 截面完整度** | 逐根 bar，有 OI 行的标的占比 | 任何一根低于 `--min-cross-section`（默认 99%）→ **FAIL** |
 | **E. 对回币安**（`--vs-binance`） | 抽样标的与币安自己的 `openInterestHist` 逐值对比：标签 `T` 必须存在 `start_time = T-5m` 这一行；rank ≥ 2 的行必须与币安的值完全相等；live 行在 `--live-tol` 之内 | 不一致或缺行 → **FAIL** |
 
 这些检查为什么存在：
-- **`snap_time` 和 “`T-5m`” 规则**证明了 live 快照被归到了正在收盘的那根 K 线、hist 标签被存到了早一根的位置。相邻两根 OI 只差约 0.02%，整体平移一根是**肉眼看不出来**的，只能靠这些规则抓。
+- **“`T-5m`” 规则**（hist/归档行 `snap_time == start_time + 5m`）证明了 hist 标签被存到了早一根的位置；live 行按本轮的边界归属，它的 `snap_time` 只记录币安实际做快照的时刻。相邻两根 OI 只差约 0.02%，整体平移一根是**肉眼看不出来**的，只能靠这些规则抓。
 - **偏离网格的行**是导入时时区或单位出错的典型特征。
 - **未校准的 live 行**意味着每小时的 hist 校准没有在跑；live 值永远不会被币安自己的序列替换。
 
@@ -399,7 +399,7 @@ python cmd/test-tools/run_all_checks.py --verbose
 | `--symbol` | 全市场 | 逗号分隔的币种，例如 `BTCUSDT,ETHUSDT` |
 | `--limit-symbols` | 全部 | 只检查前 N 个币种 |
 | `--max-lag-bars` | `2` | 最新一根最多落后这么多根 |
-| `--live-accept` | `60` | live 行的 `snap_time` 与 bar 收盘时刻的最大差（秒） |
+| `--live-accept` | `60` | live 行的 `snap_time` 与收盘时刻的差超过这个值时计为 WARN（按返回值原样存储，不拒绝） |
 | `--max-uncalibrated-hours` | `2` | 早于这个时长的 live 行本应已被 hist 替换 |
 | `--require-calibration` | 关 | 把未校准的 live 行从 WARN 升级为 FAIL |
 | `--min-coverage` / `--min-cross-section` | `0.995` / `0.99` | C / D 两项的阈值 |

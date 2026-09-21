@@ -303,7 +303,8 @@ open_interest:
 
 1. `internal/app` 在 universe 首次刷新成功之后启动（`Run()` 里 `univ.Start()` 之后）；未启用任何一项时不构造。
 2. **hist 与 live 同时启动。** 之前的设计要求先补缺、后启动 live，理由是“避免额度冲突”；但两者用的是**不同的池**（live 走 `/fapi` 权重闸门，hist 走 `/futures/data` 池），互不占用额度，所以补缺期间 live 照常快照，不会因为补缺跑得久而漏掉快照。同一个 `(symbol, start_time)` 上 hist（`src_rank=2`）总是覆盖 live（`1`），与谁先写入无关。
-3. **hist 先做冷启动决策（见 §5.8）**：读库、逐个标的判断是否需要补，再跑一轮不铺开的补缺（启动补缺只受 `/futures/data` 池限制），之后每小时 `hh:05` 校准一次。
+3. **hist 启动那一轮是全量的（见 §5.8）**：每个标的都请求一整页最新标签并写入，缺口更长再往回翻页；这一轮不铺开（只受 `/futures/data` 池限制），之后每小时 `hh:05` 增量校准一次。
+   **live 启动补拍**：如果服务启动时距上一个 5 分钟边界不到 `live_catchup_window`（默认 4 分钟），live 立刻给那个边界刚收盘的 bar 补拍一轮（`src_rank=1`）：币安要在标签之后 1~3 分钟才发布，hist 此刻还拿不到这一根。hist 发布后会覆盖它。
 4. 停机：取消两个循环并等待，再依次关闭写入器（排空并落盘）与存储连接。
 
 ### 5.5 指标（Prometheus）
@@ -326,9 +327,11 @@ open_interest:
 - `hist.go`：每个标的的动态 `limit`（含 30 小时缺口、超过 500 分页、新上市标的）；一轮的请求按 `spread` 匀速铺开；缺口优先的排序。
 - 写入器：沿用 `chwriter` 的测试用例结构（fake flusher）。
 
-### 5.8 冷启动决策与每小时校准（hist.go，已实现）
+### 5.8 启动全量校准与每小时增量校准（hist.go，已实现）
 
-**冷启动决策：读库里每个标的的最大开盘时间，再决定要不要调 hist。** 启动时 `store.LastStarts` 用一条查询取每个标的的两个值：
+**启动那一轮是全量的：不跳过任何标的。** 实际运行中，每次重启几乎所有标的都要请求：停机会给每个标的留下缺口（过去的 bar 只有 hist 能补，live 取不到），而且上次每小时校准之后的 live 行本来就在等校准。既然这 528 个请求省不掉，就每个标的都请求一整页最新标签（`hist_max_limit − hist_limit_margin` = 497 根 ≈ 41 小时，`limit=500`，一个请求）并**写入返回的所有内容**（`src_rank=2` 覆盖 live，归档 `src_rank=3` 仍然优先），顺带把最近 41 小时重新校准一次。缺口比一页更长时，从最新已校准的那一根起往回翻页，最远到 `hist_max_backfill`。下面的读库与决策表描述的是**每小时的增量校准**（启动那一轮只用其中的 `lh`、冷启动窗口和上限）。
+
+**增量校准的决策：读库里每个标的的最大开盘时间，再决定要不要调 hist。** 启动时 `store.LastStarts` 用一条查询取每个标的的两个值：
 
 ```sql
 SELECT symbol, max(start_time), maxIf(start_time, src_rank >= 2) FROM market.fapi_oi_5m WHERE symbol IN (?) GROUP BY symbol

@@ -57,6 +57,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("open_interest.live_lead (%v) must be shorter than the 5m bar", c.Live.Lead)
 	case c.Live.AcceptWindow >= BarInterval:
 		return fmt.Errorf("open_interest.live_accept_window (%v) must be shorter than the 5m bar: a round may not run into the next one", c.Live.AcceptWindow)
+	case c.Live.CatchUp >= BarInterval:
+		return fmt.Errorf("open_interest.live_catchup_window (%v) must be shorter than the 5m bar", c.Live.CatchUp)
 	case c.Live.Lead < c.Live.MinRemaining:
 		return fmt.Errorf("open_interest.live_lead (%v) must not be shorter than the minimum remaining time (%v)", c.Live.Lead, c.Live.MinRemaining)
 	case c.Hist.Offset >= c.Hist.Interval:

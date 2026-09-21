@@ -17,6 +17,7 @@ func TestConfigValidate(t *testing.T) {
 	bad := map[string]Config{
 		"lead >= bar":               {Live: LiveConfig{Lead: 5 * time.Minute}},
 		"accept window too wide":    {Live: LiveConfig{AcceptWindow: 5 * time.Minute}},
+		"catch-up as long as a bar": {Live: LiveConfig{CatchUp: 5 * time.Minute}},
 		"lead below min remaining":  {Live: LiveConfig{Lead: 3 * time.Second}},
 		"offset >= interval":        {Hist: HistConfig{Interval: time.Hour, Offset: time.Hour}},
 		"spread > interval":         {Hist: HistConfig{Interval: time.Hour, Spread: 2 * time.Hour}},

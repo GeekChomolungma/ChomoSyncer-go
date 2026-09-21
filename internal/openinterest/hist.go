@@ -73,9 +73,18 @@ type PassStats struct {
 	LiveGapBar int // bars hist returned that live had no snapshot for
 }
 
-// Reconciler brings each symbol's calibrated (hist) rows up to date. The same
-// pass serves as the start-up catch-up and the hourly calibration: for each symbol
-// it asks how far the database is calibrated and fetches only what is missing.
+// Reconciler brings each symbol's calibrated (hist) rows up to date. There are two
+// kinds of pass:
+//
+//   - the start-up pass is FULL: every symbol is asked for at least one whole page of
+//     the newest labels (500 bars, about 41 hours) whatever the database holds, and
+//     whatever hist returns is written (rank 2 replaces live rows; archive rows keep
+//     winning). A restart costs one request per symbol in any case (the downtime
+//     itself left a hole in every symbol, and the live rows since the last hourly pass
+//     wait for calibration), so nothing is skipped; a gap longer than one page is
+//     paged back to the last calibrated bar, never beyond MaxBackfill;
+//   - the hourly passes are incremental: per symbol they fetch from the last
+//     calibrated bar on, and skip a symbol that is already up to date.
 //
 // State: last[sym] is the start_time of the newest row with src_rank >= 2 in the
 // database. It is loaded from ClickHouse once at start-up and kept in memory after
@@ -165,18 +174,18 @@ func (r *Reconciler) Run(ctx context.Context) {
 	if err := r.LoadState(ctx); err != nil {
 		return
 	}
-	r.runPass(ctx, 0, "startup")
+	r.runPass(ctx, 0, "startup", true)
 	for ctx.Err() == nil {
 		next := nextReconcileTime(r.now(), r.cfg.Interval, r.cfg.Offset)
 		if err := r.sleep(ctx, next.Sub(r.now())); err != nil {
 			return
 		}
-		r.runPass(ctx, r.cfg.Spread, "scheduled")
+		r.runPass(ctx, r.cfg.Spread, "scheduled", false)
 	}
 }
 
-func (r *Reconciler) runPass(ctx context.Context, spread time.Duration, reason string) {
-	st, err := r.Pass(ctx, spread)
+func (r *Reconciler) runPass(ctx context.Context, spread time.Duration, reason string, full bool) {
+	st, err := r.pass(ctx, spread, full)
 	if err != nil && ctx.Err() == nil {
 		r.log.Error("open-interest hist pass failed", "reason", reason, "err", err)
 		return
@@ -212,17 +221,25 @@ type jobResult struct {
 
 // plan decides, per symbol, whether hist has to be called and how far back.
 //
+// Incremental (hourly) pass:
+//
 //	calibrated up to lh, target = newest bar expected published:
 //	  lh >= target        -> skip (nothing new to ask for)
 //	  otherwise           -> re-fetch from lh (one bar of overlap) to now
 //	no calibrated rows    -> fetch the cold-start window
-//	either way never earlier than now - MaxBackfill (older needs the archive).
-func (r *Reconciler) plan(now time.Time) (jobs []histJob, st PassStats) {
+//
+// Full (start-up) pass: nothing is skipped, and the window is the incremental one
+// widened to at least one whole page (MaxLimit-LimitMargin bars back from now), so one
+// request per symbol re-reads everything Binance has for the last ~41 hours.
+//
+// Either way never earlier than now - MaxBackfill (older needs the archive).
+func (r *Reconciler) plan(now time.Time, full bool) (jobs []histJob, st PassStats) {
 	syms := r.symbols()
 	st.Symbols = len(syms)
 	floorNow := floorBar(now)
 	target := newestPublishedStart(now, r.cfg.PublishLag)
 	capStart := floorBar(now.Add(-r.cfg.MaxBackfill))
+	pageStart := floorNow.Add(-time.Duration(maxInt(r.cfg.MaxLimit-r.cfg.LimitMargin, 1)) * BarInterval)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -234,16 +251,21 @@ func (r *Reconciler) plan(now time.Time) (jobs []histJob, st PassStats) {
 			since = floorNow.Add(-r.cfg.ColdStartWindow)
 			st.ColdStart++
 		} else {
-			if !lh.Before(target) {
+			if !full && !lh.Before(target) {
 				st.Skipped++
 				continue
 			}
 			since = lh
 		}
-		if since.Before(capStart) {
-			since = capStart
+		if since.Before(capStart) { // the gap itself reaches past the cap: the rest needs the archive
 			st.BeyondCap++
 			r.m.histBeyondCap.Inc()
+		}
+		if full && pageStart.Before(since) {
+			since = pageStart // widen to one whole page
+		}
+		if since.Before(capStart) {
+			since = capStart
 		}
 		needed := int(floorNow.Sub(since) / BarInterval)
 		if needed < 1 {
@@ -257,11 +279,20 @@ func (r *Reconciler) plan(now time.Time) (jobs []histJob, st PassStats) {
 	return jobs, st
 }
 
-// Pass runs one pass. spread > 0 spaces the symbols' first requests evenly over
-// that duration; 0 sends them as fast as the /futures/data pool allows.
+// Pass runs one incremental pass. spread > 0 spaces the symbols' first requests
+// evenly over that duration; 0 sends them as fast as the /futures/data pool allows.
 func (r *Reconciler) Pass(ctx context.Context, spread time.Duration) (PassStats, error) {
+	return r.pass(ctx, spread, false)
+}
+
+// PassFull runs a full pass (the start-up kind, see Reconciler).
+func (r *Reconciler) PassFull(ctx context.Context, spread time.Duration) (PassStats, error) {
+	return r.pass(ctx, spread, true)
+}
+
+func (r *Reconciler) pass(ctx context.Context, spread time.Duration, full bool) (PassStats, error) {
 	start := r.now()
-	jobs, st := r.plan(start)
+	jobs, st := r.plan(start, full)
 	r.m.histSymbols.WithLabelValues("skipped").Add(float64(st.Skipped))
 
 	results := map[string]jobResult{}

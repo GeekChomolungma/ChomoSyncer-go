@@ -744,7 +744,7 @@ curl -s localhost:9090/metrics | grep -E '^(oi_|weightgate_)'
 给策略提供一条与它已经在读的 K 线对齐的持仓量序列：**在 bar 收盘的那一刻就有**，之后又被校准成与币安自己的历史**完全一致**。
 
 - **两个来源，一行数据。** *Live*（`GET /fapi/v1/openInterest`，在每根 5 分钟 K 线收盘前打一次快照）保证及时；*hist*（`GET /futures/data/openInterestHist`）是币安权威的序列，所以事后会覆盖 live 行。hist 的标签 `T` 是 `T` **时刻**的快照，属于在 `T` 收盘的那根 K 线，即存到 `start_time = T − 5m`；live 快照按响应里自己的 `time` 归属到同一根，而不是按发请求的时刻。
-- **启动时按数据库里的现状决策。** 每次启动，模块都会逐个标的读出“表已经校准到哪根”，只取缺的那一段（已是最新的标的一个请求都不发）——见 10.3。
+- **启动那一轮是全量的。** 每次启动，每个标的都请求一整页（约 41 小时）最新标签并写入所有返回内容；缺口更长就往回翻页到最新已校准的那根。只有每小时的校准才会跳过已是最新的标的——见 10.3。
 - **两个互相独立的限流池。** live 通过共享的 `internal/weightgate` 使用 `/fapi` 权重预算；hist 用自己的计数器使用 `/futures/data` 池（每 IP 每 5 分钟 1000 次）。二者互不竞争，所以再长的补缺也不会拖慢 live 快照。
 
 ### 10.3 核心调用者、并发模型与代码入口
@@ -771,7 +771,7 @@ curl -s localhost:9090/metrics | grep -E '^(oi_|weightgate_)'
 
 - **并发与 Goroutine 模型**：
   - **Live 循环**（[`Live.Run`](../internal/openinterest/live.go#L111)）：一个调度 goroutine。每个边界 `B`，等到 `B − live_lead`（30 秒）后执行 [`Cycle`](../internal/openinterest/live.go#L132)：8 个 worker 从 channel 里取标的，按 `fapi_rps`（25 次/秒）节奏、经权重闸门放行。这一轮在 `B + live_accept_window`（60 秒）时放弃未完成的请求。本轮所有行都属于在 `B` 收盘的那根 K 线，币安返回什么就原样记下：响应的 `time` 既不用来选 bar，也不用来过滤，只保存在 `snap_time` 里（流动性差的标的，它可能比请求时刻早得多）。
-  - **Hist 校准器**（[`Reconciler.Run`](../internal/openinterest/hist.go#L164)）：一个调度 goroutine + 4 个 worker。[`LoadState`](../internal/openinterest/hist.go#L128) 从 ClickHouse 按标的读出 `src_rank >= 2` 的最新一行（数据库不可用时一直重试）。然后 [`plan`](../internal/openinterest/hist.go#L220) 逐个标的决策：已是最新 → **跳过，不发请求**；落后 → 从那一根起重取（多取一根做重叠）；没有任何已校准行 → 冷启动窗口（48 小时）；最远不超过 `hist_max_backfill`（7 天）。请求的 `limit` 按缺口取值（缺口 + 余量），并且因为只传 `startTime` 无法向前翻页，长缺口通过移动 `endTime` **从新往旧**翻页（[`fetchSymbol`](../internal/openinterest/hist.go#L375)）。启动那一轮不铺开；每小时的一轮从 `hh:05` 开始，把请求在 20 分钟内铺开，缺口大的先取，失败的标的轮末重试一次。内存里“校准到哪根”的状态只在行**落盘之后**才前进（[`Pass`](../internal/openinterest/hist.go#L262)）。
+  - **Hist 校准器**（[`Reconciler.Run`](../internal/openinterest/hist.go#L164)）：一个调度 goroutine + 4 个 worker。[`LoadState`](../internal/openinterest/hist.go#L128) 从 ClickHouse 按标的读出 `src_rank >= 2` 的最新一行（数据库不可用时一直重试）。然后 `plan` 逐个标的决策。**启动（全量）那一轮**：不跳过任何标的，窗口至少放宽到一整页（从现在往回 `hist_max_limit − hist_limit_margin` 根）；缺口更长就从最新已校准的那根起重取（多取一根做重叠）；没有任何已校准行 → 冷启动窗口（48 小时）。**每小时（增量）的一轮**：已是最新 → **跳过，不发请求**；落后 → 从那一根起重取。最远都不超过 `hist_max_backfill`（7 天）。请求的 `limit` 按缺口取值（缺口 + 余量），并且因为只传 `startTime` 无法向前翻页，长缺口通过移动 `endTime` **从新往旧**翻页（[`fetchSymbol`](../internal/openinterest/hist.go#L375)）。启动那一轮不铺开；每小时的一轮从 `hh:05` 开始，把请求在 20 分钟内铺开，缺口大的先取，失败的标的轮末重试一次。内存里“校准到哪根”的状态只在行**落盘之后**才前进（[`Pass`](../internal/openinterest/hist.go#L262)）。
   - **写入器**（[`Writer.loop`](../internal/openinterest/writer.go#L160)）：一个 goroutine，按数量或时间攒批并重试；是 `chwriter.BatchWriter` 的一个小型独立对应物（K 线写入器没有被改动）。
   - **live 与 hist 的对比诊断几乎免费：** 每个标的最近约 24 根的 live 值保存在内存里，校准时直接和 hist 对比，不用查 ClickHouse（`oi_live_vs_hist_rel_diff`、`oi_live_gap_bars_total`）。
 - **限流控制**：live → [`weightgate.Gate.Wait`](../internal/weightgate/gate.go#L239)（`ClassLive`）；hist → [`DataPool.Wait`](../internal/openinterest/limiter.go#L87)（5 分钟滑动窗口上限 900、令牌桶 2 次/秒、收到 429/418 全局暂停）。

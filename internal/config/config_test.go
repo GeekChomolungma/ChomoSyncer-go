@@ -244,6 +244,7 @@ func TestValidateRejectsBadOpenInterest(t *testing.T) {
 	for name, mutate := range map[string]func(*Config){
 		"lead as long as the bar":    func(c *Config) { c.OpenInterest.LiveLead = 5 * time.Minute },
 		"accept window too wide":     func(c *Config) { c.OpenInterest.LiveAcceptWindow = 5 * time.Minute },
+		"catch-up as long as a bar":  func(c *Config) { c.OpenInterest.LiveCatchUp = 5 * time.Minute },
 		"offset beyond the interval": func(c *Config) { c.OpenInterest.HistReconcileOffset = 2 * time.Hour },
 		"limit above Binance's max":  func(c *Config) { c.OpenInterest.HistMaxLimit = 1000 },
 		"backfill beyond retention":  func(c *Config) { c.OpenInterest.HistMaxBackfill = 60 * 24 * time.Hour },

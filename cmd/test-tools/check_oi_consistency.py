@@ -14,10 +14,13 @@ What it verifies, over the last --hours of bars that should already exist:
        * every start_time is on the 5-minute grid (catches a timezone / unit shift)
        * values are finite and non-negative (0 is only a WARN)
        * snap_time is consistent with start_time:
-           hist/archive rows: snap_time == start_time + 5m exactly
-           live rows:         snap_time within --live-accept of start_time + 5m
-         (this is what proves live snapshots are attributed to the closing bar and
-          hist labels are stored at T-5m)
+           hist/archive rows: snap_time == start_time + 5m exactly (FAIL otherwise)
+           live rows:         any snap_time is stored as Binance returned it: an illiquid
+                              symbol's older snapshot is that bar's value, and a start-up
+                              catch-up round is taken after the close. Rows further than
+                              --live-accept from start_time + 5m are only counted (WARN).
+         (this proves hist labels are stored at T-5m; live rows are attributed by the
+          round's boundary, not by snap_time)
        * the series is fresh: its newest bar is no more than --max-lag-bars behind
   B. Source health
        * live rows older than --max-uncalibrated-hours that hist never replaced
@@ -151,8 +154,8 @@ def evaluate_symbol(row: Dict[str, Any], lo_ms: int, hi_ms: int,
         fails.append(f"{row['bad_value']} non-finite or negative value(s)")
     if int(row.get("bad_snap_cal", 0)) > 0:
         fails.append(f"{row['bad_snap_cal']} hist/archive row(s) with snap_time != start_time+5m")
-    if int(row.get("bad_snap_live", 0)) > 0:
-        fails.append(f"{row['bad_snap_live']} live row(s) with snap_time far from the bar's close")
+    if int(row.get("bad_snap_live", 0)) > 0:  # by design: live stores what Binance answers, a stale value is a sign of an illiquid symbol
+        warns.append(f"{row['bad_snap_live']} live row(s) with snap_time far from the bar's close (stored as returned)")
     if int(row.get("bad_rank", 0)) > 0:
         fails.append(f"{row['bad_rank']} row(s) with an invalid src_rank")
     if lag_bars > max_lag_bars:
@@ -367,7 +370,7 @@ def main():
     p.add_argument("--symbol", help="Comma-separated symbols to check; whole market if omitted")
     p.add_argument("--limit-symbols", type=int, default=None, help="Check only the first N symbols (alphabetical)")
     p.add_argument("--max-lag-bars", type=int, default=2, help="Newest bar may be at most this many bars behind (default 2)")
-    p.add_argument("--live-accept", type=float, default=60.0, help="Live rows: snap_time must be within this many seconds of the bar's close (default 60)")
+    p.add_argument("--live-accept", type=float, default=60.0, help="Live rows whose snap_time is further than this many seconds from the bar's close are counted as WARN, not rejected (default 60)")
     p.add_argument("--max-uncalibrated-hours", type=float, default=2.0, help="Live rows older than this should have been replaced by hist (default 2)")
     p.add_argument("--require-calibration", action="store_true", help="Make uncalibrated live rows a FAIL instead of a WARN")
     p.add_argument("--min-coverage", type=float, default=0.995, help="Per-symbol share of kline bars that have an OI row (default 0.995)")

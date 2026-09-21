@@ -229,8 +229,8 @@ The open-interest (OI) module is **off by default** and independent of the kline
 
 | Switch | What it does | Pool it spends |
 | :--- | :--- | :--- |
-| `open_interest.hist_enabled` | At start-up reads, per symbol, how far the table is already calibrated and backfills only the gap from `openInterestHist`; then calibrates every hour at `hh:05` | `/futures/data` (1000 requests / 5 min / IP), its own counter |
-| `open_interest.live_enabled` | Every 5-minute boundary, from 30 s before the kline closes, snapshots each symbol with `/fapi/v1/openInterest` | `/fapi` weight budget (2400/min/IP) through the shared `weight_gate` |
+| `open_interest.hist_enabled` | At start-up asks `openInterestHist` for a whole page (~41 h) of every symbol and writes whatever it returns (paging further back to the last calibrated bar if the gap is longer); then calibrates incrementally every hour at `hh:05` | `/futures/data` (1000 requests / 5 min / IP), its own counter |
+| `open_interest.live_enabled` | Every 5-minute boundary, from 30 s before the kline closes, snapshots each symbol with `/fapi/v1/openInterest`; if the service starts less than `live_catchup_window` (4 m) after a boundary it first snapshots the bar that boundary closed | `/fapi` weight budget (2400/min/IP) through the shared `weight_gate` |
 
 #### Step by step
 
@@ -308,7 +308,8 @@ How to read the results:
 #### What the first start does (and what a restart does)
 
 - **Empty table**: every symbol is backfilled 48 hours (`hist_cold_start_window`), 2 requests per symbol. For ~528 symbols that is ~1050 requests at `data_rps: 2`, roughly **9 minutes** (an estimate; the end-to-end test measured 2 s for 3 symbols). During that time this IP spends about 60% of its `/futures/data` budget: do not run other `/futures/data` heavy tools meanwhile.
-- **Every later start**: the module re-reads the newest calibrated row per symbol from ClickHouse and decides per symbol — already current → **no request at all**; behind → only the gap (`limit` sized to it; verified: a 3-hour outage costs one request per symbol). If ClickHouse is down at start it retries every 5–60 s and logs `could not read open-interest state; will retry`.
+- **Every later start**: the start-up pass is *full*: **every symbol gets one request for the newest whole page** (500 bars, about 41 hours; ~528 requests, roughly 4½ minutes at `data_rps: 2`) whatever the database holds, and everything Binance returns is written (`src_rank = 2` replaces live rows; archive rows keep winning), so it also recalibrates the last ~41 hours. Nothing is skipped: a restart leaves a hole in every symbol and the live rows since the last hourly pass are waiting for calibration anyway. A gap longer than one page is paged back to the last calibrated bar (read from ClickHouse), never beyond `hist_max_backfill`. If ClickHouse is down at start it retries every 5–60 s and logs `could not read open-interest state; will retry`. Only the hourly passes skip symbols that are already current.
+- **Restart right after a boundary**: Binance publishes a label 1–3 minutes after its 5-minute mark, so hist cannot have the bar that just closed yet. If the service starts less than `live_catchup_window` (4 m) after a boundary, live immediately snapshots that bar (`catch_up=true` in the `open-interest live round` log line, `src_rank = 1`); the next hist pass replaces it with Binance's own value.
 - **Long downtime**: gaps are backfilled up to `hist_max_backfill` (7 days). Older parts are counted in `oi_hist_gap_beyond_cap_total` and need the archive import, which is not part of the module yet. Live snapshots of the downtime are gone for good (the live endpoint has no history) — hist fills those bars instead, with Binance's own values.
 - The service does **not** need to be stopped to change the switches, but a restart is required for them to take effect.
 
@@ -497,8 +498,8 @@ The Binance connector re-creates each WebSocket connection every 23 hours withou
 ### Drill 3: Open-Interest Module Down for a Few Hours (only when §3.4 is enabled)
 1. Set both `open_interest` switches to `false` (or stop the service) for ~3 hours, then enable them again and restart;
 2. **Expected behavior**:
-   - The log shows `loaded open-interest state from ClickHouse` and a `reason=startup` hist pass with `cold_start=0` and about one request per symbol (a 3-hour gap is a single small page each; the pass is not spread out);
-   - The bars of the outage are filled with Binance's own values (`src_rank = 2`); symbols that were already current make **no** request;
+   - The log shows `loaded open-interest state from ClickHouse` and a `reason=startup` hist pass with `skipped=0 cold_start=0` and exactly one request per symbol (the whole newest page; the pass is not spread out); if the restart was within 4 minutes of a boundary there is also an `open-interest live round ... catch_up=true` line;
+   - The bars of the outage are filled with Binance's own values (`src_rank = 2`); the newest just-closed bar that Binance had not published yet holds a live value until the next hist pass;
    - `oi_cross_section_complete_ratio` returns to ≈ 1;
    - `python cmd/test-tools/check_oi_consistency.py --vs-binance` shows zero missing bars.
 

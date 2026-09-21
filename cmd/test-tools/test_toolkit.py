@@ -241,9 +241,12 @@ class TestOIEvaluateSymbol(unittest.TestCase):
         self.assertEqual(r["status"], "FAIL")
         self.assertEqual(r["missing"], 0)
 
-    def test_snap_time_violations_fail(self):
+    def test_snap_time_violations(self):
+        # hist/archive rows must have snap_time == start_time + 5m
         self.assertEqual(evaluate_symbol(_oi_row(bad_snap_cal=2), self.LO, self.HI)["status"], "FAIL")
-        self.assertEqual(evaluate_symbol(_oi_row(bad_snap_live=1), self.LO, self.HI)["status"], "FAIL")
+        # live rows are stored as Binance returned them (a stale snapshot of an illiquid symbol, or a
+        # start-up catch-up taken after the close): only a warning
+        self.assertEqual(evaluate_symbol(_oi_row(bad_snap_live=1), self.LO, self.HI)["status"], "WARN")
 
     def test_stale_series_fails(self):
         r = evaluate_symbol(_oi_row(max_ms=287 * BAR_MS - 10 * BAR_MS), self.LO, self.HI, max_lag_bars=2)
