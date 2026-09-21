@@ -38,18 +38,24 @@ What it verifies, over the last --hours of bars that should already exist:
 Only bars whose close is at least --settle-minutes old are examined, so a bar that
 hist has not published yet is not reported as missing.
 
+  F. (--gaps-csv PATH) writes every missing-bar range of section A to a CSV that
+       backfill_missing_oi.py repairs from Binance's openInterestHist. Add --gaps-tail to
+       also list the bars between a symbol's newest row and the end of the window.
+
 Exit code 0 = no FAIL (WARNs allowed).  1 = at least one FAIL or a connection error.
 
 Examples
   python check_oi_consistency.py                          # whole market, last 24h
   python check_oi_consistency.py --symbol BTCUSDT,ETHUSDT --hours 6
   python check_oi_consistency.py --vs-binance --limit-symbols 5
+  python check_oi_consistency.py --start-date 2020-09-01 --skip-coverage --gaps-csv oi_gaps.csv   # whole history
   python check_oi_consistency.py --table oi_scratch.fapi_oi_5m --kline-table market.fapi_kline_5m
 """
 import os
 import sys
 import time
 import argparse
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -61,6 +67,7 @@ from common import (
     print_table,
 )
 from check_vs_binance import rel_close
+from check_clickhouse_integrity import write_gaps_csv
 
 try:
     import requests
@@ -86,6 +93,35 @@ def bar_window(now_ms: int, hours: float, settle_minutes: float) -> Tuple[int, i
     hi = (settled // BAR_MS) * BAR_MS - BAR_MS
     lo = hi - int(hours * 3_600_000) + BAR_MS
     return lo, hi
+
+
+def parse_start_date(text: str) -> int:
+    """'2024-01-01' or '2024-01-01 06:30[:00]' (UTC) -> epoch ms, rounded UP to the next 5-minute bar."""
+    text = text.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+            break
+        except ValueError:
+            continue
+    else:
+        raise ValueError(f"cannot parse {text!r}; use 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM[:SS]' (UTC)")
+    ms = int(dt.timestamp() * 1000)
+    return -(-ms // BAR_MS) * BAR_MS
+
+
+def tail_gaps(stats: Dict[str, Dict[str, Any]], hi_ms: int) -> List[Tuple[str, str, Dict[str, Any]]]:
+    """
+    One gap per symbol whose newest row is before `hi_ms`: the missing bar-open times are
+    [newest + 5m, hi_ms + 5m).  Rows are (symbol, "5m", {from_ms, to_ms, missing_count}).
+    """
+    out = []
+    for sym in sorted(stats):
+        newest = int(stats[sym]["max_ms"])
+        if newest < hi_ms:
+            out.append((sym, "5m", {"from_ms": newest + BAR_MS, "to_ms": hi_ms + BAR_MS,
+                                    "missing_count": (hi_ms - newest) // BAR_MS}))
+    return out
 
 
 def evaluate_symbol(row: Dict[str, Any], lo_ms: int, hi_ms: int,
@@ -212,6 +248,41 @@ def fetch_symbol_stats(ch, table: str, lo_ms: int, hi_ms: int, live_accept_ms: i
     return out
 
 
+def fetch_gaps(ch, table: str, lo_ms: int, hi_ms: int,
+               symbols: Optional[List[str]]) -> List[Tuple[str, str, Dict[str, Any]]]:
+    """
+    Missing bars strictly between two rows of the same symbol.  A symbol's first row is
+    not compared with anything (its listing date is unknown), so leading gaps are not
+    reported.  Only rows ON the 5-minute grid count: an off-grid row (reported by section A)
+    is not a bar, so the bar it stands in for is listed as missing.  The missing bar-open
+    times of a gap are [from_ms, to_ms).
+    """
+    sym_filter = ""
+    if symbols:
+        quoted = ", ".join("'" + s.replace("'", "") + "'" for s in symbols)
+        sym_filter = f" AND symbol IN ({quoted})"
+    rows = ch.query(f"""
+    SELECT symbol,
+           toUnixTimestamp64Milli(prev) + {BAR_MS} AS from_ms,
+           toUnixTimestamp64Milli(start_time)      AS to_ms
+    FROM (
+        SELECT symbol, start_time,
+               lagInFrame(start_time, 1) OVER (PARTITION BY symbol ORDER BY start_time
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS prev
+        FROM {table} FINAL
+        WHERE start_time >= {ts_expr(lo_ms)} AND start_time <= {ts_expr(hi_ms)} {sym_filter}
+          AND toUnixTimestamp64Milli(start_time) % {BAR_MS} = 0
+    )
+    WHERE toUnixTimestamp64Milli(prev) > 0
+      AND toUnixTimestamp64Milli(start_time) - toUnixTimestamp64Milli(prev) > {BAR_MS}
+    ORDER BY symbol, from_ms""")
+    out = []
+    for r in rows:
+        a, b = int(r["from_ms"]), int(r["to_ms"])
+        out.append((r["symbol"], "5m", {"from_ms": a, "to_ms": b, "missing_count": (b - a) // BAR_MS}))
+    return out
+
+
 def fetch_freshness(ch, table: str) -> Dict[str, int]:
     rows = ch.query(f"""
         SELECT toUnixTimestamp64Milli(max(start_time)) AS newest,
@@ -289,6 +360,9 @@ def main():
     p.add_argument("--table", default=None, help="OI table (default: open_interest.table from config, else market.fapi_oi_5m)")
     p.add_argument("--kline-table", default="market.fapi_kline_5m", help="5m kline table used for the coverage check")
     p.add_argument("--hours", type=float, default=24.0, help="Window length in hours (default 24)")
+    p.add_argument("--start-date", help="Window start (UTC), e.g. '2020-09-01' or '2024-01-01 06:30'; overrides --hours. Use with --skip-coverage to scan the whole history")
+    p.add_argument("--gaps-csv", metavar="PATH", help="Write every missing-bar range to this CSV (input of backfill_missing_oi.py)")
+    p.add_argument("--gaps-tail", action="store_true", help="With --gaps-csv: also list bars between a symbol's newest row and the window end (delisted symbols show up here and can never be filled)")
     p.add_argument("--settle-minutes", type=float, default=10.0, help="Only examine bars whose close is at least this old (default 10)")
     p.add_argument("--symbol", help="Comma-separated symbols to check; whole market if omitted")
     p.add_argument("--limit-symbols", type=int, default=None, help="Check only the first N symbols (alphabetical)")
@@ -333,6 +407,15 @@ def main():
 
     now_ms = int(ch.query("SELECT toUnixTimestamp(now()) AS ts")[0]["ts"]) * 1000
     lo_ms, hi_ms = bar_window(now_ms, args.hours, args.settle_minutes)
+    if args.start_date:
+        try:
+            lo_ms = parse_start_date(args.start_date)
+        except ValueError as e:
+            print(f"{Colors.RED}[ERROR] --start-date: {e}{Colors.RESET}")
+            sys.exit(1)
+        if lo_ms > hi_ms:
+            print(f"{Colors.RED}[ERROR] --start-date is after the newest settled bar ({format_ms_to_utc(hi_ms)}).{Colors.RESET}")
+            sys.exit(1)
     print(f"Window: bars {format_ms_to_utc(lo_ms)} .. {format_ms_to_utc(hi_ms)} UTC "
           f"({int((hi_ms - lo_ms) / BAR_MS) + 1} bars; close >= {args.settle_minutes:g} min old)\n")
 
@@ -399,6 +482,18 @@ def main():
         for w in r["warns"]:
             warns.append(f"{s}: {w}")
     fails = fails[:200]
+
+    # ---- F. gaps CSV ---------------------------------------------------------
+    if args.gaps_csv:
+        gap_rows = fetch_gaps(ch, table, lo_ms, hi_ms, symbols)
+        if args.gaps_tail:
+            gap_rows += tail_gaps(stats, hi_ms)
+        gap_rows.sort(key=lambda g: (g[0], g[2]["from_ms"]))
+        n = write_gaps_csv(args.gaps_csv, gap_rows)
+        bars = sum(g[2]["missing_count"] for g in gap_rows)
+        print(f"\nWrote {n} gap line(s) ({bars:,} missing bar(s), {len({g[0] for g in gap_rows})} symbol(s)) to {args.gaps_csv}")
+        if n:
+            print(f"Repair: python cmd/test-tools/backfill_missing_oi.py {args.gaps_csv}   (dry run; add --apply to write)")
 
     # ---- C/D. consumer view ---------------------------------------------------
     if not args.skip_coverage:

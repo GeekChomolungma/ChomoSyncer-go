@@ -710,7 +710,7 @@ While the Gapfill backfill pipeline is re-materializing 200 bars from ClickHouse
 
 #### 1. Tables
 - **Raw table**: `market.fapi_oi_5m` (`deploy/clickhouse/004_fapi_oi.sql`) — written by `internal/openinterest`, **not** by `chwriter`. Engine `ReplacingMergeTree(src_rank)`, key `(symbol, start_time)`, monthly partitions. It holds live snapshots that cannot be replayed, so it is never dropped.
-- **Rollups**: `market.fapi_oi_{15m,1h,4h,1d,1mo}` + refreshable MVs `*_rmv` (`005`), history fold `006`. Same recompute-from-`FINAL`, bucket-aligned, UTC-anchored design as the kline rollups (§8.6 of `ARCHITECTURE_MODULES.md`).
+- **Rollups**: `market.fapi_oi_{15m,1h,4h,1d}` + refreshable MVs `*_rmv` (`005`), history fold `006`. Same recompute-from-`FINAL`, bucket-aligned, UTC-anchored design as the kline rollups (§8.6 of `ARCHITECTURE_MODULES.md`).
 - **Query convention**: `... FROM market.fapi_oi_5m FINAL ...`, joined to `fapi_kline_5m` on `(symbol, start_time)`; use `SETTINGS join_use_nulls = 1` on a LEFT JOIN, otherwise a missing OI row reads as `0`.
 
 #### 2. External Query Commands & Code Examples
@@ -770,7 +770,7 @@ Give strategies an open-interest series that aligns with the kline they already 
                                 ▼
                      market.fapi_oi_5m  (ReplacingMergeTree(src_rank))
                                 ▼
-                  refreshable MVs -> fapi_oi_{15m,1h,4h,1d,1mo}
+                  refreshable MVs -> fapi_oi_{15m,1h,4h,1d}
 ```
 
 - **Concurrency & Goroutine Model**:

@@ -131,7 +131,7 @@ open_interest:                   # 5 分钟持仓量（OI）同步，写入 mark
   hist_publish_lag: 4m           # 标签 T 预计在 T 之后多久可读，用来判断“已是最新则跳过”
   hist_limit_margin: 3           # 每次请求比缺口多要几根，容忍个别失败
   hist_max_limit: 500            # 单次请求 limit 上限（币安文档上限 500）；更长的缺口从新往旧分页
-  hist_cold_start_window: 48h    # 库里没有任何已校准行的标的，补回多远
+  hist_cold_start_window: 48h    # 库里没有任何已校准行的标的，补回多远，已经有数据的标的不用这个参数，它们从自己上次校准到的位置接着补。
   hist_max_backfill: 168h        # 补缺最远回溯多久（币安只保留约 30 天）；更早的缺口需要用归档导入
   hist_workers: 4                # hist 并发拉取的标的数
   data_rps: 2                    # /futures/data 池的请求速率（该池每 IP 每 5 分钟 1000 次）

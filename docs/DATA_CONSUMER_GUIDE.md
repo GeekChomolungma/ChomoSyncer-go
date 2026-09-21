@@ -131,7 +131,7 @@ Design and measurements behind it: [`../new_requirements/oi.md`](../new_requirem
 | Table | Bucket |
 | :--- | :--- |
 | `market.fapi_oi_5m` | 5 minutes — the raw table the producer writes |
-| `market.fapi_oi_15m`, `_1h`, `_4h`, `_1d`, `_1mo` | rollups, recomputed from the 5m table; never touched by hand |
+| `market.fapi_oi_15m`, `_1h`, `_4h`, `_1d` | rollups, recomputed from the 5m table; never touched by hand |
 
 `market.fapi_oi_5m` columns:
 
@@ -191,12 +191,12 @@ WHERE start_time = '2026-09-21 12:00:00' ORDER BY symbol
 
 ### The rollups
 
-`fapi_oi_{15m,1h,4h,1d,1mo}` hold, per bucket, the OI **at the bucket's close** and its range:
+`fapi_oi_{15m,1h,4h,1d}` hold, per bucket, the OI **at the bucket's close** and its range:
 
 | Column | Meaning |
 | :--- | :--- |
-| `symbol`, `start_time` | Bucket start (UTC; `1mo` uses calendar months). |
-| `samples` | Number of 5m rows in the bucket. A complete bucket has 3 / 12 / 48 / 288 (15m / 1h / 4h / 1d) or `days_in_month × 288` (1mo). **Filter on it** — the newest bucket is normally incomplete. |
+| `symbol`, `start_time` | Bucket start (UTC). |
+| `samples` | Number of 5m rows in the bucket. A complete bucket has 3 / 12 / 48 / 288 (15m / 1h / 4h / 1d). **Filter on it** — the newest bucket is normally incomplete. |
 | `sum_open_interest_close` | OI at the bucket's close (the last 5m row in it). |
 | `sum_open_interest_high` / `_low` | Highest / lowest of the closing snapshots inside the bucket. |
 | `rollup_version` | Internal. |

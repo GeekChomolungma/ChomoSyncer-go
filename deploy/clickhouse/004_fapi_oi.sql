@@ -20,7 +20,7 @@
 -- NEVER DROP THIS TABLE. Live snapshots cannot be replayed (the live endpoint has
 -- no history), unlike the rollup tables in 005 which are fully derived from this one.
 --
--- Rollups: 005_oi_rollups.sql (15m / 1h / 4h / 1d / 1mo).
+-- Rollups: 005_oi_rollups.sql (15m / 1h / 4h / 1d).
 -- sum_open_interest_value is intentionally not stored: it equals
 -- sum_open_interest * markPrice, and sum_open_interest * fapi_kline_5m.close is a
 -- ~1 bp approximation of it (see the design doc).

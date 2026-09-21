@@ -706,7 +706,7 @@ curl -s localhost:9090/metrics | grep dispatcher_kline_ready_suppressed_total
 
 #### 1. 表
 - **原始表**：`market.fapi_oi_5m`（`deploy/clickhouse/004_fapi_oi.sql`）——由 `internal/openinterest` 写入，**不经过** `chwriter`。引擎 `ReplacingMergeTree(src_rank)`，键 `(symbol, start_time)`，按月分区。它存着无法重放的 live 快照，所以**永远不要删**。
-- **汇总表**：`market.fapi_oi_{15m,1h,4h,1d,1mo}` + 刷新式物化视图 `*_rmv`（`005`），历史折叠 `006`。与 K 线汇总同一套设计：从 `FINAL` 全量重算、按桶对齐、UTC 锚定（见 `ARCHITECTURE_MODULES.zh-CN.md` §8.6）。
+- **汇总表**：`market.fapi_oi_{15m,1h,4h,1d}` + 刷新式物化视图 `*_rmv`（`005`），历史折叠 `006`。与 K 线汇总同一套设计：从 `FINAL` 全量重算、按桶对齐、UTC 锚定（见 `ARCHITECTURE_MODULES.zh-CN.md` §8.6）。
 - **查询约定**：`... FROM market.fapi_oi_5m FINAL ...`，按 `(symbol, start_time)` 与 `fapi_kline_5m` 拼接；LEFT JOIN 要加 `SETTINGS join_use_nulls = 1`，否则缺失的 OI 行会被读成 `0`。
 
 #### 2. 外部查询命令与代码示例
@@ -766,7 +766,7 @@ curl -s localhost:9090/metrics | grep -E '^(oi_|weightgate_)'
                                 ▼
                      market.fapi_oi_5m  (ReplacingMergeTree(src_rank))
                                 ▼
-                  刷新式 MV -> fapi_oi_{15m,1h,4h,1d,1mo}
+                  刷新式 MV -> fapi_oi_{15m,1h,4h,1d}
 ```
 
 - **并发与 Goroutine 模型**：

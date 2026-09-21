@@ -36,6 +36,7 @@ This mirrors `docs/OPERATIONS.md` §3 (B.1/B.2): you validate ClickHouse's own h
 | `e2e_reconciliation.py` | **[Phase B·4] Cache-vs-storage reconciliation tool**: compares the Redis `kline:{SYM}:1m` window against ClickHouse `fapi_kline_1m`, bar-by-bar, for timestamp and OHLCV consistency |
 | `run_all_checks.py` | **[Phase C] One-shot pre-flight orchestrator**: runs every check with a single command and outputs a visual red/green health scorecard |
 | `check_oi_consistency.py` | **[Phase D] Open-interest consistency checker**: read-only checks of `market.fapi_oi_5m` — gaps, 5-minute grid, `snap_time` semantics, freshness, calibration by hist, coverage against the kline table, per-bar cross-section, and (optionally) value-for-value against Binance |
+| `backfill_missing_oi.py` | **[Repair] Backfill missing 5m open-interest bars**: reads the CSV from `check_oi_consistency.py --gaps-csv`, fetches those bars from Binance `openInterestHist` (only the latest ~30 days exist) and inserts them into `market.fapi_oi_5m` as `src_rank = 2`. Dry run unless `--apply` |
 | `common.py` | Shared utility library: config loading, ClickHouse/Redis clients, symbol discovery, time utilities, table formatting, etc. Not a check by itself. |
 | `test_toolkit.py` | The toolkit's built-in unit tests and mock validation suite (`python -m pytest cmd/test-tools/test_toolkit.py`, or run directly) |
 | `requirements.txt` | Python dependency manifest |
@@ -403,6 +404,9 @@ What the checks mean for the data (why they exist):
 | `--require-calibration` | off | Make uncalibrated live rows a FAIL instead of a WARN |
 | `--min-coverage` / `--min-cross-section` | `0.995` / `0.99` | Thresholds for checks C / D |
 | `--skip-coverage` | off | Skip the join against the kline table (C and D) |
+| `--start-date` | off | Window start (UTC), e.g. `2020-09-01` or `2024-01-01 06:30`; overrides `--hours`. Combine with `--skip-coverage` for a whole-history scan |
+| `--gaps-csv PATH` | off | Write every missing-bar range (between two rows of the same symbol, on-grid rows only) to a CSV for `backfill_missing_oi.py`; same columns as the kline gaps CSV, interval `5m` |
+| `--gaps-tail` | off | With `--gaps-csv`: also list the bars between a symbol's newest row and the window end. Delisted symbols show up here and can never be filled |
 | `--vs-binance` | off | Also run check E (hits the exchange) |
 | `--binance-symbols` / `--binance-bars` | `5` / `48` | Symbols sampled / newest hist points fetched per symbol |
 | `--live-tol` | `0.005` | Relative tolerance for live rows vs Binance |
@@ -425,9 +429,44 @@ python cmd/test-tools/check_oi_consistency.py --require-calibration --max-uncali
 
 # Against a rehearsal database
 python cmd/test-tools/check_oi_consistency.py --table oi_rehearsal.fapi_oi_5m --kline-table market.fapi_kline_5m
+
+# Whole history (e.g. after an archive import): list every missing bar, ClickHouse only
+python cmd/test-tools/check_oi_consistency.py --start-date 2020-09-01 --skip-coverage --ch-password "<pw>" --gaps-csv oi_gaps.csv
 ```
 
 Exit code `0` = no FAIL (WARNs allowed); `1` = at least one FAIL, an empty/missing table (the message says to apply `deploy/clickhouse/004_fapi_oi.sql`), or a connection error.
+
+---
+
+### 8b. Backfill Missing 5m Open-Interest Bars (`backfill_missing_oi.py`)
+
+**Repair tool — the follow-up to check #8.** The checker names the missing bars; this script fills what Binance can still serve.
+
+```bash
+python cmd/test-tools/check_oi_consistency.py --start-date 2020-09-01 --skip-coverage --ch-password "<pw>" --gaps-csv oi_gaps.csv   # 1. list every gap
+python cmd/test-tools/backfill_missing_oi.py oi_gaps.csv --ch-password "<pw>"           # 2. dry run: fetch + report, writes nothing
+python cmd/test-tools/backfill_missing_oi.py oi_gaps.csv --ch-password "<pw>" --apply   # 3. insert what was found
+python cmd/test-tools/check_oi_consistency.py --start-date 2020-09-01 --skip-coverage --ch-password "<pw>"   # 4. verify
+```
+
+What it does per symbol: drops the part of each gap older than Binance's retention (~30 days, reported as *beyond retention*), drops the bars ClickHouse already has (so re-running is safe and nothing is overwritten), groups the rest into as few `openInterestHist` requests as fit one page (500 bars), fetches them paced against the `/futures/data` pool, and inserts only the bars that were asked for. Rows use the same mapping as the Go module: a label `T` is stored at `start_time = T-5m`, `snap_time = T`, `src_rank = 2`.
+
+**Some gaps cannot be filled here.** Bars older than the retention need the archive; bars Binance returns nothing for are *empty at exchange*; a symbol Binance rejects (delisted) is reported and skipped. The checker keeps listing all of them.
+
+| Flag | Default | Meaning |
+| :--- | :--- | :--- |
+| `csv` (positional) | required | The gaps CSV. Only `5m` lines are used |
+| `--apply` | off | Actually `INSERT`. Without it nothing is written |
+| `--symbol` | *(all in file)* | Only this symbol |
+| `--table` | `market.fapi_oi_5m` | OI table (`open_interest.table` from config if set) |
+| `--rps` | `2` | Requests per second (same as `open_interest.data_rps`) |
+| `--window-cap` | `900` | Max requests in any 5 minutes (the IP limit is 1000, shared with the service's hist pass) |
+| `--retention-days` | `30` | Older bars are reported, not requested |
+| `--rest-url` | from config | Binance REST base URL |
+| `--batch-rows` | `2000` | Rows per `INSERT` |
+| `--ch-host/-port/-db/-user/-password` | from config | ClickHouse connection overrides |
+
+If the repair reaches back beyond the rollups' refresh lookback, the tool prints the exact `./rollup_oi_per_month.sh` command to refold those months. Exit code `1` if any symbol failed. Full runbook: `docs/OPERATIONS.md` §3.4, "After importing the archive".
 
 ---
 

@@ -109,6 +109,8 @@ docker compose -f deploy/docker-compose.yml exec clickhouse \
 docker compose -f deploy/docker-compose.yml exec clickhouse clickhouse-client \
   --param_m_start='2000-01-01 00:00:00' --param_m_end='2099-01-01 00:00:00' \
   --queries-file /clickhouse/003_rollup_backfill.sql
+#    (For a large table, fold month by month instead: ./rollup_kline_per_month.sh --password "<pw>" ; it runs
+#     003 once per calendar month and takes --host/--port/--user/--from/--to/--dry-run too. Formerly rollup_per_month.sh.)
 
 # 4. Validate (must be all-green before moving to the next step).
 python cmd/test-tools/check_clickhouse_integrity.py --intervals 1m,5m,15m,1h,4h,1d
@@ -178,6 +180,8 @@ clickhouse-client --host 127.0.0.1 --port 9000 --multiquery < deploy/clickhouse/
 clickhouse-client --host 127.0.0.1 --port 9000 \
   --param_m_start='2000-01-01 00:00:00' --param_m_end='2099-01-01 00:00:00' \
   --queries-file deploy/clickhouse/003_rollup_backfill.sql
+#    (For a large table, fold month by month instead: ./rollup_kline_per_month.sh --password "<pw>" ; it runs
+#     003 once per calendar month and takes --host/--port/--user/--from/--to/--dry-run too. Formerly rollup_per_month.sh.)
 
 # 5. Validate.
 curl -s 'http://127.0.0.1:8123/?query=SHOW+TABLES+FROM+market'
@@ -249,12 +253,57 @@ python cmd/test-tools/check_oi_consistency.py --vs-binance --require-calibration
 
 # 4. Then turn on live (live_enabled: true), restart, validate again after a few 5-minute boundaries.
 
-# 5. Optional rollups (15m / 1h / 4h / 1d / 1mo). Requires ClickHouse >= 24.10 (same as 002); build them
-#    only after history is in fapi_oi_5m, then fold the history month by month (006 needs month-aligned ranges):
-clickhouse-client --queries-file deploy/clickhouse/005_oi_rollups.sql
-clickhouse-client --param_m_start='2026-08-01 00:00:00' --param_m_end='2026-09-01 00:00:00' \
-                  --queries-file deploy/clickhouse/006_oi_rollup_backfill.sql
+# 5. Optional rollups (15m / 1h / 4h / 1d). Requires ClickHouse >= 24.10 (same as 002); build them
+#    only after history is in fapi_oi_5m, then fold the history month by month (006 needs month-aligned
+#    ranges; rollup_oi_per_month.sh does the loop, see "After importing the archive" below):
+clickhouse-client --host localhost --user default --password "<pw>" --multiquery < deploy/clickhouse/005_oi_rollups.sql
+./rollup_oi_per_month.sh --password "<pw>"
 ```
+
+#### After importing the archive: fold the rollups, then check completeness
+
+Run in this order. Every ClickHouse command takes the password explicitly (`--password` for `clickhouse-client` and the shell scripts, `--ch-password` for the Python tools; the Python tools otherwise read it from `config.yaml`, and the shell scripts also read `$CLICKHOUSE_PASSWORD`).
+
+```bash
+# 1. 005 applied? Expect the 5 rollup tables + 5 *_rmv views, every view Scheduled with an empty `exception`.
+clickhouse-client --host 127.0.0.1 --port 9000 --user default --password "<pw>" -q "
+  SELECT view, status, last_success_time, exception
+  FROM system.view_refreshes WHERE database = 'market' AND view LIKE 'fapi_oi%' ORDER BY view"
+
+# 2. Fold the whole 5m history into the rollups, one calendar month at a time (idempotent; safe to re-run).
+./rollup_oi_per_month.sh --password "<pw>" --dry-run          # print the commands, run nothing
+./rollup_oi_per_month.sh --password "<pw>"                    # 2020-08 .. current month
+./rollup_oi_per_month.sh --password "<pw>" --from 2026-08-01 --to 2026-10-01   # only some months (month starts)
+
+# 3. Verify the fold. Every 5m row lands in exactly one bucket of each rollup, so the sums must equal
+#    the raw row count (re-check after a moment if the module is writing new rows).
+clickhouse-client --host 127.0.0.1 --port 9000 --user default --password "<pw>" -q "
+  SELECT (SELECT count() FROM market.fapi_oi_5m FINAL)         AS raw_5m_rows,
+         (SELECT sum(samples) FROM market.fapi_oi_15m FINAL)   AS rows_in_15m,
+         (SELECT sum(samples) FROM market.fapi_oi_1h  FINAL)   AS rows_in_1h,
+         (SELECT sum(samples) FROM market.fapi_oi_4h  FINAL)   AS rows_in_4h,
+         (SELECT sum(samples) FROM market.fapi_oi_1d  FINAL)   AS rows_in_1d"
+
+# 4. Scan the whole history for missing bars. Read-only; writes the gap list.
+python cmd/test-tools/check_oi_consistency.py --start-date 2020-09-01 --skip-coverage \
+    --ch-password "<pw>" --gaps-csv oi_gaps.csv
+
+# 5. Repair what Binance can still serve. Dry run first (fetches, writes nothing), then --apply.
+python cmd/test-tools/backfill_missing_oi.py oi_gaps.csv --ch-password "<pw>"
+python cmd/test-tools/backfill_missing_oi.py oi_gaps.csv --ch-password "<pw>" --apply
+
+# 6. If step 5 repaired bars older than the rollups' refresh lookback it prints the exact command; e.g.
+./rollup_oi_per_month.sh --password "<pw>" --from 2026-08-01 --to 2026-10-01
+```
+
+How to read the results:
+- **Only the last ~30 days can be repaired here.** `openInterestHist` keeps about a month, so `backfill_missing_oi.py` requests only that part and reports the rest as "beyond Binance retention". Older gaps need the archive re-imported for those days; if the archive has no rows for them either, they are gaps at the source and will stay in every scan.
+- **"Empty at exchange"** = Binance returned nothing for a bar it was asked for; it is not inserted.
+- Repaired rows are written as `src_rank = 2` and only where no row existed, so nothing already in the table is overwritten. The tool is safe to re-run.
+- **Off-grid rows.** A row whose `start_time` is not on the 5-minute grid is a FAIL in check A (`not on the 5-minute grid`). The gap scan counts only on-grid rows, so the bar such a row stands in for is listed as missing; the repair inserts the proper on-grid bar but does **not** delete the off-grid row.
+- **Delisted symbols.** With `--gaps-tail`, the bars between a symbol's newest row and now are listed too (off by default: after an archive import that range is what the module's hist pass fills on its first start). A delisted symbol shows up there and can never be filled; the backfill reports it as "rejected by Binance".
+- **The freshness FAIL is expected** until the module has run: the archive ends at the last archived day, so "table is stale" and "newest bar N bars behind" fire in section A/B. The gap list is independent of them.
+- `backfill_missing_oi.py` (and `check_oi_consistency.py --vs-binance`) request `/futures/data`, the same pool as the module's hist pass (1000 requests / 5 min / IP). The scan and the fold only read/write ClickHouse. Do not run `backfill_missing_oi.py --apply` at the same moment as the module's start-up pass; lower `--window-cap` if you must.
 
 #### What the first start does (and what a restart does)
 
@@ -413,6 +462,7 @@ python cmd/test-tools/check_oi_consistency.py --require-calibration --max-uncali
 ```
 - It checks gaps, the 5-minute grid, `snap_time` semantics, freshness, calibration by hist, coverage against `fapi_kline_5m`, and per-bar cross-section completeness; exit `0` = no FAIL. It can also be run as part of the scorecard: `python cmd/test-tools/run_all_checks.py --oi`.
 - If the table does not exist it says so and points at `004_fapi_oi.sql`.
+- **Find and repair missing bars**: `--gaps-csv oi_gaps.csv` writes every missing-bar range (same CSV format as `check_clickhouse_integrity.py --gaps-csv`, interval `5m`); `--start-date 2020-09-01` widens the window from the last `--hours` to a start date, and `--skip-coverage` skips the (heavy) join against the kline table for a whole-history scan. Then `python cmd/test-tools/backfill_missing_oi.py oi_gaps.csv --ch-password "<pw>"` (dry run) and `--apply`. Full order of operations, including the password options and how to read the result: §3.4, "After importing the archive".
 
 ---
 

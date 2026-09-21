@@ -36,6 +36,7 @@
 | `e2e_reconciliation.py` | **[阶段 B·4] 缓存与存储对账工具**：对比 Redis `kline:{SYM}:1m` 滑窗与 ClickHouse `fapi_kline_1m`，逐根对比时间戳与 OHLCV 一致性 |
 | `run_all_checks.py` | **[阶段 C] 一键全量预检调度器**：一键执行所有检查项，输出可视化红绿灯健康计分卡 (Scorecard) |
 | `check_oi_consistency.py` | **[阶段 D] 持仓量一致性检查器**：只读检查 `market.fapi_oi_5m`——缺口、5 分钟网格、`snap_time` 语义、新鲜度、hist 校准情况、与 K 线表的覆盖率、逐根截面完整度，以及（可选）与币安逐值对账 |
+| `backfill_missing_oi.py` | **[修复] 缺失 5m 持仓量（OI）bar 回填**：读取 `check_oi_consistency.py --gaps-csv` 生成的 CSV，从币安 `openInterestHist` 拉这些 bar（接口只保留最近约 30 天）并以 `src_rank = 2` 写入 `market.fapi_oi_5m`。不带 `--apply` 只演练 |
 | `common.py` | 基础公用库：配置文件加载、ClickHouse/Redis 客户端、交易标的探测、时间工具、表格格式化等。本身不是一项检查。 |
 | `test_toolkit.py` | 工具包内置单元测试与 Mock 验证套件（`python -m pytest cmd/test-tools/test_toolkit.py`，或直接运行） |
 | `requirements.txt` | Python 依赖包清单 |
@@ -403,6 +404,9 @@ python cmd/test-tools/run_all_checks.py --verbose
 | `--require-calibration` | 关 | 把未校准的 live 行从 WARN 升级为 FAIL |
 | `--min-coverage` / `--min-cross-section` | `0.995` / `0.99` | C / D 两项的阈值 |
 | `--skip-coverage` | 关 | 跳过与 K 线表的拼接（C 和 D） |
+| `--start-date` | 关 | 窗口起点（UTC），如 `2020-09-01` 或 `2024-01-01 06:30`；会覆盖 `--hours`。配合 `--skip-coverage` 用于整段历史的扫描 |
+| `--gaps-csv PATH` | 关 | 把每一段缺失的 bar（同一标的两行之间，只统计在 5 分钟网格上的行）另存为 CSV，供 `backfill_missing_oi.py` 使用；列与 K 线缺口 CSV 相同，interval 为 `5m` |
+| `--gaps-tail` | 关 | 配合 `--gaps-csv`：把“每个标的最新一行到窗口末尾”的 bar 也列出来。已下架的标的会出现在这里，永远补不上 |
 | `--vs-binance` | 关 | 加跑 E 项（会打外部交易所） |
 | `--binance-symbols` / `--binance-bars` | `5` / `48` | 抽样几个标的 / 每个标的取最新几个 hist 点 |
 | `--live-tol` | `0.005` | live 行与币安的相对容差 |
@@ -425,9 +429,44 @@ python cmd/test-tools/check_oi_consistency.py --require-calibration --max-uncali
 
 # 针对演练库
 python cmd/test-tools/check_oi_consistency.py --table oi_rehearsal.fapi_oi_5m --kline-table market.fapi_kline_5m
+
+# 整段历史(例如导入归档之后):列出所有缺失的 bar,只读 ClickHouse
+python cmd/test-tools/check_oi_consistency.py --start-date 2020-09-01 --skip-coverage --ch-password "<pw>" --gaps-csv oi_gaps.csv
 ```
 
 退出码：`0` = 没有 FAIL（允许 WARN）；`1` = 至少一项 FAIL、表为空或不存在（提示信息会说明先执行 `deploy/clickhouse/004_fapi_oi.sql`）、或连不上 ClickHouse。
+
+---
+
+### 8b. 缺失 5m 持仓量（OI）bar 回填 (`backfill_missing_oi.py`)
+
+**修复工具，是第 8 项检查的后续。** 检查脚本指出缺了哪些 bar，这个脚本补上币安还能提供的部分。
+
+```bash
+python cmd/test-tools/check_oi_consistency.py --start-date 2020-09-01 --skip-coverage --ch-password "<pw>" --gaps-csv oi_gaps.csv   # 1. 列出所有缺口
+python cmd/test-tools/backfill_missing_oi.py oi_gaps.csv --ch-password "<pw>"           # 2. 演练:会请求但不写入
+python cmd/test-tools/backfill_missing_oi.py oi_gaps.csv --ch-password "<pw>" --apply   # 3. 写入找到的 bar
+python cmd/test-tools/check_oi_consistency.py --start-date 2020-09-01 --skip-coverage --ch-password "<pw>"   # 4. 校验
+```
+
+对每个标的：先去掉早于币安保留期（约 30 天）的部分（报为 *beyond retention*），再去掉 ClickHouse 里已有的 bar（所以可以重复执行，也不会覆盖已有数据），把剩下的尽量合并成能放进一页（500 根）的 `openInterestHist` 请求，按 `/futures/data` 额度池的节奏拉取，只写入被请求的 bar。行的映射与 Go 模块一致：标签 `T` 写到 `start_time = T-5m`，`snap_time = T`，`src_rank = 2`。
+
+**有些缺口在这里补不了。** 早于保留期的 bar 需要归档；币安什么也没返回的 bar 报为 *empty at exchange*；币安拒绝的标的（已下架）会被报出并跳过。检查脚本会继续列出这些缺口。
+
+| 参数 | 默认 | 含义 |
+| :--- | :--- | :--- |
+| `csv`（位置参数） | 必填 | 缺口 CSV，只使用 `5m` 的行 |
+| `--apply` | 关 | 真正 `INSERT`；不带则什么都不写 |
+| `--symbol` | *(文件中全部)* | 只处理这个标的 |
+| `--table` | `market.fapi_oi_5m` | OI 表（配置里设了 `open_interest.table` 就用它） |
+| `--rps` | `2` | 每秒请求数（与 `open_interest.data_rps` 相同） |
+| `--window-cap` | `900` | 任意 5 分钟内最多请求数（IP 上限是 1000，与服务的 hist 共用） |
+| `--retention-days` | `30` | 更早的 bar 只报告，不请求 |
+| `--rest-url` | 取配置 | 币安 REST 地址 |
+| `--batch-rows` | `2000` | 每次 `INSERT` 的行数 |
+| `--ch-host/-port/-db/-user/-password` | 取配置 | ClickHouse 连接覆盖项 |
+
+如果补的 bar 早于汇总表的刷新回看范围，脚本会打印需要执行的 `./rollup_oi_per_month.sh` 命令，用来重新折叠这些月份。有任何标的失败时退出码为 `1`。完整流程见 `docs/OPERATIONS.zh-CN.md` §3.4“导入归档之后”。
 
 ---
 

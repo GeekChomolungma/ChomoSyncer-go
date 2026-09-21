@@ -18,6 +18,8 @@ from check_vs_binance import rel_close
 import backfill_missing_1m as bf
 from check_clickhouse_integrity import write_gaps_csv, GAPS_CSV_HEADER
 from check_oi_consistency import bar_window, evaluate_symbol, compare_with_binance, coverage_status, BAR_MS
+from check_oi_consistency import parse_start_date, tail_gaps
+import backfill_missing_oi as bo
 
 
 class TestCommon(unittest.TestCase):
@@ -451,6 +453,212 @@ class TestBackfillMissing1m(unittest.TestCase):
                     apply=True, now_ms=base + 5 * M, out=lambda *_: None)
         self.assertEqual(st["failed_symbols"], ["BADUSDT"])
         self.assertEqual(st["empty_at_exchange"], 1)
+
+
+class TestOIGapsCsv(unittest.TestCase):
+    def test_parse_start_date_is_utc_and_rounds_up_to_a_bar(self):
+        self.assertEqual(parse_start_date("2024-01-01"), 1704067200000)
+        self.assertEqual(parse_start_date("2024-01-01 06:30"), 1704067200000 + 6 * 3600_000 + 30 * 60_000)
+        self.assertEqual(parse_start_date("2024-01-01 00:00:01"), 1704067200000 + BAR_MS)   # up, never before the request
+        with self.assertRaises(ValueError):
+            parse_start_date("01/01/2024")
+
+    def test_tail_gaps_lists_only_symbols_behind_the_window_end(self):
+        hi = 100 * BAR_MS
+        stats = {"AAAUSDT": {"max_ms": hi}, "BBBUSDT": {"max_ms": hi - 3 * BAR_MS}}
+        rows = tail_gaps(stats, hi)
+        self.assertEqual(rows, [("BBBUSDT", "5m", {"from_ms": hi - 2 * BAR_MS, "to_ms": hi + BAR_MS, "missing_count": 3})])
+
+    def test_csv_written_by_the_checker_is_read_by_the_backfill(self):
+        import tempfile
+        rows = [("BBBUSDT", "5m", {"from_ms": 10 * BAR_MS, "to_ms": 12 * BAR_MS, "missing_count": 2}),
+                ("BBBUSDT", "5m", {"from_ms": 12 * BAR_MS, "to_ms": 13 * BAR_MS, "missing_count": 1}),   # touches: merged
+                ("AAAUSDT", "5m", {"from_ms": 3 * BAR_MS, "to_ms": 4 * BAR_MS, "missing_count": 1})]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "g.csv")
+            self.assertEqual(write_gaps_csv(path, rows), 3)
+            gaps, warns = bo.read_gaps_csv(path)
+        self.assertEqual(warns, [])
+        self.assertEqual(gaps, {"AAAUSDT": [(3 * BAR_MS, 4 * BAR_MS)], "BBBUSDT": [(10 * BAR_MS, 13 * BAR_MS)]})
+
+
+class TestBackfillMissingOI(unittest.TestCase):
+    def test_read_gaps_csv_skips_other_intervals_and_bad_lines(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "g.csv")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("symbol,interval,from_ms,to_ms\n"
+                        f"AAAUSDT,1m,0,{BAR_MS}\n"                      # a kline gaps file line
+                        f"AAAUSDT,5m,{BAR_MS},{2 * BAR_MS}\n"
+                        f"AAAUSDT,5m,{BAR_MS + 1},{2 * BAR_MS}\n"       # off the grid
+                        f"BAD'USDT,5m,{BAR_MS},{2 * BAR_MS}\n"          # would be injected into SQL
+                        f"AAAUSDT,5m,{3 * BAR_MS},{3 * BAR_MS}\n")      # empty range
+            gaps, warns = bo.read_gaps_csv(path)
+        self.assertEqual(gaps, {"AAAUSDT": [(BAR_MS, 2 * BAR_MS)]})
+        self.assertEqual(len(warns), 4)
+
+    def test_subtract_present_and_clip_to_retention(self):
+        B = BAR_MS
+        self.assertEqual(bo.subtract_present([(0, 5 * B)], [B, 3 * B]), [(0, B), (2 * B, 3 * B), (4 * B, 5 * B)])
+        self.assertEqual(bo.clip_to_retention([(0, 2 * B), (3 * B, 6 * B), (8 * B, 9 * B)], 4 * B),
+                         ([(4 * B, 6 * B), (8 * B, 9 * B)], 2 + 1))
+
+    def test_plan_spans_shares_requests_and_pages_long_ranges(self):
+        B = BAR_MS
+        # two close gaps share one request; a far one does not
+        self.assertEqual(bo.plan_spans([(0, B), (10 * B, 11 * B), (2000 * B, 2001 * B)]),
+                         [(0, 11 * B), (2000 * B, 2001 * B)])
+        # 1200 bars -> pages of 500, 500, 200
+        self.assertEqual(bo.plan_spans([(0, 1200 * B)]), [(0, 500 * B), (500 * B, 1000 * B), (1000 * B, 1200 * B)])
+
+    def test_point_to_row_matches_go_mapping(self):
+        label = 1_000_000 * BAR_MS                 # label T
+        row = bo.point_to_row("AAAUSDT", label, 12.5)
+        self.assertEqual(row["start_time"], bo.fmt_ts(label - BAR_MS))   # stored at T-5m
+        self.assertEqual(row["snap_time"], bo.fmt_ts(label))
+        self.assertEqual((row["sum_open_interest"], row["src_rank"]), (12.5, 2))
+
+    def test_rollup_hint_and_month_helpers(self):
+        day = 86_400_000
+        self.assertEqual(bo.rollup_hint(0, 2 * day), [])
+        self.assertEqual(bo.rollup_hint(0, 12 * day), ["15m", "1h", "4h", "1d"])
+        ms = int(datetime_ms("2026-12-15"))
+        self.assertEqual((bo.month_start(ms), bo.next_month_start(ms)), ("2026-12-01", "2027-01-01"))
+
+    def test_pacer_spaces_requests_caps_the_window_and_honours_pauses(self):
+        t = [0.0]
+        slept = []
+
+        def sleep(d):
+            slept.append(d)
+            t[0] += d
+
+        p = bo.DataPacer(rps=2, window_cap=3, window_s=10, clock=lambda: t[0], sleep=sleep)
+        p.before()                       # first request: no wait
+        self.assertEqual(slept, [])
+        p.before()                       # 2 rps: waits 0.5s
+        self.assertAlmostEqual(slept[-1], 0.5)
+        p.before()
+        p.before()                       # 4th inside 10s with cap 3: waits until the first leaves the window
+        self.assertGreaterEqual(t[0], 10.0)
+        before = t[0]
+        p.pause_for(30)
+        p.before()
+        self.assertGreaterEqual(t[0], before + 30)
+
+    def test_fetch_sends_the_label_range_and_retries_rate_limits(self):
+        B = BAR_MS
+        calls = []
+
+        class Resp:
+            def __init__(self, code, body=None, headers=None):
+                self.status_code, self._b, self.headers = code, body, headers or {}
+            def json(self): return self._b
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError(f"http {self.status_code}")
+
+        answers = [Resp(429, headers={"Retry-After": "1"}),
+                   Resp(200, [{"timestamp": 3 * B, "sumOpenInterest": "2.5"}, {"timestamp": 2 * B, "sumOpenInterest": "1.5"},
+                              {"timestamp": 9 * B, "sumOpenInterest": "oops"}])]
+
+        class Sess:
+            def get(self, url, params=None, timeout=None):
+                calls.append((url, dict(params)))
+                return answers.pop(0)
+
+        t = [0.0]
+        pacer = bo.DataPacer(rps=1000, window_cap=1000, clock=lambda: t[0], sleep=lambda d: t.__setitem__(0, t[0] + d))
+        pts = bo.OIHist("https://x", pacer, session=Sess(), sleep=lambda d: None).fetch("AAAUSDT", B, 3 * B)
+        self.assertEqual(pts, [(2 * B, 1.5), (3 * B, 2.5)])                 # sorted, malformed item dropped
+        url, params = calls[0]
+        self.assertTrue(url.endswith("/futures/data/openInterestHist"))
+        # bars [B, 3B) have labels 2B and 3B
+        self.assertEqual((params["startTime"], params["endTime"], params["limit"], params["period"]), (2 * B, 3 * B, 2, "5m"))
+        self.assertEqual(len(calls), 2)
+        self.assertGreaterEqual(t[0], 1.0)                                  # waited Retry-After
+
+    def test_fetch_maps_code_1121_to_invalid_symbol(self):
+        class Resp:
+            status_code = 400
+            headers = {}
+            def json(self): return {"code": -1121, "msg": "Invalid symbol."}
+            def raise_for_status(self): raise RuntimeError("http 400")
+
+        class Sess:
+            def get(self, *a, **k): return Resp()
+
+        pacer = bo.DataPacer(rps=1000, window_cap=1000)
+        with self.assertRaises(bo.InvalidSymbol):
+            bo.OIHist("https://x", pacer, session=Sess()).fetch("GONEUSDT", BAR_MS, 2 * BAR_MS)
+
+    def _run(self, gaps, present, exchange, apply=True, now_ms=None, retention_days=30.0):
+        B = BAR_MS
+
+        class FakeCH:
+            def __init__(self): self.inserted = []
+            def query(self, sql): return [{"t": t} for t in present]
+            def insert_json_rows(self, table, cols, rows):
+                self.inserted.extend(rows)
+                return len(rows)
+
+        class FakeFetch:
+            def __init__(self): self.calls = []
+            def fetch(self, sym, a, b):
+                self.calls.append((sym, a, b))
+                if isinstance(exchange, Exception):
+                    raise exchange
+                return list(exchange)
+
+        ch, fe = FakeCH(), FakeFetch()
+        st = bo.run(ch, "t", gaps, fe, apply=apply, now_ms=now_ms if now_ms is not None else 1_000_000 * B + B // 2,
+                    retention_days=retention_days, out=lambda *_: None)
+        return ch, fe, st
+
+    def test_run_inserts_only_missing_wanted_published_bars(self):
+        B = BAR_MS
+        base = 1_000_000 * B - 100 * B            # 100 bars before "now"
+        ch, fe, st = self._run(
+            {"AAAUSDT": [(base, base + 4 * B)]},
+            present=[base + B],                    # bar 1 is already there
+            # labels: bar0, bar2, an out-of-range extra (bar 5), and a not-on-grid start
+            exchange=[(base + B, 10.0), (base + 3 * B, 30.0), (base + 6 * B, 60.0), (base + 3 * B + 1000, 9.0)])
+        self.assertEqual([r["start_time"] for r in ch.inserted], [bo.fmt_ts(base), bo.fmt_ts(base + 2 * B)])
+        self.assertTrue(all(r["src_rank"] == 2 for r in ch.inserted))
+        self.assertEqual((st["fetched"], st["inserted"], st["empty_at_exchange"], st["already_present"]), (2, 2, 1, 1))
+        self.assertEqual(len(fe.calls), 1)          # bars 0, 2 and 3 share one request
+
+    def test_run_dry_run_writes_nothing(self):
+        B = BAR_MS
+        base = 1_000_000 * B - 100 * B
+        ch, _, st = self._run({"AAAUSDT": [(base, base + B)]}, present=[], exchange=[(base + B, 1.0)], apply=False)
+        self.assertEqual((st["fetched"], st["inserted"], ch.inserted), (1, 0, []))
+
+    def test_run_reports_bars_older_than_retention_without_requesting_them(self):
+        B = BAR_MS
+        now = 1_000_000 * B
+        old = now - 40 * 288 * B                    # 40 days ago
+        ch, fe, st = self._run({"AAAUSDT": [(old, old + 10 * B)]}, present=[], exchange=[], now_ms=now)
+        self.assertEqual((st["beyond_retention"], st["fetched"], fe.calls, ch.inserted), (10, 0, [], []))
+
+    def test_run_skips_future_bars_and_isolates_failures(self):
+        B = BAR_MS
+        now = 1_000_000 * B + B // 2               # bar 999_999 has just closed; label 1_000_000 * B is in the past
+        last_start = 1_000_000 * B - B
+        ch, fe, st = self._run({"AAAUSDT": [(last_start, last_start + 3 * B)]}, present=[],
+                               exchange=[(1_000_000 * B, 5.0), (1_000_001 * B, 6.0)], now_ms=now)
+        self.assertEqual([r["start_time"] for r in ch.inserted], [bo.fmt_ts(last_start)])   # the still-open bar is not asked for
+
+        _, _, st = self._run({"AAAUSDT": [(last_start - B, last_start)]}, present=[], exchange=RuntimeError("boom"), now_ms=now)
+        self.assertEqual(st["failed_symbols"], ["AAAUSDT"])
+        _, _, st = self._run({"GONEUSDT": [(last_start - B, last_start)]}, present=[], exchange=bo.InvalidSymbol("x"), now_ms=now)
+        self.assertEqual((st["invalid_symbols"], st["failed_symbols"]), (["GONEUSDT"], []))
+
+
+def datetime_ms(day):
+    from datetime import datetime, timezone
+    return datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000
 
 
 if __name__ == "__main__":

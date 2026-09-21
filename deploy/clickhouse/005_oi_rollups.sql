@@ -1,9 +1,10 @@
 -- ============================================================================
--- Coarser-interval rollups of the 5m open-interest table (004): 15m / 1h / 4h / 1d / 1mo.
+-- Coarser-interval rollups of the 5m open-interest table (004): 15m / 1h / 4h / 1d.
 --
 -- REBUILD, NOT MIGRATE (same contract as 002_kline_rollups.sql)
---   Applying this file DROPS the five refreshable MVs and the five rollup tables and
---   recreates them EMPTY; market.fapi_oi_5m is never touched. Run
+--   Applying this file DROPS the four refreshable MVs and the four rollup tables and
+--   recreates them EMPTY (it also drops the retired 1mo view/table if an earlier version
+--   of this file created them); market.fapi_oi_5m is never touched. Run
 --   006_oi_rollup_backfill.sql afterwards to refill the history. A wrong rollup layer
 --   is cheaper to recompute from the 5m table than to patch. (Do NOT confuse the
 --   rollups with fapi_oi_5m itself: that table holds live snapshots that cannot be
@@ -29,16 +30,11 @@
 --
 -- COLUMN SEMANTICS  (a 5m row labelled t holds the OI at t + 5m, the kline's close)
 --   samples                   number of 5m rows in the bucket. A complete bucket has
---                             3 / 12 / 48 / 288 (15m/1h/4h/1d) or days_in_month*288
---                             (1mo). Filter on it before use.
+--                             3 / 12 / 48 / 288 (15m/1h/4h/1d). Filter on it before use.
 --   sum_open_interest_close   OI at the bucket's close = the row with the largest
 --                             start_time in the bucket (= bucket_end - 5m label).
 --   sum_open_interest_high/low  max / min of the closing snapshots inside the bucket.
 --   There is no `open`: a bucket's opening OI is the previous bucket's close (use lag()).
---
--- MONTH BUCKETS
---   toStartOfMonth is calendar-aware (toStartOfInterval is anchored at the epoch and
---   is not for months/weeks), so 1mo is offered here.
 --
 -- APPLY ORDER
 --   004 -> load history into fapi_oi_5m -> this file -> 006 (fold the history).
@@ -58,12 +54,12 @@ DROP VIEW  IF EXISTS market.fapi_oi_15m_rmv;
 DROP VIEW  IF EXISTS market.fapi_oi_1h_rmv;
 DROP VIEW  IF EXISTS market.fapi_oi_4h_rmv;
 DROP VIEW  IF EXISTS market.fapi_oi_1d_rmv;
-DROP VIEW  IF EXISTS market.fapi_oi_1mo_rmv;
+DROP VIEW  IF EXISTS market.fapi_oi_1mo_rmv;     -- retired: 1mo is no longer built; dropped so a re-run cleans it up
 DROP TABLE IF EXISTS market.fapi_oi_15m;
 DROP TABLE IF EXISTS market.fapi_oi_1h;
 DROP TABLE IF EXISTS market.fapi_oi_4h;
 DROP TABLE IF EXISTS market.fapi_oi_1d;
-DROP TABLE IF EXISTS market.fapi_oi_1mo;
+DROP TABLE IF EXISTS market.fapi_oi_1mo;         -- retired (see above)
 -- <<< REBUILD-DROPS (end)
 
 
@@ -232,48 +228,6 @@ FROM
         now64(3)                                   AS rollup_version
     FROM market.fapi_oi_5m FINAL
     WHERE start_time >= toStartOfInterval(toTimeZone(now(), 'UTC') - INTERVAL 10 DAY, INTERVAL 1 DAY)
-    GROUP BY symbol, bucket_start
-);
-
--- ---------------------------------------------------------------------------
--- 1mo
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS market.fapi_oi_1mo
-(
-    symbol                   LowCardinality(String),
-    start_time               DateTime64(3, 'UTC'),
-    samples                  UInt16,
-    sum_open_interest_close  Float64,
-    sum_open_interest_high   Float64,
-    sum_open_interest_low    Float64,
-    rollup_version           DateTime64(3, 'UTC')
-)
-ENGINE = ReplacingMergeTree(rollup_version)
-PARTITION BY toYYYYMM(start_time)
-PRIMARY KEY (symbol, start_time)
-ORDER BY (symbol, start_time)
-SETTINGS index_granularity = 8192;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS market.fapi_oi_1mo_rmv
-REFRESH EVERY 900 SECOND APPEND TO market.fapi_oi_1mo AS
-SELECT
-    symbol,
-    bucket_start AS start_time,
-    samples,
-    sum_open_interest_close, sum_open_interest_high, sum_open_interest_low,
-    rollup_version
-FROM
-(
-    SELECT
-        symbol,
-        toDateTime64(toStartOfMonth(start_time), 3, 'UTC')                                   AS bucket_start,
-        toUInt16(count())                          AS samples,
-        argMax(sum_open_interest, start_time)      AS sum_open_interest_close,
-        max(sum_open_interest)                     AS sum_open_interest_high,
-        min(sum_open_interest)                     AS sum_open_interest_low,
-        now64(3)                                   AS rollup_version
-    FROM market.fapi_oi_5m FINAL
-    WHERE start_time >= toDateTime64(toStartOfMonth(toTimeZone(now(), 'UTC') - INTERVAL 40 DAY), 3, 'UTC')
     GROUP BY symbol, bucket_start
 );
 

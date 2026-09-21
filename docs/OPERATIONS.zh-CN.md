@@ -103,6 +103,8 @@ docker compose -f deploy/docker-compose.yml exec clickhouse \
 docker compose -f deploy/docker-compose.yml exec clickhouse clickhouse-client \
   --param_m_start='2000-01-01 00:00:00' --param_m_end='2099-01-01 00:00:00' \
   --queries-file /clickhouse/003_rollup_backfill.sql
+#    (数据量大时改用按月折叠:./rollup_kline_per_month.sh --password "<pw>" ;它对每个自然月各跑一次 003,
+#     同样支持 --host/--port/--user/--from/--to/--dry-run。原名 rollup_per_month.sh。)
 
 # 4. 校验(必须全绿再进下一步)。
 python cmd/test-tools/check_clickhouse_integrity.py --intervals 1m,5m,15m,1h,4h,1d
@@ -166,6 +168,8 @@ clickhouse-client --host 127.0.0.1 --port 9000 --multiquery < deploy/clickhouse/
 clickhouse-client --host 127.0.0.1 --port 9000 \
   --param_m_start='2000-01-01 00:00:00' --param_m_end='2099-01-01 00:00:00' \
   --queries-file deploy/clickhouse/003_rollup_backfill.sql
+#    (数据量大时改用按月折叠:./rollup_kline_per_month.sh --password "<pw>" ;它对每个自然月各跑一次 003,
+#     同样支持 --host/--port/--user/--from/--to/--dry-run。原名 rollup_per_month.sh。)
 
 # 5. 校验。
 curl -s 'http://127.0.0.1:8123/?query=SHOW+TABLES+FROM+market'
@@ -236,12 +240,57 @@ python cmd/test-tools/check_oi_consistency.py --vs-binance --require-calibration
 
 # 4. 再打开 live(live_enabled: true),重启,跑过几个 5 分钟边界后再校验一次。
 
-# 5. 可选的汇总表(15m / 1h / 4h / 1d / 1mo)。需要 ClickHouse >= 24.10(与 002 相同);
-#    等 fapi_oi_5m 里已有历史之后再建,然后按月折叠历史(006 要求按月对齐的区间):
-clickhouse-client --queries-file deploy/clickhouse/005_oi_rollups.sql
-clickhouse-client --param_m_start='2026-08-01 00:00:00' --param_m_end='2026-09-01 00:00:00' \
-                  --queries-file deploy/clickhouse/006_oi_rollup_backfill.sql
+# 5. 可选的汇总表(15m / 1h / 4h / 1d)。需要 ClickHouse >= 24.10(与 002 相同);
+#    等 fapi_oi_5m 里已有历史之后再建,然后按月折叠历史(006 要求按月对齐的区间;
+#    rollup_oi_per_month.sh 负责循环,见下文“导入归档之后”):
+clickhouse-client --host localhost --user default --password "<pw>" --multiquery < deploy/clickhouse/005_oi_rollups.sql
+./rollup_oi_per_month.sh --password "<pw>"
 ```
+
+#### 导入归档之后：折叠汇总表，再检查完整性
+
+按这个顺序做。每个 ClickHouse 操作都显式带密码（`clickhouse-client` 和 shell 脚本用 `--password`，Python 工具用 `--ch-password`；Python 工具不带的话会读 `config.yaml`，shell 脚本也会读环境变量 `$CLICKHOUSE_PASSWORD`）。
+
+```bash
+# 1. 005 是否已生效?应看到 5 张汇总表 + 5 个 *_rmv 视图,每个视图都是 Scheduled 且 exception 为空。
+clickhouse-client --host 127.0.0.1 --port 9000 --user default --password "<pw>" -q "
+  SELECT view, status, last_success_time, exception
+  FROM system.view_refreshes WHERE database = 'market' AND view LIKE 'fapi_oi%' ORDER BY view"
+
+# 2. 按自然月把整段 5m 历史折叠进汇总表(幂等,可重复执行)。
+./rollup_oi_per_month.sh --password "<pw>" --dry-run          # 只打印命令,不执行
+./rollup_oi_per_month.sh --password "<pw>"                    # 2020-08 到当前月
+./rollup_oi_per_month.sh --password "<pw>" --from 2026-08-01 --to 2026-10-01   # 只折叠部分月份(必须是月初)
+
+# 3. 验证折叠结果。每一行 5m 数据在每张汇总表里恰好落进一个桶,所以各表 samples 之和
+#    应等于原始行数(如果模块正在写入新数据,稍后再核对一次)。
+clickhouse-client --host 127.0.0.1 --port 9000 --user default --password "<pw>" -q "
+  SELECT (SELECT count() FROM market.fapi_oi_5m FINAL)         AS raw_5m_rows,
+         (SELECT sum(samples) FROM market.fapi_oi_15m FINAL)   AS rows_in_15m,
+         (SELECT sum(samples) FROM market.fapi_oi_1h  FINAL)   AS rows_in_1h,
+         (SELECT sum(samples) FROM market.fapi_oi_4h  FINAL)   AS rows_in_4h,
+         (SELECT sum(samples) FROM market.fapi_oi_1d  FINAL)   AS rows_in_1d"
+
+# 4. 扫描整段历史里缺失的 bar。只读;输出缺口清单。
+python cmd/test-tools/check_oi_consistency.py --start-date 2020-09-01 --skip-coverage \
+    --ch-password "<pw>" --gaps-csv oi_gaps.csv
+
+# 5. 补币安还能提供的部分。先演练(会请求但不写入),再加 --apply。
+python cmd/test-tools/backfill_missing_oi.py oi_gaps.csv --ch-password "<pw>"
+python cmd/test-tools/backfill_missing_oi.py oi_gaps.csv --ch-password "<pw>" --apply
+
+# 6. 如果第 5 步补的 bar 早于汇总表的刷新回看范围,脚本会打印确切命令,例如:
+./rollup_oi_per_month.sh --password "<pw>" --from 2026-08-01 --to 2026-10-01
+```
+
+怎么看结果：
+- **这里只能补最近约 30 天。** `openInterestHist` 只保留约一个月，所以 `backfill_missing_oi.py` 只请求这一段，其余的报为“超出币安保留期（beyond Binance retention）”。更早的缺口要对那几天重新导入归档；如果归档里也没有，那就是源头本身的缺口，每次扫描都会列出。
+- **“empty at exchange”** = 请求了但币安什么也没返回的 bar，不会插入。
+- 补进去的行 `src_rank = 2`，并且只写入原本不存在的 bar，不会覆盖表里已有的数据；可以放心重复执行。
+- **不在网格上的行。** `start_time` 不是 5 分钟整点的行，在检查 A 里是 FAIL（`not on the 5-minute grid`）。缺口扫描只统计在网格上的行，所以这类行所占的那一根 bar 会被列为缺失；补数会插入正确的整点 bar，但**不会删除**那条不在网格上的行。
+- **已下架的标的。** 加 `--gaps-tail` 会把“每个标的最新一行到现在”的 bar 也列出来（默认关闭：导入归档之后，这一段就是模块首次启动时 hist 要补的）。已下架的标的会出现在这里，永远补不上，补数脚本会报为“rejected by Binance”。
+- **在模块运行之前，新鲜度的 FAIL 是预期的**：归档只到最后一个已归档日，所以 A/B 部分会出现 “table is stale” 和 “newest bar N bars behind”。缺口清单不受它们影响。
+- `backfill_missing_oi.py`（以及 `check_oi_consistency.py --vs-binance`）请求的是 `/futures/data`，与模块 hist 共用同一个额度池（每 IP 每 5 分钟 1000 次）。扫描和折叠只读写 ClickHouse。不要和模块的启动补缺同时执行 `backfill_missing_oi.py --apply`；确需同时跑就调低 `--window-cap`。
 
 #### 首次启动做什么，重启又做什么
 
@@ -398,6 +447,7 @@ python cmd/test-tools/check_oi_consistency.py --require-calibration --max-uncali
 ```
 - 检查缺口、5 分钟网格、`snap_time` 语义、新鲜度、hist 校准情况、与 `fapi_kline_5m` 的覆盖率，以及逐根 bar 的截面完整度；退出码 `0` = 没有 FAIL。也可以并入计分卡一起跑：`python cmd/test-tools/run_all_checks.py --oi`。
 - 表不存在时会明确指出，并提示执行 `004_fapi_oi.sql`。
+- **找出并补上缺失的 bar**：`--gaps-csv oi_gaps.csv` 会把每一段缺失的 bar 写成 CSV（格式与 `check_clickhouse_integrity.py --gaps-csv` 相同，interval 为 `5m`）；`--start-date 2020-09-01` 把窗口从“最近 `--hours` 小时”改成从某个起始日期开始，`--skip-coverage` 跳过（很重的）与 K 线表的 join，用于整段历史的扫描。然后运行 `python cmd/test-tools/backfill_missing_oi.py oi_gaps.csv --ch-password "<pw>"`（演练），确认后加 `--apply`。完整的操作顺序（含密码参数与结果解读）见 §3.4“导入归档之后”。
 
 ---
 

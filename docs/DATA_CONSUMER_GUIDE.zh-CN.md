@@ -131,7 +131,7 @@ EXISTS TABLE market.fapi_oi_5m
 | 表 | 周期 |
 | :--- | :--- |
 | `market.fapi_oi_5m` | 5 分钟 —— 生产者直接写入的原始表 |
-| `market.fapi_oi_15m`、`_1h`、`_4h`、`_1d`、`_1mo` | 汇总表，由 5m 表重算得到，不要手工改 |
+| `market.fapi_oi_15m`、`_1h`、`_4h`、`_1d` | 汇总表，由 5m 表重算得到，不要手工改 |
 
 `market.fapi_oi_5m` 的列：
 
@@ -191,12 +191,12 @@ WHERE start_time = '2026-09-21 12:00:00' ORDER BY symbol
 
 ### 汇总表
 
-`fapi_oi_{15m,1h,4h,1d,1mo}` 每个桶存的是**桶收盘时刻**的持仓量及其区间：
+`fapi_oi_{15m,1h,4h,1d}` 每个桶存的是**桶收盘时刻**的持仓量及其区间：
 
 | 列 | 含义 |
 | :--- | :--- |
-| `symbol`、`start_time` | 桶起点（UTC；`1mo` 用日历月）。 |
-| `samples` | 桶内 5m 行数。完整的桶是 3 / 12 / 48 / 288（15m / 1h / 4h / 1d），月桶是 `当月天数 × 288`。**务必按它过滤**——最新的那个桶通常是不完整的。 |
+| `symbol`、`start_time` | 桶起点（UTC）。 |
+| `samples` | 桶内 5m 行数。完整的桶是 3 / 12 / 48 / 288（15m / 1h / 4h / 1d）。**务必按它过滤**——最新的那个桶通常是不完整的。 |
 | `sum_open_interest_close` | 桶收盘时刻的持仓量（桶内最后一个 5m 行）。 |
 | `sum_open_interest_high` / `_low` | 桶内各收盘快照的最大 / 最小值。 |
 | `rollup_version` | 内部字段。 |

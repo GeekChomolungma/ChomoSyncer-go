@@ -187,14 +187,14 @@ live 与 hist 的数值**不会完全一致**：
 
 引擎 `ReplacingMergeTree(src_rank)`，`PARTITION BY toYYYYMM(start_time)`，`ORDER BY (symbol, start_time)`。读取一律加 `FINAL`。
 
-### 4.2 汇总表：`market.fapi_oi_{15m,1h,4h,1d,1mo}`（5 张）
+### 4.2 汇总表：`market.fapi_oi_{15m,1h,4h,1d}`（4 张）
 
 由 5m 原始表在 ClickHouse 内汇总，思路与 `002_kline_rollups.sql` 一致：**每次从源表 `FINAL` 全量重算、不累加、每档直接读 5m 表不做级联**，目标表 `ReplacingMergeTree(rollup_version)`。
 
 | 列 | 含义 |
 |---|---|
-| `symbol`、`start_time` | 桶起点（UTC 对齐；月桶用 `toStartOfMonth`） |
-| `samples` | 桶内 5m 行数。完整桶为 3 / 12 / 48 / 288（15m/1h/4h/1d），月为 `当月天数 × 288`，使用前应据此过滤 |
+| `symbol`、`start_time` | 桶起点（UTC 对齐） |
+| `samples` | 桶内 5m 行数。完整桶为 3 / 12 / 48 / 288（15m/1h/4h/1d），使用前应据此过滤 |
 | `sum_open_interest_{close,high,low}` | `close` = 桶内最后一行（桶收盘时刻的持仓量）；`high/low` = 桶内各收盘快照的最大/最小 |
 | `rollup_version` | `now64(3)` |
 
@@ -206,7 +206,7 @@ live 与 hist 的数值**不会完全一致**：
 WHERE start_time >= toStartOfInterval(toTimeZone(now(), 'UTC') - INTERVAL 3 DAY, INTERVAL 1 HOUR)
 ```
 
-### 4.3 物化视图：`market.fapi_oi_{15m,1h,4h,1d,1mo}_rmv`（5 个）
+### 4.3 物化视图：`market.fapi_oi_{15m,1h,4h,1d}_rmv`（4 个）
 
 `REFRESH EVERY N SECOND APPEND TO` 的可刷新物化视图，每档一个，负责把最近若干天的 5m 行重新汇总进对应汇总表。MV 的替换规则（先 `DROP` 再 `CREATE`）见 `deploy/clickhouse-fixes/README.md`。
 
