@@ -55,6 +55,26 @@ func TestNextRound(t *testing.T) {
 	}
 }
 
+func TestNextRoundNeverPicksABoundaryAlreadySnapshotted(t *testing.T) {
+	l, _, _, _, _, _ := newLiveHarness(t, "2026-09-21 12:00:00.000")
+	l.lastBoundary = ts("2026-09-21 12:10:00.000")
+	// The round for 12:10 finished 9s before its boundary: 12:10 is done, so wait for 12:15.
+	b, s := l.nextRound(ts("2026-09-21 12:09:51.000"))
+	if !b.Equal(ts("2026-09-21 12:15:00.000")) || !s.Equal(ts("2026-09-21 12:14:30.000")) {
+		t.Fatalf("nextRound = (%s, %s), want (12:15:00, 12:14:30)", b.Format("15:04:05"), s.Format("15:04:05"))
+	}
+	// The round overran its boundary; the next boundary is still the very next one.
+	b, _ = l.nextRound(ts("2026-09-21 12:10:20.000"))
+	if !b.Equal(ts("2026-09-21 12:15:00.000")) {
+		t.Fatalf("after an overrun the boundary = %s, want 12:15:00", b.Format("15:04:05"))
+	}
+	// A boundary later than the last one is unaffected.
+	b, _ = l.nextRound(ts("2026-09-21 12:12:00.000"))
+	if !b.Equal(ts("2026-09-21 12:15:00.000")) {
+		t.Fatalf("boundary = %s, want 12:15:00", b.Format("15:04:05"))
+	}
+}
+
 func TestCycleAttributesSnapshotsToTheClosingBar(t *testing.T) {
 	l, src, sink, cache, m, fc := newLiveHarness(t, "2026-09-21 12:09:30.000", "AAA", "BBB", "CCC", "DDD")
 	boundary := ts("2026-09-21 12:10:00.000")
@@ -159,6 +179,39 @@ func TestRunWaitsForTheLeadThenSnapshots(t *testing.T) {
 	rows := sink.forSymbol("AAA")
 	if len(rows) != 1 || !rows[0].StartTime.Equal(ts("2026-09-21 12:05:00.000")) {
 		t.Fatalf("rows = %+v", rows)
+	}
+}
+
+func TestRunSnapshotsEachBoundaryOnce(t *testing.T) {
+	// The fake clock does not advance during a round, so the round for 12:10 "finishes" at
+	// 12:09:30 with 30s left. Without the memory of the last boundary Run starts a second
+	// round for 12:10 at once; with it Run waits 5 minutes for the 12:15 round.
+	l, src, sink, _, _, fc := newLiveHarness(t, "2026-09-21 12:07:30.000", "AAA")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var slept []time.Duration
+	l.sleep = func(ctx context.Context, d time.Duration) error {
+		slept = append(slept, d)
+		if len(slept) == 2 {
+			cancel()
+			return ctx.Err()
+		}
+		return fc.Sleep(ctx, d)
+	}
+	rounds := 0
+	src.fn = func(string) (Snapshot, error) {
+		if rounds++; rounds >= 3 {
+			cancel() // a regression would loop here forever; stop it so the test fails instead of hanging
+		}
+		return Snapshot{OpenInterest: 7, Time: fc.Now()}, nil
+	}
+	l.Run(ctx)
+
+	if len(slept) != 2 || slept[0] != 2*time.Minute || slept[1] != 5*time.Minute {
+		t.Fatalf("waits = %v, want 2m (to 12:09:30) then 5m (to 12:14:30)", slept)
+	}
+	if rows := sink.forSymbol("AAA"); len(rows) != 1 {
+		t.Fatalf("got %d rows for boundary 12:10, want exactly one round", len(rows))
 	}
 }
 

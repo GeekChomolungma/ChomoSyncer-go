@@ -70,6 +70,9 @@ type Live struct {
 	lim     *rate.Limiter
 	now     func() time.Time
 	sleep   func(ctx context.Context, d time.Duration) error
+
+	// lastBoundary is the newest boundary Run has already snapshotted. Only Run touches it.
+	lastBoundary time.Time
 }
 
 // NewLive builds a Live. cache may be nil.
@@ -94,11 +97,16 @@ func NewLive(cfg LiveConfig, src SnapshotSource, sink RowSink, symbols func() []
 //
 // B is the next 5-minute boundary; the round starts at B-Lead. If that moment has
 // already passed the round starts now, unless fewer than MinRemaining is left, in
-// which case the following boundary is used.
+// which case the following boundary is used. A boundary that Run has already
+// snapshotted is never chosen again: a round that finishes with more than MinRemaining
+// still left before its own boundary would otherwise start a second round for it.
 func (l *Live) nextRound(now time.Time) (boundary, start time.Time) {
 	boundary = floorBar(now).Add(BarInterval)
 	if boundary.Sub(now) < l.cfg.MinRemaining {
 		boundary = boundary.Add(BarInterval)
+	}
+	if !boundary.After(l.lastBoundary) {
+		boundary = l.lastBoundary.Add(BarInterval)
 	}
 	start = boundary.Add(-l.cfg.Lead)
 	if start.Before(now) {
@@ -120,6 +128,7 @@ func (l *Live) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		l.lastBoundary = boundary
 		l.log.Info("open-interest live round",
 			"boundary", st.Boundary.Format("15:04:05"), "symbols", st.Symbols, "ok", st.OK,
 			"dropped", st.Dropped, "errors", st.Errors, "took", st.Took.Round(100*time.Millisecond))
