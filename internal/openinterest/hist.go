@@ -219,7 +219,19 @@ type jobResult struct {
 	err    error
 }
 
-// plan decides, per symbol, whether hist has to be called and how far back.
+// plan decides, per symbol, whether hist has to be called and how far back (see
+// planJobs).
+func (r *Reconciler) plan(now time.Time, full bool) ([]histJob, PassStats) {
+	syms := r.symbols()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	jobs, st := planJobs(r.cfg, syms, r.last, now, full)
+	r.m.histBeyondCap.Add(float64(st.BeyondCap))
+	return jobs, st
+}
+
+// planJobs decides, per symbol, whether a hist-style source has to be called and
+// how far back. last[sym] is the start_time of the newest calibrated row.
 //
 // Incremental (hourly) pass:
 //
@@ -233,22 +245,19 @@ type jobResult struct {
 // request per symbol re-reads everything Binance has for the last ~41 hours.
 //
 // Either way never earlier than now - MaxBackfill (older needs the archive).
-func (r *Reconciler) plan(now time.Time, full bool) (jobs []histJob, st PassStats) {
-	syms := r.symbols()
+func planJobs(cfg HistConfig, syms []string, last map[string]time.Time, now time.Time, full bool) (jobs []histJob, st PassStats) {
 	st.Symbols = len(syms)
 	floorNow := floorBar(now)
-	target := newestPublishedStart(now, r.cfg.PublishLag)
-	capStart := floorBar(now.Add(-r.cfg.MaxBackfill))
-	pageStart := floorNow.Add(-time.Duration(maxInt(r.cfg.MaxLimit-r.cfg.LimitMargin, 1)) * BarInterval)
+	target := newestPublishedStart(now, cfg.PublishLag)
+	capStart := floorBar(now.Add(-cfg.MaxBackfill))
+	pageStart := floorNow.Add(-time.Duration(maxInt(cfg.MaxLimit-cfg.LimitMargin, 1)) * BarInterval)
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	for _, s := range syms {
-		lh, ok := r.last[s]
+		lh, ok := last[s]
 		var since time.Time
 		fresh := !ok
 		if fresh {
-			since = floorNow.Add(-r.cfg.ColdStartWindow)
+			since = floorNow.Add(-cfg.ColdStartWindow)
 			st.ColdStart++
 		} else {
 			if !full && !lh.Before(target) {
@@ -259,7 +268,6 @@ func (r *Reconciler) plan(now time.Time, full bool) (jobs []histJob, st PassStat
 		}
 		if since.Before(capStart) { // the gap itself reaches past the cap: the rest needs the archive
 			st.BeyondCap++
-			r.m.histBeyondCap.Inc()
 		}
 		if full && pageStart.Before(since) {
 			since = pageStart // widen to one whole page
@@ -356,6 +364,14 @@ func (r *Reconciler) pass(ctx context.Context, spread time.Duration, full bool) 
 // runJobs fetches every job with a small worker pool. Results are stored into out;
 // the jobs that failed are returned.
 func (r *Reconciler) runJobs(ctx context.Context, jobs []histJob, spread time.Duration, out map[string]jobResult) (failed []histJob) {
+	return runHistJobs(ctx, r.cfg.Workers, jobs, spread, r.now, r.sleep, r.fetchSymbol, out)
+}
+
+// runHistJobs runs fetch for every job on `workers` goroutines. spread > 0 spaces
+// the jobs' starts evenly over that duration on a shared timeline. Results are
+// stored into out; the jobs that failed are returned.
+func runHistJobs(ctx context.Context, workers int, jobs []histJob, spread time.Duration, now func() time.Time,
+	sleep func(context.Context, time.Duration) error, fetch func(context.Context, histJob) jobResult, out map[string]jobResult) (failed []histJob) {
 	if len(jobs) == 0 {
 		return nil
 	}
@@ -363,12 +379,12 @@ func (r *Reconciler) runJobs(ctx context.Context, jobs []histJob, spread time.Du
 	if spread > 0 {
 		step = spread / time.Duration(len(jobs))
 	}
-	pc := &pacer{step: step, next: r.now(), now: r.now, sleep: r.sleep}
+	pc := &pacer{step: step, next: now(), now: now, sleep: sleep}
 
 	ch := make(chan histJob)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for w := 0; w < r.cfg.Workers; w++ {
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -376,7 +392,7 @@ func (r *Reconciler) runJobs(ctx context.Context, jobs []histJob, spread time.Du
 				if pc.wait(ctx) != nil {
 					return
 				}
-				res := r.fetchSymbol(ctx, j)
+				res := fetch(ctx, j)
 				mu.Lock()
 				if res.err != nil {
 					failed = append(failed, j)

@@ -208,9 +208,30 @@ type OpenInterestConfig struct {
 	HistMaxBackfill       time.Duration `yaml:"hist_max_backfill"`      // never reach back further; older gaps need the archive
 	HistWorkers           int           `yaml:"hist_workers"`           // concurrent symbol fetches
 
-	// /futures/data pool (openInterestHist): 1000 requests per 5 minutes per IP
+	// /futures/data pool (openInterestHist and the long/short ratios): 1000 requests per 5 minutes per IP
 	DataRPS       float64 `yaml:"data_rps"`
 	DataWindowCap int     `yaml:"data_window_cap"`
+
+	// LSRatio: the three long/short ratios into market.fapi_ls_ratio_5m
+	// (deploy/clickhouse/007_fapi_ls_ratio.sql). Shares the /futures/data pool above.
+	LSRatio LSRatioConfig `yaml:"ls_ratio"`
+}
+
+// LSRatioConfig configures the long/short ratio passes (topLongShortAccountRatio,
+// topLongShortPositionRatio, globalLongShortAccountRatio): at start-up a full pass
+// per symbol, then an incremental pass every reconcile_interval. Off by default.
+type LSRatioConfig struct {
+	Enabled           bool          `yaml:"enabled"`
+	Table             string        `yaml:"table"`
+	ReconcileInterval time.Duration `yaml:"reconcile_interval"`
+	ReconcileOffset   time.Duration `yaml:"reconcile_offset"`  // a pass starts at hh:offset of each interval
+	ReconcileSpread   time.Duration `yaml:"reconcile_spread"`  // a scheduled pass spreads its symbols over this
+	PublishLag        time.Duration `yaml:"publish_lag"`       // a label T is expected readable this long after T
+	LimitMargin       int           `yaml:"limit_margin"`      // extra bars requested beyond the gap
+	MaxLimit          int           `yaml:"max_limit"`         // largest limit per request (Binance max 500)
+	ColdStartWindow   time.Duration `yaml:"cold_start_window"` // symbols without rows are backfilled this far
+	MaxBackfill       time.Duration `yaml:"max_backfill"`      // never reach back further; older gaps need the archive
+	Workers           int           `yaml:"workers"`           // concurrent symbol fetches
 }
 
 // ToModule converts the YAML shape to the module's own Config. The writer settings
@@ -230,6 +251,14 @@ func (o OpenInterestConfig) ToModule() openinterest.Config {
 		},
 		DataRPS:       o.DataRPS,
 		DataWindowCap: o.DataWindowCap,
+
+		LSRatioEnabled: o.LSRatio.Enabled,
+		LSRatioTable:   o.LSRatio.Table,
+		LSRatio: openinterest.HistConfig{
+			Interval: o.LSRatio.ReconcileInterval, Offset: o.LSRatio.ReconcileOffset, Spread: o.LSRatio.ReconcileSpread,
+			PublishLag: o.LSRatio.PublishLag, LimitMargin: o.LSRatio.LimitMargin, MaxLimit: o.LSRatio.MaxLimit,
+			ColdStartWindow: o.LSRatio.ColdStartWindow, MaxBackfill: o.LSRatio.MaxBackfill, Workers: o.LSRatio.Workers,
+		},
 	}
 }
 
@@ -377,6 +406,19 @@ func DefaultConfig() Config {
 			HistWorkers:           4,
 			DataRPS:               2,
 			DataWindowCap:         900,
+			LSRatio: LSRatioConfig{
+				Enabled:           false,
+				Table:             openinterest.DefaultLSTable,
+				ReconcileInterval: time.Hour,
+				ReconcileOffset:   5 * time.Minute,
+				ReconcileSpread:   openinterest.DefaultLSRatioSpread,
+				PublishLag:        4 * time.Minute,
+				LimitMargin:       3,
+				MaxLimit:          500,
+				ColdStartWindow:   48 * time.Hour,
+				MaxBackfill:       168 * time.Hour,
+				Workers:           4,
+			},
 		},
 	}
 }

@@ -18,13 +18,18 @@ import (
 type Config struct {
 	HistEnabled bool // start-up catch-up and hourly calibration from openInterestHist
 	LiveEnabled bool // pre-close snapshots from /fapi/v1/openInterest
+	// LSRatioEnabled: start-up catch-up and hourly passes of the three long/short ratio
+	// endpoints into LSRatioTable. Independent of the two above.
+	LSRatioEnabled bool
 
-	Table string // target table (default DefaultTable)
+	Table        string // target table (default DefaultTable)
+	LSRatioTable string // long/short ratio table (default DefaultLSTable)
 
-	Live LiveConfig
-	Hist HistConfig
+	Live    LiveConfig
+	Hist    HistConfig
+	LSRatio HistConfig // long/short ratio passes; zero values take the defaults of Hist, except Spread (30m)
 
-	// /futures/data pool (openInterestHist)
+	// /futures/data pool, shared by openInterestHist and the long/short ratio endpoints
 	DataRPS       float64 // token-bucket rate (default 2)
 	DataWindowCap int     // hard cap of requests per sliding 5 minutes (default 900 of 1000)
 
@@ -32,13 +37,27 @@ type Config struct {
 }
 
 // Enabled reports whether anything should run.
-func (c Config) Enabled() bool { return c.HistEnabled || c.LiveEnabled }
+func (c Config) Enabled() bool { return c.oiEnabled() || c.LSRatioEnabled }
+
+func (c Config) oiEnabled() bool { return c.HistEnabled || c.LiveEnabled }
+
+// DefaultLSRatioSpread spreads an hourly long/short ratio pass (3 requests per
+// symbol) over 30 minutes: ~0.9 requests/s for 528 symbols, which together with the
+// open-interest pass (~0.45/s) stays under half of the /futures/data budget.
+const DefaultLSRatioSpread = 30 * time.Minute
 
 func (c Config) withDefaults() Config {
 	c.Live = c.Live.withDefaults()
 	c.Hist = c.Hist.withDefaults()
+	if c.LSRatio.Spread <= 0 {
+		c.LSRatio.Spread = DefaultLSRatioSpread
+	}
+	c.LSRatio = c.LSRatio.withDefaults()
 	if c.Table == "" {
 		c.Table = DefaultTable
+	}
+	if c.LSRatioTable == "" {
+		c.LSRatioTable = DefaultLSTable
 	}
 	if c.DataRPS <= 0 {
 		c.DataRPS = 2
@@ -72,6 +91,23 @@ func (c Config) Validate() error {
 	case c.Hist.MaxBackfill > 30*24*time.Hour:
 		return fmt.Errorf("open_interest.hist_max_backfill (%v) exceeds the ~30 days Binance keeps", c.Hist.MaxBackfill)
 	}
+	return c.LSRatio.validate("open_interest.ls_ratio.")
+}
+
+// validate checks a hist-style schedule; prefix names its YAML section.
+func (h HistConfig) validate(prefix string) error {
+	switch {
+	case h.Offset >= h.Interval:
+		return fmt.Errorf("%sreconcile_offset (%v) must be shorter than %sreconcile_interval (%v)", prefix, h.Offset, prefix, h.Interval)
+	case h.Spread > h.Interval:
+		return fmt.Errorf("%sreconcile_spread (%v) must not exceed %sreconcile_interval (%v)", prefix, h.Spread, prefix, h.Interval)
+	case h.MaxLimit > 500:
+		return fmt.Errorf("%smax_limit (%d) exceeds Binance's documented maximum of 500", prefix, h.MaxLimit)
+	case h.ColdStartWindow > h.MaxBackfill:
+		return fmt.Errorf("%scold_start_window (%v) must not exceed %smax_backfill (%v)", prefix, h.ColdStartWindow, prefix, h.MaxBackfill)
+	case h.MaxBackfill > 30*24*time.Hour:
+		return fmt.Errorf("%smax_backfill (%v) exceeds the ~30 days Binance keeps", prefix, h.MaxBackfill)
+	}
 	return nil
 }
 
@@ -82,6 +118,11 @@ type Deps struct {
 	History   HistSource
 	Store     Store
 	Sink      RowSink
+
+	// long/short ratios (needed when LSRatioEnabled)
+	Ratios  RatioHistSource
+	LSStore Store
+	LSSink  LSRowSink
 
 	Metrics *metrics
 	Logger  *slog.Logger
@@ -99,6 +140,7 @@ type Syncer struct {
 	log  *slog.Logger
 	live *Live
 	hist *Reconciler
+	ls   *LSReconciler
 	dep  Deps
 
 	mu      sync.Mutex
@@ -114,8 +156,14 @@ func New(cfg Config, d Deps) (*Syncer, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	if d.Symbols == nil || d.Sink == nil {
-		return nil, errors.New("openinterest: Symbols and Sink are required")
+	if d.Symbols == nil {
+		return nil, errors.New("openinterest: Symbols is required")
+	}
+	if cfg.oiEnabled() && d.Sink == nil {
+		return nil, errors.New("openinterest: Sink is required")
+	}
+	if cfg.LSRatioEnabled && (d.Ratios == nil || d.LSStore == nil || d.LSSink == nil) {
+		return nil, errors.New("openinterest: long/short ratios are enabled but no RatioHistSource, LSStore or LSSink was given")
 	}
 	if cfg.LiveEnabled && d.Snapshots == nil {
 		return nil, errors.New("openinterest: live is enabled but no SnapshotSource was given")
@@ -137,12 +185,16 @@ func New(cfg Config, d Deps) (*Syncer, error) {
 	if cfg.HistEnabled {
 		s.hist = NewReconciler(cfg.Hist, d.History, d.Store, d.Sink, d.Symbols, cache, d.Metrics, d.Logger)
 	}
+	if cfg.LSRatioEnabled {
+		s.ls = NewLSReconciler(cfg.LSRatio, d.Ratios, d.LSStore, d.LSSink, d.Symbols, d.Metrics, d.Logger)
+	}
 	return s, nil
 }
 
 // Build assembles a Syncer with the production collaborators: the ClickHouse
-// writer and store, the REST client (live via the shared /fapi weight gate, hist
-// via its own /futures/data pool). It returns (nil, nil) when nothing is enabled.
+// writers and stores, the REST client (live via the shared /fapi weight gate, hist
+// and the long/short ratios via ONE /futures/data pool, since Binance counts that
+// budget per IP). It returns (nil, nil) when nothing is enabled.
 func Build(cfg Config, ch CHConfig, baseURL string, gate *weightgate.Gate, symbols func() []string, reg prometheus.Registerer, log *slog.Logger) (*Syncer, error) {
 	cfg = cfg.withDefaults()
 	if !cfg.Enabled() {
@@ -151,26 +203,50 @@ func Build(cfg Config, ch CHConfig, baseURL string, gate *weightgate.Gate, symbo
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	ch.Table = cfg.Table
 	m := newMetrics(reg)
-	flusher, err := NewCHFlusher(ch)
-	if err != nil {
-		return nil, err
-	}
-	store, err := NewCHStore(ch)
-	if err != nil {
-		return nil, err
-	}
-	writer := NewWriter(cfg.Writer, flusher, log, m)
 	pool := NewDataPool(DataPoolConfig{RPS: cfg.DataRPS, WindowCap: cfg.DataWindowCap, Metrics: m, Logger: log})
 	client := NewClient(ClientConfig{BaseURL: baseURL, Gate: gate, Pool: pool, Metrics: m, Logger: log})
-	s, err := New(cfg, Deps{
-		Symbols: symbols, Snapshots: client, History: client, Store: store, Sink: writer,
-		Metrics: m, Logger: log, Closers: []io.Closer{writer, store},
-	})
+	d := Deps{Symbols: symbols, Metrics: m, Logger: log}
+	closeAll := func() {
+		for _, c := range d.Closers {
+			_ = c.Close()
+		}
+	}
+	if cfg.oiEnabled() {
+		oiCH := ch
+		oiCH.Table = cfg.Table
+		flusher, err := NewCHFlusher(oiCH)
+		if err != nil {
+			return nil, err
+		}
+		store, err := NewCHStore(oiCH)
+		if err != nil {
+			return nil, err
+		}
+		writer := NewWriter(cfg.Writer, flusher, log, m)
+		d.Snapshots, d.History, d.Store, d.Sink = client, client, store, writer
+		d.Closers = append(d.Closers, writer, store) // writer first: its queue drains before the store goes
+	}
+	if cfg.LSRatioEnabled {
+		lsCH := ch
+		lsCH.Table = cfg.LSRatioTable
+		flusher, err := NewLSFlusher(lsCH)
+		if err != nil {
+			closeAll()
+			return nil, err
+		}
+		store, err := NewCHStore(lsCH)
+		if err != nil {
+			closeAll()
+			return nil, err
+		}
+		writer := newLSWriter(cfg.Writer, flusher, log, m)
+		d.Ratios, d.LSStore, d.LSSink = client, store, writer
+		d.Closers = append(d.Closers, io.Closer(writer), store)
+	}
+	s, err := New(cfg, d)
 	if err != nil {
-		_ = writer.Close()
-		_ = store.Close()
+		closeAll()
 		return nil, err
 	}
 	return s, nil
@@ -200,7 +276,11 @@ func (s *Syncer) Start(ctx context.Context) error {
 		s.wg.Add(1)
 		go func() { defer s.wg.Done(); s.hist.Run(ctx) }()
 	}
-	s.log.Info("open-interest sync started", "live", s.live != nil, "hist", s.hist != nil)
+	if s.ls != nil {
+		s.wg.Add(1)
+		go func() { defer s.wg.Done(); s.ls.Run(ctx) }()
+	}
+	s.log.Info("open-interest sync started", "live", s.live != nil, "hist", s.hist != nil, "ls_ratio", s.ls != nil)
 	return nil
 }
 

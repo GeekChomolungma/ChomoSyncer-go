@@ -17,6 +17,13 @@ import (
 // when the test ends. Skips the test unless CHOMO_TEST_CH_ADDR is set.
 func scratchDB(t *testing.T) (admin clickhouse.Conn, db string, cfg CHConfig) {
 	t.Helper()
+	return scratchDBFrom(t, "004_fapi_oi.sql", "fapi_oi_5m")
+}
+
+// scratchDBFrom is scratchDB for any DDL file of deploy/clickhouse; cfg.Table is
+// <scratch db>.<table>.
+func scratchDBFrom(t *testing.T, ddlFile, table string) (admin clickhouse.Conn, db string, cfg CHConfig) {
+	t.Helper()
 	addr := os.Getenv("CHOMO_TEST_CH_ADDR")
 	if addr == "" {
 		t.Skip("set CHOMO_TEST_CH_ADDR to run the ClickHouse integration tests")
@@ -37,7 +44,7 @@ func scratchDB(t *testing.T) (admin clickhouse.Conn, db string, cfg CHConfig) {
 	t.Cleanup(func() { _ = admin.Close() })
 	t.Cleanup(func() { _ = admin.Exec(ctx, "DROP DATABASE IF EXISTS "+db) })
 
-	ddl, err := os.ReadFile("../../deploy/clickhouse/004_fapi_oi.sql")
+	ddl, err := os.ReadFile("../../deploy/clickhouse/" + ddlFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,10 +60,10 @@ func scratchDB(t *testing.T) (admin clickhouse.Conn, db string, cfg CHConfig) {
 			continue
 		}
 		if err := admin.Exec(ctx, stmt); err != nil {
-			t.Fatalf("applying 004: %v\n%s", err, stmt)
+			t.Fatalf("applying %s: %v\n%s", ddlFile, err, stmt)
 		}
 	}
-	return admin, db, CHConfig{Addrs: []string{addr}, Database: db, Username: user, Password: pass, Table: db + ".fapi_oi_5m"}
+	return admin, db, CHConfig{Addrs: []string{addr}, Database: db, Username: user, Password: pass, Table: db + "." + table}
 }
 
 // Integration test against a real ClickHouse (see scratchDB); nothing in the real
@@ -143,5 +150,63 @@ func TestIntegrationClickHouse(t *testing.T) {
 	}
 	if lo := got["LIVEONLY"]; !lo.Hist.IsZero() || !lo.Any.Equal(bar) {
 		t.Fatalf("LIVEONLY LastStarts = %+v, want Hist zero, Any=%v", lo, bar)
+	}
+}
+
+// TestIntegrationLSRatioClickHouse: NULL cells survive the round trip, archive (3)
+// wins over hist (2) whatever the insert order, LastStarts works on the ratio table.
+func TestIntegrationLSRatioClickHouse(t *testing.T) {
+	admin, db, cfg := scratchDBFrom(t, "007_fapi_ls_ratio.sql", "fapi_ls_ratio_5m")
+	ctx := context.Background()
+	fl, err := NewLSFlusher(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fl.Close()
+	store, err := NewCHStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	bar := ts("2026-09-21 12:00:00.000")
+	archive := newLSRow("AAA", bar, RankArchive)
+	archive.Ratios = [numRatios]float64{1.25, 2.5, 3.75}
+	hist := newLSRow("AAA", bar, RankHist)
+	hist.Ratios[RatioTopAccount] = 9 // the other two stay NULL
+	holed := newLSRow("BBB", bar.Add(BarInterval), RankHist)
+	holed.Ratios[RatioGlobalAccount] = 0.5
+	for _, batch := range [][]LSRow{{archive}, {hist, holed}} {
+		if err := fl.Flush(ctx, batch); err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+	}
+
+	var c1, c2, c3 *float64
+	var rank uint8
+	var start, snap time.Time
+	q := fmt.Sprintf("SELECT start_time, snap_time, count_toptrader_long_short_ratio, sum_toptrader_long_short_ratio, count_long_short_ratio, src_rank FROM %s.fapi_ls_ratio_5m FINAL WHERE symbol = ?", db)
+	if err := admin.QueryRow(ctx, q, "AAA").Scan(&start, &snap, &c1, &c2, &c3, &rank); err != nil {
+		t.Fatal(err)
+	}
+	if rank != RankArchive || c1 == nil || *c1 != 1.25 || *c2 != 2.5 || *c3 != 3.75 || !start.Equal(bar) || !snap.Equal(bar.Add(BarInterval)) {
+		t.Fatalf("AAA FINAL row: rank=%d start=%v snap=%v; the archive row must win over the later hist insert", rank, start, snap)
+	}
+	if err := admin.QueryRow(ctx, q, "BBB").Scan(&start, &snap, &c1, &c2, &c3, &rank); err != nil {
+		t.Fatal(err)
+	}
+	if c1 != nil || c2 != nil || c3 == nil || *c3 != 0.5 {
+		t.Fatalf("BBB: NULL cells must stay NULL: %v %v %v", c1, c2, c3)
+	}
+
+	got, err := store.LastStarts(ctx, []string{"AAA", "BBB", "NONE"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got["AAA"].Hist.Equal(bar) || !got["BBB"].Hist.Equal(bar.Add(BarInterval)) {
+		t.Fatalf("LastStarts = %+v", got)
+	}
+	if _, ok := got["NONE"]; ok {
+		t.Fatal("a symbol without rows must be absent")
 	}
 }

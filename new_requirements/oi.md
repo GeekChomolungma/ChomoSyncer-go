@@ -78,7 +78,7 @@
 
 归档 CSV 的 8 列：`create_time`、`symbol` 是键，其余 6 列是指标。**6 个指标来自 5 个不同的端点加本地 K 线，不存在一个能一次返回全部指标的接口**（`/fapi/v1` 下没有多空比或 taker 比的同名接口，连接器路径清单与线上探测均确认 **[实测]**）。
 
-**时间戳列的含义（关键）：** REST `timestamp` 与归档 `create_time` 是**同一个数轴**（BTCUSDT 一天 288 个点 288/288 命中 **[实测]**）。但“标签”对不同列含义不同：
+**时间戳列的含义（关键）：** ~~REST `timestamp` 与归档 `create_time` 是同一个数轴~~ **更正（2026-10-09 实测，见 §3.7）：** 归档 `create_time` 的含义在 **2024-03-04** 变过一次；此后（含当前）归档 `create_time = T` 的值等于 REST 标签 `T+5m` 的值（OI 与三个多空比都是 288/288），即两者差一格。但“标签”对不同列含义不同：
 
 - **快照类（OI、三个多空比）：标签 = 快照时刻**，即前一个 5 分钟窗口的**结束**（连接器源码注释 “End time of the period”）。
 - **流量类（taker 比）：标签 = 窗口 `[t, t+5m)` 的开始**（连接器注释 “Start time of the period”；与本地 K 线推导值对比，按“开盘”对齐平均相对误差 0.23%，平移一格则约 70% **[实测]**）。
@@ -140,7 +140,9 @@ start_time = T − 5m        // 与 live 的 “b − 5m” 是同一个映射�
 
 即“hist 返回项 `T` 补到数据库里 `T-5m` 这条记录”。你的分析成立：live 在 K 线 `t` 快收盘时快照，写到 `t`；hist 在同一个边界 `T = t+5m` 的快照，也必须写到 `t = T-5m`，两个来源才在同一条时间轴上。
 
-**归档的日边界要特别处理：** 归档文件 `D` 的 `create_time` 从 `D 00:00:00` 到 `D 23:55:00`，平移后对应的 `start_time` 是 `D-1 23:55` 到 `D 23:50`。所以 **`D` 这天最后一根 K 线（23:55）的 OI 来自 `D+1` 那个文件的第一行（`00:00:00`）**。导入必须把相邻两天的文件连续处理，或至少在导入完成后检查每天是否有 288 行。归档 CSV 的行顺序不保证按时间排序，导入时不依赖文件顺序。
+**归档不能一律按 `T-5m` 平移，见 §3.7：** 只有日期 ≤ 2024-03-03 的文件 `create_time` 是快照时刻；≥ 2024-03-04 的文件 `create_time` 是窗口**开始**，快照在 `create_time + 5m`，应写到 `start_time = create_time`（不平移）。下面的日边界说明只适用于旧文件。
+
+**归档的日边界要特别处理（≤ 2024-03-03 的文件）：** 归档文件 `D` 的 `create_time` 从 `D 00:00:00` 到 `D 23:55:00`，平移后对应的 `start_time` 是 `D-1 23:55` 到 `D 23:50`。所以 **`D` 这天最后一根 K 线（23:55）的 OI 来自 `D+1` 那个文件的第一行（`00:00:00`）**。导入必须把相邻两天的文件连续处理，或至少在导入完成后检查每天是否有 288 行。归档 CSV 的行顺序不保证按时间排序，导入时不依赖文件顺序。
 
 ### 3.4 为什么 hist 的标签 `T` 是“`T` 时刻的快照” [实测]
 
@@ -158,12 +160,34 @@ live 与 hist 的数值**不会完全一致**：
 - 我测到 REST hist 与归档的差异：OI 中位约 0.02%、最大 0.4%。live 与 hist 之间也应是这个量级（未单独测）。
 - 结果：**实盘看到的是 live 值，回测读到的是被 hist/归档覆盖后的值**，二者有微小差异。这是有意接受的，因为 live 快照不可重放，覆盖后的序列才是可复现的“事实”。
 
+**不在 5 分钟网格上的归档行（2026-10-10 已用 `003_fix_oi_offgrid_rows.sh` 处理）：** 部分归档文件的 `create_time` 不是整 5 分钟（14,623 行、80 个标的、2022-05 ~ 2025-12；99.9% 只晚几秒到一分钟，190 个 (标的, 日) 整天如此），原样入库后永远拼不上 K 线。规则：四舍五入到最近的整 5 分钟点；该点已有正常行则删除，多行抢同一点保留最近的一行，否则挪过去。多空比导入器按同一规则处理（另外丢弃会进位到相邻日期文件的行）。
+
 ### 3.6 边界情况
 
 - **采集器停机：** live 快照不可回补（`/fapi/v1/openInterest` 没有历史）。启动时必须先用 hist 从每个标的的 `max(start_time)` 补到现在（每页 500 根，约 41.7 小时），再启动 live。
 - **hist 只保留 30 天：** 更早的缺口只能等归档。
 - **新上市标的：** 首个 live 快照即为其第一行；hist 对账时会补出上市以来的历史。
 - **下架标的：** universe 中移除后停止采集，历史保留。
+
+### 3.7 归档 `create_time` 的含义在 2024-03-04 改变 [实测 2026-10-09]
+
+三组互相独立的证据：
+
+1. **REST 标签 `L` 就是 `L` 时刻的状态。** 三个多空比在 `L` 之后约 40 秒、`openInterestHist` 约 1 分钟就能读到标签 `L`，所以它不可能描述 `L+5m`；每 5 秒采样一次 `/fapi/v1/openInterest`，与 hist 标签 `L` 最接近的 live 样本落在 `L-4s ~ L+56s`，从未落在 `L±300s`。
+2. **近期归档 = REST 标签后移一格。** BTCUSDT 2026-10-07、ETHUSDT 2026-10-06、BTCUSDT 2026-09-15：归档 `create_time = T` 的 `sum_open_interest` 与 REST 标签 `T+5m` 288/288 完全相等（标签 `T`：0/288）；三个多空比也是 `T+5m` 才在 0.1% 内 288/288 吻合（REST 的比值由四位小数的 `longAccount/shortAccount` 算出，所以只有约 1 bp 的差异，不是逐位相等）。
+3. **用归档自己当时钟（覆盖整个历史）。** 归档的 `sum_open_interest_value / sum_open_interest` 是快照时刻的标记价格，拿它和库里 `fapi_kline_1m` 的收盘价比：
+   - 2021-03-01、2022-06-01、2023-09-01、2023-12-01、2024-03-01、**2024-03-03**：与 `create_time` 时刻收盘价的中位偏差 0.2~1.1 bp，与 `create_time + 5m` 为 4~16 bp → 快照在 `T`；
+   - **2024-03-04**、2024-06-01、2024-09-01、2024-12-01、2025-06-01、2026-09-15、2026-10-07：与 `create_time + 5m` 的中位偏差 0.0~1.0 bp，与 `create_time` 为 5~12 bp → 快照在 `T+5m`。
+   - 二分到天：BTCUSDT / ETHUSDT / DOGEUSDT 都是 2024-03-03 为旧含义、2024-03-04 为新含义，切换在日边界上，一天之内不混用。切换处正好缺一根（快照 `2024-03-04 00:00` 两个文件都没有）。
+
+**结论（导入规则）：**
+
+| 归档文件日期 | 快照时刻 | `start_time` | `snap_time` |
+|---|---|---|---|
+| ≤ 2024-03-03 | `create_time` | `create_time − 5m` | `create_time` |
+| ≥ 2024-03-04 | `create_time + 5m` | `create_time` | `create_time + 5m` |
+
+**对已有 `fapi_oi_5m` 的影响（2026-10-09 已用 `deploy/clickhouse-fixes/002_fix_oi_archive_shift.sh` 修复：95,993,114 行整体 +5m，备份在 `market.fapi_oi_5m_bak_fix002`，2024-03 起的汇总表已重折，校验通过）：** 当初的 OI 归档导入一律用了 `create_time − 5m`，所以 **2024-03-04 ~ 2026-09-20 的 `src_rank = 3` 行整体早了 5 分钟**：`start_time = t` 的行装的是 `t + 10m` 的 OI，相对 K 线有 5 分钟前视。库里的直接证据：BTCUSDT 2026-09-15 的归档行在 `start_time = s` 处的值等于 REST 标签 `s + 10m`（289/289），而 hist 行写在 `s + 5m`。2024-03-03 及以前的归档行是对的，2026-09-21 起的 live/hist 行是对的。修复方式：把这段 rank-3 行整体改到 `start_time + 5m`（重新导入或 `INSERT … SELECT` 平移后删除旧行），再按月重折 006。
 
 ---
 
@@ -314,7 +338,7 @@ open_interest:
 ### 5.6 冷启动（归档导入器）
 
 - 一个独立命令（第一版可以放在 `deploy/clickhouse/` 下，风格与 `import_fapi_kline.py` 一致；放 `cmd/` 下的 Go 子命令也可以）。
-- 对每个标的每天下载 `SYMBOL-metrics-YYYY-MM-DD.zip`，校验 `.CHECKSUM`，只取 `sum_open_interest` 一列；`start_time = create_time − 5 分钟`，`snap_time = create_time`，`src_rank = 3`。
+- 对每个标的每天下载 `SYMBOL-metrics-YYYY-MM-DD.zip`，校验 `.CHECKSUM`，只取 `sum_open_interest` 一列；`src_rank = 3`。**平移规则按文件日期区分（§3.7）**：≤ 2024-03-03 为 `start_time = create_time − 5m`、`snap_time = create_time`；≥ 2024-03-04 为 `start_time = create_time`、`snap_time = create_time + 5m`。（当初的 OI 导入一律用了前者，见 §3.7 的“影响”。）
 - **`create_time` 必须按 UTC 解析**：`input()` 里写 `DateTime('UTC')`（写 `DateTime` 会按服务器时区解析，服务器是 `Asia/Shanghai` 时整体偏 8 小时 **[实测]**）。
 - 相邻两天的文件要连续处理（§3.3 的日边界）；导入完成后检查每个 `(symbol, 日)` 是否有 288 行（新上市、下架的标的除外）。
 - 记录已完成的 `(symbol, date)`，支持断点续传。
@@ -379,3 +403,69 @@ SELECT symbol, max(start_time), maxIf(start_time, src_rank >= 2) FROM market.fap
 测试：`internal/openinterest` 下的单元测试全部用假时钟与一个**忠实模拟真实接口语义**的假 API（返回区间内最新的 `limit` 根）；另有两个默认跳过的测试：`TestIntegrationClickHouse`（真实 ClickHouse 的临时库：时间无偏移、hist 覆盖 live、`LastStarts` 语义）与 `TestE2ERealBinance`（真实币安：冷启动、二次运行、重启、3 小时停机、一轮真实 live、被 hist 校准）。
 
 **上线顺序：** 执行 004 → 只开 `hist_enabled` 跑一天 → 看指标（`oi_hist_pass_seconds`、`oi_cross_section_complete_ratio`、`oi_data_window_used`、`weightgate_used_weight_1m`）→ 再开 `live_enabled`。
+
+---
+
+## 7. 多空比：`market.fapi_ls_ratio_5m`（已实现）
+
+### 7.1 范围与接口
+
+| 列 | 接口（`/futures/data/`，字段 `longShortRatio`） | 归档列 |
+|---|---|---|
+| `count_toptrader_long_short_ratio` | `topLongShortAccountRatio` | 同名 |
+| `sum_toptrader_long_short_ratio` | `topLongShortPositionRatio` | 同名 |
+| `count_long_short_ratio` | `globalLongShortAccountRatio` | 同名 |
+
+三个接口的参数、分页语义（返回区间内最新 `limit` 根）、30 天保留与 `openInterestHist` 相同；无效标的返回 200 加空数组。没有 `/fapi/v1` 实时版本，所以只有 hist（`src_rank = 2`）与归档（`3`）两个来源。
+
+**为什么另起一张表：** `fapi_oi_5m` 的 live/hist 双来源逻辑已经足够复杂；比率没有 live，时间语义同为快照类，单独成表后 OI 的代码与状态完全不受影响。
+
+### 7.2 对齐
+
+与 OI 相同（§3.7）：REST 标签 `L` → `start_time = L − 5m`；归档按文件日期分两种规则。实测（BTCUSDT/ETHUSDT 2026-10-07，经生产代码写入后在库里比对）：按此规则 hist 行与归档行在同一 `start_time` 上的中位差 0.16~1.2 bp、p99 < 3 bp；错一格则中位约 9 bp、p99 130~235 bp。
+
+**归档的源头缺口（2026-10-09 导入实测，REST 只保留 30 天，无法补）：**
+
+- 2021-12 底到 2022-01：归档文件里三个比率列全是空字符串（例：`BTCUSDT-metrics-2022-01-15.csv`），这些行不导入；2022-01 的覆盖只有 OI 的 41%，2021-12 为 95%，其余每个月与 OI 相差不到 1%。
+- 2022 年：86% 的行没有两个大户比率（`count_toptrader_*`、`sum_toptrader_*` 为 NULL），只有全网账户比；其他年份这两列 NULL 都低于 0.1%。
+- 导入合计：445,260 个文件、1.274 亿行；130 个 (标的, 日) 文件不存在（404）。
+
+### 7.3 写入规则
+
+- `ReplacingMergeTree(src_rank)` 整行替换，所以一行必须同时带上三列：每个标的先把三个接口都拉完（各自往回翻页），按标签合并，再写入；任一接口失败则整个标的本轮不写（轮末重试一次，仍失败则状态不前进）。
+- 三个接口发布同一标签的时刻不同（`globalLongShortAccountRatio` 通常最早），所以只写到**所有非空接口都已返回的最新标签**为止；否则先写入的行会永久缺列。
+- 某接口在中间确实缺一根时，该列写 NULL（`ls_ratio_null_cells_total{column}`）。
+- 某接口对整个窗口返回空、而其他接口有数据时，该标的本轮**不写**、状态不前进，下一轮再取（`ls_ratio_hist_partial_total`）：实测抽样 40 个标的三个接口都有数据，所以这只会是暂时的发布延迟或故障，此时写入会让该列永久为 NULL。三个接口都为空（刚上市）不算失败。
+
+### 7.4 限速预算（528 个标的）
+
+| 场景 | 请求数 | 说明 |
+|---|---|---|
+| 每小时增量 | 528 × 3 = 1584 次，`reconcile_spread` 30 分钟内匀速发出 ≈ 0.9 次/秒 | 加上 OI 的 528 次/20 分钟 ≈ 0.45 次/秒，重叠时峰值约 400 次/5 分钟（窗口上限 900，官方 1000） |
+| 启动全量 | 1584 + OI 528 = 2112 次，按 `data_rps = 2` 约 18 分钟 | 两个模块**共用一个 `DataPool`**（同一 IP 同一额度），2 次/秒 = 600 次/5 分钟 |
+| 7 天缺口 | 每接口 5 页，约 7900 次，约 66 分钟 | 更长的缺口用归档 |
+
+`DataPool` 由 `Build` 创建一次，同时交给 OI hist 和多空比；429/418 会暂停这个池，两边一起停。
+
+### 7.5 代码
+
+在 `internal/openinterest` 包内（共用 REST 客户端、`DataPool`、ClickHouse 自动重连连接、批量写入器、`planJobs`/`runHistJobs` 调度），业务逻辑独立成文件：
+
+| 文件 | 内容 |
+|---|---|
+| `lsratio.go` | `RatioKind`、`Client.RatioHistory`、`LSRow`（NaN = NULL）、`LSFlusher`、`LSWriter` |
+| `lsratio_hist.go` | `LSReconciler`：`LoadState`（读库失败无限重试）→ 启动全量 → 每小时 `hh:offset` 增量 |
+| `writer.go` | 批量写入器改为泛型 `batchWriter[R]`，`Writer` / `Flusher` / `NewWriter` 保持原样（类型别名） |
+| `hist.go` | 抽出 `planJobs`、`runHistJobs`，OI 与多空比共用 |
+
+指标：`ls_ratio_hist_requests_total{endpoint,result}`、`ls_ratio_hist_rows_total`、`ls_ratio_null_cells_total{column}`、`ls_ratio_hist_partial_total`、`ls_ratio_hist_symbols_total{outcome}`、`ls_ratio_hist_pass_seconds`、`ls_ratio_hist_last_pass_timestamp_seconds`、`ls_ratio_hist_gap_beyond_cap_total`、`ls_ratio_cross_section_complete_ratio`、`ls_ratio_rows_written_total` 与 `ls_ratio_writer_*`；HTTP 与池的指标沿用 `oi_http_requests_total{endpoint}`、`oi_rate_limited_total{pool}`、`oi_data_window_used`。
+
+配置：`open_interest.ls_ratio`（默认关，与 `hist_enabled` / `live_enabled` 独立）。
+
+### 7.6 部署顺序
+
+1. `007_fapi_ls_ratio.sql` 建表。
+2. 归档导入：`python3 cmd/test-tools/import_ls_ratio_archive.py --until <最新已发布日期> --apply`（默认按 `fapi_oi_5m` 里每个标的有数据的日子取文件，断点续传）。
+3. `008_ls_ratio_rollups.sql`，然后 `./rollup_ls_ratio_per_month.sh --password …`（009）。
+4. `open_interest.ls_ratio.enabled: true`，重启服务：启动那一轮全量从每个标的最新一行补到当前（最远 `max_backfill`），归档之后的缺口由它补齐。
+

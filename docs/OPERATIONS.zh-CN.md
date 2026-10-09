@@ -339,6 +339,33 @@ curl -s http://localhost:9090/metrics | grep -E '^(oi_|weightgate_)'
 
 所有 `/fapi` REST 调用方（K 线缺口回补、universe 刷新、OI live）共用一个闸门，把每 IP 每分钟 2400 权重拆成各类预算（live 600 / bulk 1200 / misc 100，YAML 里的 `weight_gate.*`），并依据币安自己返回的 `X-MBX-USED-WEIGHT-1M` 退让。正常情况下不需要调；如果 `weightgate_backpressure_waits_total{class="live"}` 一直在涨，说明同一个 IP 上有别的东西在消耗权重。`/futures/data` 是另一个池，不归它管。
 
+### 3.5 多空比同步（可选）
+
+三个币安多空比（`topLongShortAccountRatio`、`topLongShortPositionRatio`、`globalLongShortAccountRatio`）写入 `market.fapi_ls_ratio_5m`。默认关闭，与 OI 的两个开关相互独立。设计、对齐与额度：[`../new_requirements/oi.md`](../new_requirements/oi.md) §3.7、§7；消费方视角：[`DATA_CONSUMER_GUIDE.zh-CN.md`](DATA_CONSUMER_GUIDE.zh-CN.md) §1c。
+
+- **没有实时部分。** 启动时一轮全量（每个标的、每个接口至少一整页，约 41 小时；更长的缺口往回翻页，最远到 `max_backfill`），之后每小时 `hh:05` 增量一次，3 × 528 个请求在 `reconcile_spread`（30 分钟）内匀速发出。
+- **与 OI hist 共用同一个 `/futures/data` 池**（同一个计数器，429/418 时一起暂停），因为币安按 IP 计这份额度。两边每小时一轮重叠时峰值约 400 次 / 5 分钟，上限 900。
+
+```bash
+# 1. 建表（模块不会自动建）。
+clickhouse-client --password "<pw>" --queries-file deploy/clickhouse/007_fapi_ls_ratio.sql
+
+# 2. 从 data.binance.vision 导入历史（src_rank 3）。按 fapi_oi_5m 里每个 (标的, 日) 取文件；可断点续传
+#    （logs/ls_ratio_archive_done.txt）；约 45 个文件/秒。--until = 最新已发布的日期（前一天的文件在次日内发布）。
+python3 cmd/test-tools/import_ls_ratio_archive.py --until 2026-10-07              # 试运行：只计数
+python3 cmd/test-tools/import_ls_ratio_archive.py --until 2026-10-07 --apply
+
+# 3. 汇总表，然后按月折叠历史（幂等）。
+clickhouse-client --password "<pw>" --queries-file deploy/clickhouse/008_ls_ratio_rollups.sql
+./rollup_ls_ratio_per_month.sh --password "<pw>"
+
+# 4. 持续更新：open_interest.ls_ratio.enabled: true，重启。启动那一轮全量也会补齐归档最新一天到当前之间的数据（最远 max_backfill）。
+#    预期日志："loaded long/short ratio state from ClickHouse" -> "long/short ratio pass" reason=startup
+#              -> 每小时 "long/short ratio pass" reason=scheduled
+```
+
+关注：`ls_ratio_cross_section_complete_ratio`（启动全量后约为 1；每小时增量后按设计偏低，实测 0.17，因为请求铺开在 30 分钟里，期间目标 bar 在前移；`oi_cross_section_complete_ratio` 同理）、`ls_ratio_hist_symbols_total{outcome="failed"}`、`ls_ratio_null_cells_total`、`oi_data_window_used`（共用的池，须低于 900）、`oi_rate_limited_total{pool="data"}`。
+
 ---
 
 ## 4. 探针与就绪检查

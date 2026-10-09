@@ -9,6 +9,8 @@
 | 脚本 | 修复什么 | 触发条件 |
 |---|---|---|
 | [`001_fix_kline_rollup_lookback.sh`](001_fix_kline_rollup_lookback.sh) | `fapi_kline_{5m,15m,1h,4h,1d}` 里落在 MV 回看窗口之外的行只包含桶的一部分数据（例如某小时的成交量等于该小时最后一根 1m 的成交量） | 曾使用过旧版 002（`WHERE start_time >= now() - INTERVAL N DAY`，下界没有对齐到桶边界）。**不带参数 `apply` = 删除全部 5m+ 衍生表和 MV 后，从 1m 完全重建整个历史** |
+| [`002_fix_oi_archive_shift.sh`](002_fix_oi_archive_shift.sh) | `fapi_oi_5m` 中日期为 2024-03-04 及以后的归档文件导入的行（`src_rank = 3`）早了 5 分钟（5 分钟前视），以及由它们折叠出的 OI 汇总表 | OI 归档导入时对所有文件都用了 `start_time = create_time − 5m`（币安在 2024-03-04 改变了 `create_time` 的含义，见 `new_requirements/oi.md` §3.7）。先备份，再整体 +5m，然后从 2024-03 起重新折叠 006。执行前先停 chomosyncer-go |
+| [`003_fix_oi_offgrid_rows.sh`](003_fix_oi_offgrid_rows.sh) | `fapi_oi_5m` 中 `start_time` 不在 5 分钟整点上的归档行（币安给部分快照盖的时间戳晚了几秒），这些行永远拼不上 K 线 | 每行挪到最近的整 5 分钟点；若该点已有正常行、或有离得更近的偏离行，则删除；重折涉及的月份。2026-10-10 已执行：挪动 14,586 行，删除 37 行 |
 
 公共的连接配置与函数在 [`lib.sh`](lib.sh)。
 

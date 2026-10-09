@@ -37,6 +37,7 @@
 | `run_all_checks.py` | **[阶段 C] 一键全量预检调度器**：一键执行所有检查项，输出可视化红绿灯健康计分卡 (Scorecard) |
 | `check_oi_consistency.py` | **[阶段 D] 持仓量一致性检查器**：只读检查 `market.fapi_oi_5m`——缺口、5 分钟网格、`snap_time` 语义、新鲜度、hist 校准情况、与 K 线表的覆盖率、逐根截面完整度，以及（可选）与币安逐值对账 |
 | `backfill_missing_oi.py` | **[修复] 缺失 5m 持仓量（OI）bar 回填**：读取 `check_oi_consistency.py --gaps-csv` 生成的 CSV，从币安 `openInterestHist` 拉这些 bar（接口只保留最近约 30 天）并以 `src_rank = 2` 写入 `market.fapi_oi_5m`。不带 `--apply` 只演练 |
+| `import_ls_ratio_archive.py` | **[导入] 从币安归档导入多空比历史**：对 `market.fapi_oi_5m` 中出现的每个 (标的, 日) 下载 `data.binance.vision` 的每日 metrics 文件，把三个多空比列写入 `market.fapi_ls_ratio_5m`（`src_rank = 3`），按 `new_requirements/oi.md` §3.7 的日期规则对齐（2024-03-03 及以前的文件：`create_time − 5m`；2024-03-04 起：`create_time`）。可用 `--state-file` 断点续传；不加 `--apply` 只试运行 |
 | `common.py` | 基础公用库：配置文件加载、ClickHouse/Redis 客户端、交易标的探测、时间工具、表格格式化等。本身不是一项检查。 |
 | `test_toolkit.py` | 工具包内置单元测试与 Mock 验证套件（`python -m pytest cmd/test-tools/test_toolkit.py`，或直接运行） |
 | `requirements.txt` | Python 依赖包清单 |

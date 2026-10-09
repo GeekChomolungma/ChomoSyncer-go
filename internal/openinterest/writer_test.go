@@ -189,3 +189,23 @@ func TestWriterPushHonoursContextWhenQueueFull(t *testing.T) {
 		t.Fatalf("err = %v, want DeadlineExceeded once the queue is full", err)
 	}
 }
+
+// A batch dropped by a background (size-triggered) flush must surface at the next
+// barrier, or a hist pass would advance its state over rows that never landed.
+func TestWriterBarrierReportsBatchesDroppedInTheBackground(t *testing.T) {
+	f := &fakeFlusher{failN: 1000}
+	w, _ := newTestWriter(t, WriterConfig{BatchSize: 1, FlushInterval: time.Hour, MaxRetries: 1, RetryBackoff: time.Millisecond}, f)
+	if err := w.Push(context.Background(), row("AAA", "2026-09-21 12:00:00.000", 1, RankHist)); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 2*time.Second, func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.calls >= 2 }) // dropped after its retry
+	f.mu.Lock()
+	f.failN = 0
+	f.mu.Unlock()
+	if err := w.Flush(context.Background()); err == nil {
+		t.Fatal("the barrier must report the batch dropped before it")
+	}
+	if err := w.Flush(context.Background()); err != nil { // reported once, then cleared
+		t.Fatalf("second barrier: %v", err)
+	}
+}

@@ -16,6 +16,7 @@ Everything downstream reads from exactly two stores, written by one pipeline:
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | 1 | **ClickHouse** (`market` database) | 1m raw archive + 5m/15m/1h/4h/1d rollups | SQL tables | All intervals, full market | Full history (years) |
 | 1b | **ClickHouse** — `market.fapi_oi_5m` + rollups *(optional)* | Open interest at each 5m bar's close | SQL tables | Full market | Since the module was enabled (≤ ~30 days backfilled from Binance) |
+| 1c | **ClickHouse** — `market.fapi_ls_ratio_5m` + rollups *(optional)* | Three long/short ratios at each 5m bar's close | SQL tables | Full market | From the daily archive (since 2020-09); newest hour arrives hourly |
 | 2a | **Redis** — `livebar:{SYM}:1m` | The still-forming, unclosed current bar | Hash | 1m only | 1 bar (overwritten every update) |
 | 2b | **Redis** — `kline:{SYM}:1m` | The last 200 **closed** 1m bars | List | 1m only | 200 bars (~3h20m) |
 | 2c | **Redis** — `stream:market:kline_ready` | "a whole market cross-section just closed" notification | Stream | All intervals (see note below) | Last `stream_maxlen` events (default 10,000) |
@@ -26,6 +27,7 @@ Everything downstream reads from exactly two stores, written by one pipeline:
 - Need to know the instant the whole market's bars for a period are ready (to trigger a computation)? → **kline_ready**, then pull the actual bars from Redis (`1m`) or ClickHouse (coarser).
 - Need anything older than ~3 hours, or any interval other than `1m`? → **ClickHouse**, always.
 - Need **open interest**? → **ClickHouse `fapi_oi_5m`** (§1b), joined to `fapi_kline_5m` on `(symbol, start_time)`. Redis has no OI.
+- Need **long/short ratios**? → **ClickHouse `fapi_ls_ratio_5m`** (§1c), same join key. Updated hourly, not live.
 
 ---
 
@@ -126,6 +128,8 @@ EXISTS TABLE market.fapi_oi_5m
 
 Design and measurements behind it: [`../new_requirements/oi.md`](../new_requirements/oi.md).
 
+> ✅ **Fixed on 2026-10-09 (`deploy/clickhouse-fixes/002_fix_oi_archive_shift.sh`) — archive OI 2024-03-04 … 2026-09-20 used to be 5 minutes early.** If you cached data from that range before 2026-10-09, re-read it. Binance changed the meaning of the archive's `create_time` on 2024-03-04, and the one-off OI archive import did not account for it: in that range the `src_rank = 3` row at `start_time = t` holds the OI at `t + 10m` (5 minutes of lookahead against the kline). Rows up to 2024-03-03 and from 2026-09-21 on are correct. See `new_requirements/oi.md` §3.7.
+
 ### Tables
 
 | Table | Bucket |
@@ -214,6 +218,46 @@ ORDER BY start_time DESC LIMIT 24
 
 - **History starts when the module was enabled.** At its first start the producer backfills what the database lacks from Binance (48 hours by default, at most 7 days); Binance keeps only ~30 days. Anything older needs the archive import, which is not part of the module yet.
 - Validate before relying on it: [`../cmd/test-tools/check_oi_consistency.py`](../cmd/test-tools/README.md) checks gaps, the 5-minute grid, `snap_time`, freshness, hist calibration, coverage against `fapi_kline_5m`, and (with `--vs-binance`) value-for-value against Binance.
+
+---
+
+## 1c. ClickHouse — long/short ratios (`fapi_ls_ratio_*`)
+
+Three Binance long/short ratios per symbol and 5m bar. **Optional data**: it exists when `deploy/clickhouse/007`–`009` have been applied; the producer keeps it current with `open_interest.ls_ratio.enabled`. Check first: `EXISTS TABLE market.fapi_ls_ratio_5m`. Design and measurements: [`../new_requirements/oi.md`](../new_requirements/oi.md) §3.7 and §7.
+
+| Table | Bucket |
+| :--- | :--- |
+| `market.fapi_ls_ratio_5m` | 5 minutes — the raw table |
+| `market.fapi_ls_ratio_15m`, `_1h`, `_4h`, `_1d` | rollups, recomputed from the 5m table |
+
+`market.fapi_ls_ratio_5m` columns:
+
+| Column | Type | Meaning |
+| :--- | :--- | :--- |
+| `symbol`, `start_time` | | Same meaning and join key as `fapi_kline_5m` / `fapi_oi_5m`. |
+| `count_toptrader_long_short_ratio` | `Nullable(Float64)` | Top traders, by **account count**: long accounts / short accounts (`topLongShortAccountRatio`). |
+| `sum_toptrader_long_short_ratio` | `Nullable(Float64)` | Top traders, by **position size**: long / short (`topLongShortPositionRatio`). |
+| `count_long_short_ratio` | `Nullable(Float64)` | **All** accounts, by count: long / short (`globalLongShortAccountRatio`). |
+| `snap_time` | `DateTime64(3, 'UTC')` | The snapshot instant, always `start_time + 5m`. |
+| `src_rank` | `UInt8` | `2` Binance history (REST), `3` Binance daily archive. The archive wins on merge. |
+
+- Same timing as OI: the values are the state **at the bar's close** (`start_time + 5m`), so the row and the kline with the same `start_time` become known together — no lookahead. **Query with `FINAL`.**
+- A ratio `r` = long / short; the long share is `r / (1 + r)`.
+- **Not real-time.** Binance has no live endpoint for these ratios: the newest bars arrive with the hourly pass (at hh:05, spread over ~30 minutes), so the newest hour is usually missing. Do not expect a row for the bar that just closed.
+- A column is `NULL` where Binance had no value for that bar (rare). History comes from the daily archive (back to 2020-09 for the oldest symbols); REST values are rounded by Binance to ~4 significant digits (≈1 bp from the archive's).
+- **Source gaps in Binance's archive** (cannot be refilled): late 2021-12 to 2022-01 has no ratios at all (2022-01 is only 41% covered), and during 2022 the two top-trader columns are NULL in 86% of rows. Other years: under 0.1% NULL.
+- Rollups `fapi_ls_ratio_{15m,1h,4h,1d}`: `samples` (3 / 12 / 48 / 288 when complete), and per ratio `<column>_close` (at the bucket's close), `<column>_high`, `<column>_low`.
+
+```sql
+SELECT k.start_time, k.close, o.sum_open_interest,
+       r.count_toptrader_long_short_ratio, r.sum_toptrader_long_short_ratio, r.count_long_short_ratio
+FROM market.fapi_kline_5m AS k FINAL
+LEFT JOIN market.fapi_oi_5m AS o FINAL ON o.symbol = k.symbol AND o.start_time = k.start_time
+LEFT JOIN market.fapi_ls_ratio_5m AS r FINAL ON r.symbol = k.symbol AND r.start_time = k.start_time
+WHERE k.symbol = 'BTCUSDT' AND k.start_time >= now() - INTERVAL 1 DAY
+ORDER BY k.start_time
+SETTINGS join_use_nulls = 1
+```
 
 ---
 

@@ -352,6 +352,35 @@ Set both switches to `false` and restart. **Never `DROP market.fapi_oi_5m`**: it
 
 All `/fapi` REST callers (kline gap backfill, universe refresh, OI live) share one gate that splits the per-IP 2400 weight/min into budgets (live 600 / bulk 1200 / misc 100, `weight_gate.*` in YAML) and backs off from Binance's own `X-MBX-USED-WEIGHT-1M`. Normally nothing needs tuning; if `weightgate_backpressure_waits_total{class="live"}` keeps growing, something else on the same IP is consuming weight. `/futures/data` is a separate pool and is not governed by it.
 
+### 3.5 Long/Short Ratio Sync (optional)
+
+Three Binance long/short ratios (`topLongShortAccountRatio`, `topLongShortPositionRatio`, `globalLongShortAccountRatio`) into `market.fapi_ls_ratio_5m`. Off by default, independent of the two OI switches. Design, alignment and budget: [`../new_requirements/oi.md`](../new_requirements/oi.md) §3.7, §7; consumer view: [`DATA_CONSUMER_GUIDE.md`](DATA_CONSUMER_GUIDE.md) §1c.
+
+- **No live part.** At start-up one full pass (every symbol, at least one whole page of each endpoint, ~41 h; longer gaps paged back up to `max_backfill`), then an incremental pass every hour at `hh:05`, its 3 × 528 requests spread over `reconcile_spread` (30 m).
+- **Same `/futures/data` pool as OI hist** (one counter, one 429/418 pause for both), because Binance counts that budget per IP. Peak when both hourly passes overlap: ~400 requests / 5 min of the 900 cap.
+
+```bash
+# 1. Table (never auto-created).
+clickhouse-client --password "<pw>" --queries-file deploy/clickhouse/007_fapi_ls_ratio.sql
+
+# 2. History from data.binance.vision (src_rank 3). Picks every (symbol, day) fapi_oi_5m has; resumable
+#    (logs/ls_ratio_archive_done.txt); ~45 files/s. --until = newest published day (yesterday's file
+#    appears during the following day).
+python3 cmd/test-tools/import_ls_ratio_archive.py --until 2026-10-07              # dry run: count
+python3 cmd/test-tools/import_ls_ratio_archive.py --until 2026-10-07 --apply
+
+# 3. Rollups, then fold the history (month by month, idempotent).
+clickhouse-client --password "<pw>" --queries-file deploy/clickhouse/008_ls_ratio_rollups.sql
+./rollup_ls_ratio_per_month.sh --password "<pw>"
+
+# 4. Keep it current: open_interest.ls_ratio.enabled: true, restart. The start-up pass also fills the
+#    days between the newest archive file and now (up to max_backfill).
+#    Expected logs: "loaded long/short ratio state from ClickHouse" -> "long/short ratio pass" reason=startup
+#                   -> hourly "long/short ratio pass" reason=scheduled
+```
+
+Watch: `ls_ratio_cross_section_complete_ratio` (≈1 after the start-up pass; after a scheduled pass it is low by design — measured 0.17 — because the requests are spread over 30 minutes and the target moves meanwhile; `oi_cross_section_complete_ratio` behaves the same), `ls_ratio_hist_symbols_total{outcome="failed"}`, `ls_ratio_null_cells_total`, `oi_data_window_used` (shared pool, must stay < 900), `oi_rate_limited_total{pool="data"}`.
+
 ---
 
 ## 4. Probes and Readiness Checks

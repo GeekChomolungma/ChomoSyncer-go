@@ -9,6 +9,8 @@ Scripts that repair an **already deployed** ClickHouse. `../clickhouse/` answers
 | Script | Repairs | Applies when |
 |---|---|---|
 | [`001_fix_kline_rollup_lookback.sh`](001_fix_kline_rollup_lookback.sh) | `fapi_kline_{5m,15m,1h,4h,1d}` rows older than the MV lookback window that hold only a slice of their bucket (e.g. an hour's volume equal to the last 1m bar's volume) | An old 002 was ever applied (`WHERE start_time >= now() - INTERVAL N DAY`, bound not aligned to a bucket start). **`apply` with no arguments = drop every 5m+ derived table and MV, then rebuild the whole history from 1m** |
+| [`002_fix_oi_archive_shift.sh`](002_fix_oi_archive_shift.sh) | `fapi_oi_5m` archive rows (`src_rank = 3`) from files dated 2024-03-04 and later, stored 5 minutes early (5 minutes of lookahead), and the OI rollups built from them | The OI archive was imported with `start_time = create_time − 5m` for every file (Binance changed the meaning of `create_time` on 2024-03-04, `new_requirements/oi.md` §3.7). Backs the rows up, moves them +5m, re-folds 006 from 2024-03. Stop chomosyncer-go first |
+| [`003_fix_oi_offgrid_rows.sh`](003_fix_oi_offgrid_rows.sh) | `fapi_oi_5m` archive rows whose `start_time` is not a 5-minute boundary (Binance stamped some snapshots seconds late), which never join the klines | Moves each to the nearest boundary, or drops it if an on-grid row is already there / a closer off-grid row wins; re-folds the touched months. Applied 2026-10-10: 14,586 moved, 37 dropped |
 
 Shared connection settings and helpers live in [`lib.sh`](lib.sh).
 

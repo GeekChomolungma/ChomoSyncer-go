@@ -16,6 +16,7 @@
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | 1 | **ClickHouse**（`market` 库） | 1m 原始归档 + 5m/15m/1h/4h/1d rollup | SQL 表 | 全周期、全市场 | 完整历史（以年计） |
 | 1b | **ClickHouse** —— `market.fapi_oi_5m` + 汇总表 *(可选)* | 每根 5m bar 收盘时刻的持仓量 | SQL 表 | 全市场 | 从模块启用起算（从币安补回至多约 30 天） |
+| 1c | **ClickHouse** —— `market.fapi_ls_ratio_5m` + 汇总表 *(可选)* | 每根 5m bar 收盘时刻的三个多空比 | SQL 表 | 全市场 | 来自每日归档（2020-09 起）；最近一小时每小时补入 |
 | 2a | **Redis** —— `livebar:{SYM}:1m` | 还在形成中、未收盘的当前 bar | Hash | 仅 1m | 1 根（每次更新原地覆盖） |
 | 2b | **Redis** —— `kline:{SYM}:1m` | 最近 200 根**已收盘**的 1m bar | List | 仅 1m | 200 根（约 3 小时 20 分） |
 | 2c | **Redis** —— `stream:market:kline_ready` | "全市场某个截面刚收盘"的通知 | Stream | 全周期（见下方说明） | 最近 `stream_maxlen` 条（默认 10000） |
@@ -26,6 +27,7 @@
 - 要知道全市场某个周期的截面**恰好**收齐的那一刻，用来触发计算？→ **kline_ready**，拿到通知后再去 Redis（`1m`）或 ClickHouse（更粗周期）取真正的数据。
 - 要 3 小时之前的数据，或者 `1m` 以外的任何周期？→ **一律去 ClickHouse**。
 - 要**持仓量**？→ **ClickHouse 的 `fapi_oi_5m`**（§1b），按 `(symbol, start_time)` 与 `fapi_kline_5m` 拼接。Redis 里没有 OI。
+- 要**多空比**？→ **ClickHouse 的 `fapi_ls_ratio_5m`**（§1c），拼接键相同。每小时更新，不是实时。
 
 ---
 
@@ -126,6 +128,8 @@ EXISTS TABLE market.fapi_oi_5m
 
 背后的设计与实测依据见 [`../new_requirements/oi.md`](../new_requirements/oi.md)。
 
+> ✅ **已于 2026-10-09 修复（`deploy/clickhouse-fixes/002_fix_oi_archive_shift.sh`）——2024-03-04 至 2026-09-20 的归档 OI 曾经早了 5 分钟。** 如果你在 2026-10-09 之前缓存过这段数据，请重新读取。 币安在 2024-03-04 改变了归档 `create_time` 的含义，而当初一次性的 OI 归档导入没有区分：这段时间里 `src_rank = 3`、`start_time = t` 的行装的是 `t + 10m` 的持仓量（相对 K 线有 5 分钟前视）。2024-03-03 及以前、2026-09-21 及以后的行是对的。见 `new_requirements/oi.md` §3.7。
+
 ### 表
 
 | 表 | 周期 |
@@ -214,6 +218,46 @@ ORDER BY start_time DESC LIMIT 24
 
 - **历史从模块启用那一刻开始。** 首次启动时，生产者会把库里缺的部分从币安补回来（默认 48 小时，最多 7 天）；币安本身只保留约 30 天。更早的数据需要归档导入，这一块还不在模块里。
 - 依赖它之前先验证：[`../cmd/test-tools/check_oi_consistency.py`](../cmd/test-tools/README.zh-CN.md) 会检查缺口、5 分钟网格、`snap_time`、新鲜度、hist 校准、与 `fapi_kline_5m` 的覆盖率，加 `--vs-binance` 还会与币安逐值对账。
+
+---
+
+## 1c. ClickHouse —— 多空比（`fapi_ls_ratio_*`）
+
+每个币种、每根 5m bar 的三个币安多空比。**可选数据**：执行过 `deploy/clickhouse/007`–`009` 才存在；生产者以 `open_interest.ls_ratio.enabled` 保持更新。先确认：`EXISTS TABLE market.fapi_ls_ratio_5m`。设计与实测：[`../new_requirements/oi.md`](../new_requirements/oi.md) §3.7、§7。
+
+| 表 | 桶 |
+| :--- | :--- |
+| `market.fapi_ls_ratio_5m` | 5 分钟——原始表 |
+| `market.fapi_ls_ratio_15m`、`_1h`、`_4h`、`_1d` | 汇总表，由 5m 表重算 |
+
+`market.fapi_ls_ratio_5m` 的列：
+
+| 列 | 类型 | 含义 |
+| :--- | :--- | :--- |
+| `symbol`、`start_time` | | 与 `fapi_kline_5m` / `fapi_oi_5m` 含义相同，是拼接键。 |
+| `count_toptrader_long_short_ratio` | `Nullable(Float64)` | 大户**账户数**多空比：多头账户数 / 空头账户数（`topLongShortAccountRatio`）。 |
+| `sum_toptrader_long_short_ratio` | `Nullable(Float64)` | 大户**持仓量**多空比：多头持仓 / 空头持仓（`topLongShortPositionRatio`）。 |
+| `count_long_short_ratio` | `Nullable(Float64)` | **全体**账户数多空比（`globalLongShortAccountRatio`）。 |
+| `snap_time` | `DateTime64(3, 'UTC')` | 快照时刻，恒为 `start_time + 5m`。 |
+| `src_rank` | `UInt8` | `2` 币安历史接口（REST），`3` 币安每日归档。合并时归档优先。 |
+
+- 时间语义与 OI 相同：数值是 **bar 收盘时刻**（`start_time + 5m`）的状态，同一 `start_time` 的这一行和 K 线同时可知，没有前视。**查询加 `FINAL`。**
+- 比值 `r` = 多 / 空；多头占比 = `r / (1 + r)`。
+- **不是实时的。** 币安没有这三个比率的实时接口：最新的 bar 随每小时一轮（hh:05 开始，约 30 分钟内铺开）写入，所以最近一小时通常还没有。不要指望刚收盘的 bar 已有行。
+- 某列为 `NULL` 表示币安在该 bar 没有值（少见）。历史来自每日归档（最老的币种可到 2020-09）；REST 的值被币安四舍五入到约 4 位有效数字（与归档相差约 1 bp）。
+- **币安归档的源头缺口**（无法补）：2021-12 底到 2022-01 完全没有比率（2022-01 覆盖只有 41%）；2022 年两个大户比率有 86% 的行为 NULL。其他年份 NULL 低于 0.1%。
+- 汇总表 `fapi_ls_ratio_{15m,1h,4h,1d}`：`samples`（完整时为 3 / 12 / 48 / 288），以及每个比率的 `<列名>_close`（桶收盘时刻）、`<列名>_high`、`<列名>_low`。
+
+```sql
+SELECT k.start_time, k.close, o.sum_open_interest,
+       r.count_toptrader_long_short_ratio, r.sum_toptrader_long_short_ratio, r.count_long_short_ratio
+FROM market.fapi_kline_5m AS k FINAL
+LEFT JOIN market.fapi_oi_5m AS o FINAL ON o.symbol = k.symbol AND o.start_time = k.start_time
+LEFT JOIN market.fapi_ls_ratio_5m AS r FINAL ON r.symbol = k.symbol AND r.start_time = k.start_time
+WHERE k.symbol = 'BTCUSDT' AND k.start_time >= now() - INTERVAL 1 DAY
+ORDER BY k.start_time
+SETTINGS join_use_nulls = 1
+```
 
 ---
 

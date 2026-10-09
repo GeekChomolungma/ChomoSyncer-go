@@ -3,6 +3,7 @@ package openinterest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/rand"
@@ -11,15 +12,27 @@ import (
 	"time"
 )
 
-// RowSink accepts rows for persistence. *Writer implements it.
-type RowSink interface {
-	Push(ctx context.Context, r Row) error
+// batchRow is a row type the batching writer can carry: fapi_oi_5m's Row or
+// fapi_ls_ratio_5m's LSRow.
+type batchRow interface {
+	validate() error
 }
 
-// Flusher writes one batch of rows to the backing store.
-type Flusher interface {
-	Flush(ctx context.Context, rows []Row) error
+// rowSink accepts rows for persistence. *batchWriter implements it.
+type rowSink[R batchRow] interface {
+	Push(ctx context.Context, r R) error
 }
+
+// rowFlusher writes one batch of rows to the backing store.
+type rowFlusher[R batchRow] interface {
+	Flush(ctx context.Context, rows []R) error
+}
+
+// RowSink accepts open-interest rows for persistence. *Writer implements it.
+type RowSink = rowSink[Row]
+
+// Flusher writes one batch of open-interest rows to the backing store.
+type Flusher = rowFlusher[Row]
 
 // ErrWriterClosed is returned by Push after Close.
 var ErrWriterClosed = errors.New("openinterest: writer closed")
@@ -62,17 +75,17 @@ func (c WriterConfig) withDefaults() WriterConfig {
 	return c
 }
 
-// Writer batches rows and flushes them to a Flusher when either BatchSize rows are
-// buffered or FlushInterval has elapsed. It never issues single-row inserts. It is
-// a small counterpart of chwriter.BatchWriter for this package's Row type; the
+// batchWriter batches rows and flushes them to a flusher when either BatchSize rows
+// are buffered or FlushInterval has elapsed. It never issues single-row inserts. It
+// is a small counterpart of chwriter.BatchWriter for this package's row types; the
 // kline writer is deliberately left untouched.
-type Writer struct {
+type batchWriter[R batchRow] struct {
 	cfg     WriterConfig
-	flusher Flusher
+	flusher rowFlusher[R]
 	log     *slog.Logger
-	m       *metrics
+	m       *writerMetrics
 
-	in       chan Row
+	in       chan R
 	flushReq chan chan error
 	stop     chan struct{}
 	done     chan struct{}
@@ -82,21 +95,28 @@ type Writer struct {
 	closeErr  error
 }
 
-// NewWriter starts the writer's run loop. Close it to drain and stop.
+// Writer is the batching writer of fapi_oi_5m rows.
+type Writer = batchWriter[Row]
+
+// NewWriter starts the open-interest writer's run loop. Close it to drain and stop.
 func NewWriter(cfg WriterConfig, flusher Flusher, log *slog.Logger, m *metrics) *Writer {
+	if m == nil {
+		m = newMetrics(nil)
+	}
+	return newBatchWriter[Row](cfg, flusher, log, "oi_writer", &m.writerMetrics)
+}
+
+func newBatchWriter[R batchRow](cfg WriterConfig, flusher rowFlusher[R], log *slog.Logger, component string, m *writerMetrics) *batchWriter[R] {
 	cfg = cfg.withDefaults()
 	if log == nil {
 		log = slog.Default()
 	}
-	if m == nil {
-		m = newMetrics(nil)
-	}
-	w := &Writer{
+	w := &batchWriter[R]{
 		cfg:      cfg,
 		flusher:  flusher,
-		log:      log.With("component", "oi_writer"),
+		log:      log.With("component", component),
 		m:        m,
-		in:       make(chan Row, cfg.ChannelSize),
+		in:       make(chan R, cfg.ChannelSize),
 		flushReq: make(chan chan error),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
@@ -106,7 +126,7 @@ func NewWriter(cfg WriterConfig, flusher Flusher, log *slog.Logger, m *metrics) 
 }
 
 // Push queues a row, blocking while the queue is full until ctx ends.
-func (w *Writer) Push(ctx context.Context, r Row) error {
+func (w *batchWriter[R]) Push(ctx context.Context, r R) error {
 	if err := r.validate(); err != nil {
 		return err
 	}
@@ -125,8 +145,9 @@ func (w *Writer) Push(ctx context.Context, r Row) error {
 }
 
 // Flush blocks until every row queued before the call has been flushed (or
-// dropped after its retries).
-func (w *Writer) Flush(ctx context.Context) error {
+// dropped after its retries). It returns an error if any batch was dropped since
+// the previous Flush, including batches flushed in the background in between.
+func (w *batchWriter[R]) Flush(ctx context.Context) error {
 	reply := make(chan error, 1)
 	select {
 	case w.flushReq <- reply:
@@ -145,7 +166,7 @@ func (w *Writer) Flush(ctx context.Context) error {
 
 // Close stops accepting rows, flushes what is queued (bounded by ShutdownTimeout)
 // and closes the flusher if it is an io.Closer. Safe to call more than once.
-func (w *Writer) Close() error {
+func (w *batchWriter[R]) Close() error {
 	w.closeOnce.Do(func() {
 		w.closed.Store(true)
 		close(w.stop)
@@ -157,12 +178,16 @@ func (w *Writer) Close() error {
 	return w.closeErr
 }
 
-func (w *Writer) loop() {
+func (w *batchWriter[R]) loop() {
 	defer close(w.done)
-	batch := make([]Row, 0, w.cfg.BatchSize)
+	batch := make([]R, 0, w.cfg.BatchSize)
 	ticker := time.NewTicker(w.cfg.FlushInterval)
 	defer ticker.Stop()
 
+	// dropped remembers a batch lost (after its retries) by a size- or timer-
+	// triggered flush, so the next Flush barrier reports it: a caller advancing its
+	// state after a successful barrier must not step over rows that never landed.
+	var dropped error
 	flush := func(ctx context.Context) error {
 		if len(batch) == 0 {
 			return nil
@@ -170,6 +195,9 @@ func (w *Writer) loop() {
 		err := w.flushWithRetry(ctx, batch)
 		batch = batch[:0]
 		w.m.bufferRows.Set(float64(len(w.in)))
+		if err != nil {
+			dropped = err
+		}
 		return err
 	}
 	drain := func() {
@@ -194,7 +222,12 @@ func (w *Writer) loop() {
 			_ = flush(context.Background())
 		case reply := <-w.flushReq:
 			drain()
-			reply <- flush(context.Background())
+			err := flush(context.Background())
+			if err == nil && dropped != nil {
+				err = fmt.Errorf("a batch was dropped since the last flush barrier: %w", dropped)
+			}
+			dropped = nil
+			reply <- err
 		case <-w.stop:
 			drain()
 			ctx, cancel := context.WithTimeout(context.Background(), w.cfg.ShutdownTimeout)
@@ -207,7 +240,7 @@ func (w *Writer) loop() {
 	}
 }
 
-func (w *Writer) flushWithRetry(ctx context.Context, rows []Row) error {
+func (w *batchWriter[R]) flushWithRetry(ctx context.Context, rows []R) error {
 	start := time.Now()
 	backoff := w.cfg.RetryBackoff
 	var err error

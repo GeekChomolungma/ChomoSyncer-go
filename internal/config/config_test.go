@@ -257,3 +257,49 @@ func TestValidateRejectsBadOpenInterest(t *testing.T) {
 		}
 	}
 }
+
+func TestLSRatioDefaultsAreOffAndYAMLOverrides(t *testing.T) {
+	ls := DefaultConfig().OpenInterest.LSRatio
+	if ls.Enabled || ls.Table != "market.fapi_ls_ratio_5m" || ls.ReconcileSpread != 30*time.Minute || ls.ReconcileInterval != time.Hour {
+		t.Fatalf("unexpected ls_ratio defaults: %+v", ls)
+	}
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	yamlContent := "open_interest:\n  ls_ratio:\n    enabled: true\n    reconcile_spread: 40m\n    max_backfill: 72h\n"
+	if err := os.WriteFile(cfgPath, []byte(yamlContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadYAML(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ls = cfg.OpenInterest.LSRatio
+	if !ls.Enabled || ls.ReconcileSpread != 40*time.Minute || ls.MaxBackfill != 72*time.Hour || ls.Workers != 4 {
+		t.Fatalf("ls_ratio overrides not applied or defaults lost: %+v", ls)
+	}
+	if cfg.OpenInterest.HistEnabled || cfg.OpenInterest.LiveEnabled {
+		t.Fatal("enabling ls_ratio must not enable open interest")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid override rejected: %v", err)
+	}
+	m := cfg.OpenInterest.ToModule()
+	if !m.LSRatioEnabled || m.LSRatioTable != "market.fapi_ls_ratio_5m" || m.LSRatio.Spread != 40*time.Minute || m.LSRatio.MaxBackfill != 72*time.Hour {
+		t.Fatalf("ToModule mapping wrong: %+v", m)
+	}
+}
+
+func TestValidateRejectsBadLSRatio(t *testing.T) {
+	for name, mutate := range map[string]func(*Config){
+		"offset beyond the interval": func(c *Config) { c.OpenInterest.LSRatio.ReconcileOffset = 2 * time.Hour },
+		"spread beyond the interval": func(c *Config) { c.OpenInterest.LSRatio.ReconcileSpread = 2 * time.Hour },
+		"limit above Binance's max":  func(c *Config) { c.OpenInterest.LSRatio.MaxLimit = 1000 },
+		"backfill beyond retention":  func(c *Config) { c.OpenInterest.LSRatio.MaxBackfill = 60 * 24 * time.Hour },
+		"cold start beyond the cap":  func(c *Config) { c.OpenInterest.LSRatio.ColdStartWindow = 200 * time.Hour },
+	} {
+		cfg := DefaultConfig()
+		mutate(&cfg)
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("%s: expected a validation error", name)
+		}
+	}
+}
