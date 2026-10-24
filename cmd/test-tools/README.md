@@ -36,7 +36,7 @@ This mirrors `docs/OPERATIONS.md` §3 (B.1/B.2): you validate ClickHouse's own h
 | `e2e_reconciliation.py` | **[Phase B·4] Cache-vs-storage reconciliation tool**: compares the Redis `kline:{SYM}:1m` window against ClickHouse `fapi_kline_1m`, bar-by-bar, for timestamp and OHLCV consistency |
 | `run_all_checks.py` | **[Phase C] One-shot pre-flight orchestrator**: runs every check with a single command and outputs a visual red/green health scorecard |
 | `check_oi_consistency.py` | **[Phase D] Open-interest consistency checker**: read-only checks of `market.fapi_oi_5m` — gaps, 5-minute grid, `snap_time` semantics, freshness, calibration by hist, coverage against the kline table, per-bar cross-section, and (optionally) value-for-value against Binance |
-| `backfill_missing_oi.py` | **[Repair] Backfill missing 5m open-interest bars**: reads the CSV from `check_oi_consistency.py --gaps-csv`, fetches those bars from Binance `openInterestHist` (only the latest ~30 days exist) and inserts them into `market.fapi_oi_5m` as `src_rank = 2`. Dry run unless `--apply` |
+| `backfill_missing_oi.py` | **[Repair] Backfill missing 5m open-interest bars**: reads the CSV from `check_oi_consistency.py --gaps-csv`, fetches those bars from Binance `openInterestHist` (only the latest ~30 days exist) and inserts them into `market.fapi_oi_5m` as `src_rank = 2`. With `--replace-live` it also replaces live rows the service never calibrated (monthly maintenance). Dry run unless `--apply` |
 | `import_ls_ratio_archive.py` | **[Import] Long/short ratio history from the Binance archive**: downloads `data.binance.vision` daily metrics files for every (symbol, day) `market.fapi_oi_5m` has and writes the three ratio columns into `market.fapi_ls_ratio_5m` as `src_rank = 3`, with the date-dependent alignment of `new_requirements/oi.md` §3.7 (files up to 2024-03-03: `create_time − 5m`; from 2024-03-04: `create_time`). Resumable via `--state-file`; dry run unless `--apply` |
 | `common.py` | Shared utility library: config loading, ClickHouse/Redis clients, symbol discovery, time utilities, table formatting, etc. Not a check by itself. |
 | `test_toolkit.py` | The toolkit's built-in unit tests and mock validation suite (`python -m pytest cmd/test-tools/test_toolkit.py`, or run directly) |
@@ -454,9 +454,20 @@ What it does per symbol: drops the part of each gap older than Binance's retenti
 
 **Some gaps cannot be filled here.** Bars older than the retention need the archive; bars Binance returns nothing for are *empty at exchange*; a symbol Binance rejects (delisted) is reported and skipped. The checker keeps listing all of them.
 
+**Replacing uncalibrated live rows (`--replace-live`).** The service's hourly hist pass only moves forward from the newest calibrated bar, so when `openInterestHist` answers badly for a while (e.g. off-grid per-second labels), the live rows in that window are never replaced. `--replace-live` finds every bar that is still `src_rank = 1` in `FINAL` within the retention window (minus the newest `--live-min-age` minutes, which the service's own pass still covers) and writes Binance's hist value over it as `src_rank = 2`. Hist/archive rows are never touched, off-grid labels are ignored, and a live row Binance has no point for stays live (*not at exchange*). It needs no CSV, and shares requests with the gaps when both are given. Run it about monthly, well inside the ~30-day retention:
+
+```bash
+python cmd/test-tools/backfill_missing_oi.py --replace-live --ch-password "<pw>"                  # dry run
+python cmd/test-tools/backfill_missing_oi.py --replace-live --ch-password "<pw>" --apply          # replace
+python cmd/test-tools/backfill_missing_oi.py oi_gaps.csv --replace-live --ch-password "<pw>" --apply   # gaps + live in one run
+```
+
 | Flag | Default | Meaning |
 | :--- | :--- | :--- |
-| `csv` (positional) | required | The gaps CSV. Only `5m` lines are used |
+| `csv` (positional) | optional | The gaps CSV. Only `5m` lines are used. Required unless `--replace-live` |
+| `--replace-live` | off | Also replace rows still at `src_rank = 1` with hist values |
+| `--live-min-age` | `180` | With `--replace-live`: skip live rows younger than this many minutes (the service's hourly pass is still on them) |
+| `--live-since` | *(retention window)* | With `--replace-live`: only rows from this UTC time on, `YYYY-MM-DD[ HH:MM[:SS]]` |
 | `--apply` | off | Actually `INSERT`. Without it nothing is written |
 | `--symbol` | *(all in file)* | Only this symbol |
 | `--table` | `market.fapi_oi_5m` | OI table (`open_interest.table` from config if set) |

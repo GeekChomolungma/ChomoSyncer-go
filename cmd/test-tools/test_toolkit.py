@@ -596,7 +596,7 @@ class TestBackfillMissingOI(unittest.TestCase):
         with self.assertRaises(bo.InvalidSymbol):
             bo.OIHist("https://x", pacer, session=Sess()).fetch("GONEUSDT", BAR_MS, 2 * BAR_MS)
 
-    def _run(self, gaps, present, exchange, apply=True, now_ms=None, retention_days=30.0):
+    def _run(self, gaps, present, exchange, apply=True, now_ms=None, retention_days=30.0, live=None):
         B = BAR_MS
 
         class FakeCH:
@@ -616,8 +616,39 @@ class TestBackfillMissingOI(unittest.TestCase):
 
         ch, fe = FakeCH(), FakeFetch()
         st = bo.run(ch, "t", gaps, fe, apply=apply, now_ms=now_ms if now_ms is not None else 1_000_000 * B + B // 2,
-                    retention_days=retention_days, out=lambda *_: None)
+                    retention_days=retention_days, out=lambda *_: None, live=live)
         return ch, fe, st
+
+    def test_run_replaces_live_rows_only(self):
+        B = BAR_MS
+        base = 1_000_000 * B - 100 * B
+        # live rows at bars 0 and 1; the exchange also returns bar 2 (not targeted), an
+        # off-grid label, and has no point for bar 1
+        ch, fe, st = self._run({}, present=[], live={"AAAUSDT": [base, base + B]},
+                               exchange=[(base + B, 10.0), (base + 3 * B, 30.0), (base + B + 1000, 9.0)])
+        self.assertEqual([r["start_time"] for r in ch.inserted], [bo.fmt_ts(base)])
+        self.assertTrue(all(r["src_rank"] == 2 for r in ch.inserted))
+        self.assertEqual((st["live_rows"], st["live_replaced"], st["live_not_at_exchange"], st["fetched"]), (2, 1, 1, 0))
+        self.assertEqual(len(fe.calls), 1)
+
+    def test_run_gaps_and_live_share_requests(self):
+        B = BAR_MS
+        base = 1_000_000 * B - 100 * B
+        ch, fe, st = self._run({"AAAUSDT": [(base, base + B)]}, present=[], live={"AAAUSDT": [base + 2 * B]},
+                               exchange=[(base + B, 1.0), (base + 2 * B, 2.0), (base + 3 * B, 3.0)])
+        self.assertEqual([r["start_time"] for r in ch.inserted], [bo.fmt_ts(base), bo.fmt_ts(base + 2 * B)])
+        self.assertEqual((st["fetched"], st["live_replaced"], st["inserted"]), (1, 1, 2))
+        self.assertEqual(len(fe.calls), 1)
+
+    def test_run_live_respects_retention_and_dry_run(self):
+        B = BAR_MS
+        now = 1_000_000 * B
+        old = now - 40 * 288 * B
+        recent = now - 10 * B
+        ch, fe, st = self._run({}, present=[], live={"AAAUSDT": [old, recent]},
+                               exchange=[(recent + B, 5.0)], now_ms=now, apply=False)
+        self.assertEqual((st["live_rows"], st["live_replaced"], st["inserted"], ch.inserted), (1, 1, 0, []))
+        self.assertEqual([c[1] for c in fe.calls], [recent])   # the 40-day-old row is not requested
 
     def test_run_inserts_only_missing_wanted_published_bars(self):
         B = BAR_MS

@@ -36,7 +36,7 @@
 | `e2e_reconciliation.py` | **[阶段 B·4] 缓存与存储对账工具**：对比 Redis `kline:{SYM}:1m` 滑窗与 ClickHouse `fapi_kline_1m`，逐根对比时间戳与 OHLCV 一致性 |
 | `run_all_checks.py` | **[阶段 C] 一键全量预检调度器**：一键执行所有检查项，输出可视化红绿灯健康计分卡 (Scorecard) |
 | `check_oi_consistency.py` | **[阶段 D] 持仓量一致性检查器**：只读检查 `market.fapi_oi_5m`——缺口、5 分钟网格、`snap_time` 语义、新鲜度、hist 校准情况、与 K 线表的覆盖率、逐根截面完整度，以及（可选）与币安逐值对账 |
-| `backfill_missing_oi.py` | **[修复] 缺失 5m 持仓量（OI）bar 回填**：读取 `check_oi_consistency.py --gaps-csv` 生成的 CSV，从币安 `openInterestHist` 拉这些 bar（接口只保留最近约 30 天）并以 `src_rank = 2` 写入 `market.fapi_oi_5m`。不带 `--apply` 只演练 |
+| `backfill_missing_oi.py` | **[修复] 缺失 5m 持仓量（OI）bar 回填**：读取 `check_oi_consistency.py --gaps-csv` 生成的 CSV，从币安 `openInterestHist` 拉这些 bar（接口只保留最近约 30 天）并以 `src_rank = 2` 写入 `market.fapi_oi_5m`。加 `--replace-live` 还会替换服务没来得及校准的 live 行（每月维护用）。不带 `--apply` 只演练 |
 | `import_ls_ratio_archive.py` | **[导入] 从币安归档导入多空比历史**：对 `market.fapi_oi_5m` 中出现的每个 (标的, 日) 下载 `data.binance.vision` 的每日 metrics 文件，把三个多空比列写入 `market.fapi_ls_ratio_5m`（`src_rank = 3`），按 `new_requirements/oi.md` §3.7 的日期规则对齐（2024-03-03 及以前的文件：`create_time − 5m`；2024-03-04 起：`create_time`）。可用 `--state-file` 断点续传；不加 `--apply` 只试运行 |
 | `common.py` | 基础公用库：配置文件加载、ClickHouse/Redis 客户端、交易标的探测、时间工具、表格格式化等。本身不是一项检查。 |
 | `test_toolkit.py` | 工具包内置单元测试与 Mock 验证套件（`python -m pytest cmd/test-tools/test_toolkit.py`，或直接运行） |
@@ -454,9 +454,20 @@ python cmd/test-tools/check_oi_consistency.py --start-date 2020-09-01 --skip-cov
 
 **有些缺口在这里补不了。** 早于保留期的 bar 需要归档；币安什么也没返回的 bar 报为 *empty at exchange*；币安拒绝的标的（已下架）会被报出并跳过。检查脚本会继续列出这些缺口。
 
+**替换未校准的 live 行（`--replace-live`）。** 服务每小时的 hist 校准只从“最新已校准的那根”往后推进，所以 `openInterestHist` 一段时间内返回异常（比如不在 5 分钟整点上的秒级标签）时，这段窗口里的 live 行就永远不会被替换。`--replace-live` 会找出保留期内（去掉最近 `--live-min-age` 分钟，那部分服务自己的校准还在处理）`FINAL` 里仍是 `src_rank = 1` 的每一根 bar，用币安的 hist 值以 `src_rank = 2` 覆盖。hist/归档行永远不会被动到，不在整点上的标签会被忽略，币安没有对应点的 live 行保持不变（*not at exchange*）。不需要 CSV；同时给了 CSV 时，缺口和 live 共用请求。建议每月跑一次，保证在约 30 天的保留期之内：
+
+```bash
+python cmd/test-tools/backfill_missing_oi.py --replace-live --ch-password "<pw>"                  # 演练
+python cmd/test-tools/backfill_missing_oi.py --replace-live --ch-password "<pw>" --apply          # 替换
+python cmd/test-tools/backfill_missing_oi.py oi_gaps.csv --replace-live --ch-password "<pw>" --apply   # 缺口 + live 一次跑完
+```
+
 | 参数 | 默认 | 含义 |
 | :--- | :--- | :--- |
-| `csv`（位置参数） | 必填 | 缺口 CSV，只使用 `5m` 的行 |
+| `csv`（位置参数） | 可选 | 缺口 CSV，只使用 `5m` 的行；不加 `--replace-live` 时必填 |
+| `--replace-live` | 关 | 同时把仍是 `src_rank = 1` 的行替换成 hist 值 |
+| `--live-min-age` | `180` | 配合 `--replace-live`：跳过比这更新（分钟）的 live 行，服务每小时的校准还在处理它们 |
+| `--live-since` | *(保留期)* | 配合 `--replace-live`：只处理从这个 UTC 时间起的行，`YYYY-MM-DD[ HH:MM[:SS]]` |
 | `--apply` | 关 | 真正 `INSERT`；不带则什么都不写 |
 | `--symbol` | *(文件中全部)* | 只处理这个标的 |
 | `--table` | `market.fapi_oi_5m` | OI 表（配置里设了 `open_interest.table` 就用它） |
